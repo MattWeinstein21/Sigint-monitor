@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SIGINT – Keyword Monitor</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:#0A0A0F;color:#E8E8ED;font-family:'JetBrains Mono','Fira Code',monospace}
+  ::-webkit-scrollbar{width:6px}::-webkit-scrollbar-track{background:#0A0A0F}::-webkit-scrollbar-thumb{background:#2A2A35;border-radius:3px}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+  @keyframes slideIn{from{opacity:0;transform:translateY(-8px)}to{opacity:1;transform:translateY(0)}}
+  .alert-row{animation:slideIn .3s ease-out}.alert-row:hover{background:#14141F!important}
+  .kw-tag{transition:all .15s;cursor:pointer}.kw-tag:hover{transform:scale(1.05);filter:brightness(1.3)}
+  .src-toggle{transition:all .15s;cursor:pointer}.src-toggle:hover{filter:brightness(1.2)}
+  .btn{transition:all .15s;cursor:pointer;border:none}.btn:hover{filter:brightness(1.2);transform:translateY(-1px)}
+  .src-link{color:#5A8FD4;text-decoration:none;font-size:10px;font-family:inherit;transition:color .15s;display:inline-flex;align-items:center;gap:3px;padding:2px 7px;border-radius:3px;background:#5A8FD412;border:1px solid #5A8FD422}
+  .src-link:hover{color:#A0C8FF;background:#5A8FD425;text-decoration:none}
+  select{appearance:none;-webkit-appearance:none}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useCallback } = React;
+
+const API_BASE = `${window.location.protocol}//${window.location.hostname}:${window.location.port || 5000}`;
+
+const SOURCES = [
+  { id: "truthsocial", name: "Truth Social", icon: "📢", type: "social", color: "#5448C8" },
+  { id: "x_twitter", name: "X / Twitter", icon: "𝕏", type: "social", color: "#1DA1F2" },
+  { id: "reuters", name: "Reuters", icon: "◉", type: "news", color: "#FF8000" },
+  { id: "ap_news", name: "AP News", icon: "◆", type: "news", color: "#E4002B" },
+  { id: "bloomberg", name: "Bloomberg", icon: "▮", type: "news", color: "#472F92" },
+  { id: "cnbc", name: "CNBC", icon: "▶", type: "news", color: "#005594" },
+  { id: "wsj", name: "Wall Street Journal", icon: "▣", type: "news", color: "#0274B6" },
+  { id: "foxnews", name: "Fox News", icon: "★", type: "news", color: "#003366" },
+  { id: "cnn", name: "CNN", icon: "◼", type: "news", color: "#CC0000" },
+  { id: "nytimes", name: "New York Times", icon: "⬡", type: "news", color: "#888" },
+  { id: "whitehouse", name: "White House", icon: "🏛", type: "gov", color: "#002868" },
+  { id: "newsapi", name: "NewsAPI", icon: "◈", type: "news", color: "#4A90D9" },
+];
+
+function timeAgo(iso) {
+  const s = Math.floor((Date.now() - new Date(iso)) / 1000);
+  if (s < 0) return "just now";
+  if (s < 60) return s + "s ago";
+  if (s < 3600) return Math.floor(s / 60) + "m ago";
+  if (s < 86400) return Math.floor(s / 3600) + "h ago";
+  return Math.floor(s / 86400) + "d ago";
+}
+
+function App() {
+  const [keywords, setKeywords] = useState([]);
+  const [newKeyword, setNewKeyword] = useState("");
+  const [alerts, setAlerts] = useState([]);
+  const [filter, setFilter] = useState("all");
+  const [severityFilter, setSeverityFilter] = useState("all");
+  const [isMonitoring, setIsMonitoring] = useState(true);
+  const [showConfig, setShowConfig] = useState(false);
+  const [enabledSources, setEnabledSources] = useState(SOURCES.map(s => s.id));
+  const [backendConnected, setBackendConnected] = useState(false);
+  const [lastError, setLastError] = useState("");
+  const [accounts, setAccounts] = useState([]);
+  const [newAccountUrl, setNewAccountUrl] = useState("");
+  const [accountError, setAccountError] = useState("");
+  const [refreshing, setRefreshing] = useState(false);
+  const [, setTick] = useState(0);
+
+  // Load keywords + accounts from backend on mount
+  useEffect(() => {
+    fetch(API_BASE + "/api/keywords")
+      .then(r => r.json())
+      .then(d => { if (d.keywords) setKeywords(d.keywords); setBackendConnected(true); })
+      .catch(() => setBackendConnected(false));
+    fetch(API_BASE + "/api/accounts")
+      .then(r => r.json())
+      .then(d => { if (d.accounts) setAccounts(d.accounts); })
+      .catch(() => {});
+  }, []);
+
+  // Poll backend status
+  useEffect(() => {
+    const iv = setInterval(() => {
+      fetch(API_BASE + "/api/status")
+        .then(r => { if (r.ok) { setBackendConnected(true); setLastError(""); } else throw new Error(); })
+        .catch(() => { setBackendConnected(false); setLastError("Cannot reach backend"); });
+    }, 15000);
+    return () => clearInterval(iv);
+  }, []);
+
+  // Poll alerts
+  useEffect(() => {
+    if (!isMonitoring) return;
+    let cancelled = false;
+    const poll = () => {
+      fetch(API_BASE + "/api/alerts?limit=300")
+        .then(r => r.json())
+        .then(d => { if (!cancelled && d.alerts) { setAlerts(d.alerts); setBackendConnected(true); } })
+        .catch(() => { if (!cancelled) setBackendConnected(false); });
+    };
+    poll();
+    const iv = setInterval(poll, 8000);
+    return () => { cancelled = true; clearInterval(iv); };
+  }, [isMonitoring]);
+
+  // Timestamp refresh
+  useEffect(() => { const iv = setInterval(() => setTick(t => t + 1), 10000); return () => clearInterval(iv); }, []);
+
+  const addKeyword = useCallback(() => {
+    const k = newKeyword.trim().toLowerCase();
+    if (!k || keywords.includes(k)) return;
+    setKeywords(prev => [...prev, k]);
+    setNewKeyword("");
+    fetch(API_BASE + "/api/keywords", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ add: k })
+    }).catch(() => {});
+  }, [newKeyword, keywords]);
+
+  const removeKeyword = (k) => {
+    setKeywords(prev => prev.filter(x => x !== k));
+    fetch(API_BASE + "/api/keywords", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ remove: k })
+    }).catch(() => {});
+  };
+
+  const addAccount = useCallback(() => {
+    const url = newAccountUrl.trim();
+    if (!url) return;
+    setAccountError("");
+    fetch(API_BASE + "/api/accounts", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url })
+    })
+      .then(r => r.json())
+      .then(d => {
+        if (d.error) { setAccountError(d.error); return; }
+        if (d.accounts) setAccounts(d.accounts);
+        setNewAccountUrl("");
+      })
+      .catch(() => setAccountError("Backend unreachable"));
+  }, [newAccountUrl]);
+
+  const removeAccount = (platform, username) => {
+    fetch(API_BASE + "/api/accounts", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ remove: platform + ":" + username })
+    })
+      .then(r => r.json())
+      .then(d => { if (d.accounts) setAccounts(d.accounts); })
+      .catch(() => {});
+  };
+
+  const triggerRefresh = () => {
+    if (refreshing) return;
+    setRefreshing(true);
+    fetch(API_BASE + "/api/refresh", { method: "POST" })
+      .then(() => {
+        // Wait a few seconds for the poll cycle to run, then fetch new alerts
+        setTimeout(() => {
+          fetch(API_BASE + "/api/alerts?limit=300")
+            .then(r => r.json())
+            .then(d => { if (d.alerts) setAlerts(d.alerts); })
+            .catch(() => {})
+            .finally(() => setRefreshing(false));
+        }, 5000);
+      })
+      .catch(() => setRefreshing(false));
+  };
+
+  const toggleSource = (id) => setEnabledSources(prev =>
+    prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]
+  );
+
+  const filtered = alerts.filter(a => {
+    if (filter !== "all" && a.keyword !== filter) return false;
+    if (severityFilter !== "all" && a.severity !== severityFilter) return false;
+    return enabledSources.includes(a.source);
+  });
+
+  const sevColors = { high: "#FF3B30", medium: "#FF9500", low: "#34C759" };
+  const srcMap = Object.fromEntries(SOURCES.map(s => [s.id, s]));
+
+  return (
+    <div style={{ minHeight: "100vh" }}>
+      {/* Header */}
+      <div style={{ borderBottom: "1px solid #1A1A25", padding: "16px 24px", display: "flex", alignItems: "center", justifyContent: "space-between", position: "sticky", top: 0, background: "#0A0A0F", zIndex: 10 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+          <div style={{ width: 10, height: 10, borderRadius: "50%", background: isMonitoring ? "#34C759" : "#FF3B30", animation: isMonitoring ? "pulse 2s infinite" : "none" }} />
+          <span style={{ fontFamily: "'Space Grotesk',sans-serif", fontWeight: 700, fontSize: 18, letterSpacing: "-0.5px" }}>SIGINT</span>
+          <span style={{ fontSize: 11, color: "#555", marginLeft: 4 }}>keyword monitor</span>
+          <span style={{ fontSize: 9, padding: "2px 8px", borderRadius: 4, marginLeft: 8, background: backendConnected ? "#1A2A1A" : "#2A1A1A", color: backendConnected ? "#34C759" : "#FF3B30", border: "1px solid " + (backendConnected ? "#34C75933" : "#FF3B3033") }}>
+            {backendConnected ? "● CONNECTED" : "✕ DISCONNECTED"}
+          </span>
+        </div>
+        <div style={{ display: "flex", gap: 8 }}>
+          <button className="btn" onClick={triggerRefresh} disabled={refreshing} style={{ background: refreshing ? "#2A2A35" : "#14141F", color: refreshing ? "#666" : "#AAA", padding: "6px 14px", borderRadius: 6, fontSize: 12, opacity: refreshing ? 0.7 : 1 }}>
+            {refreshing ? "⟳ Polling..." : "⟳ Refresh"}
+          </button>
+          <button className="btn" onClick={() => setShowConfig(!showConfig)} style={{ background: showConfig ? "#2A2A35" : "#14141F", color: "#AAA", padding: "6px 14px", borderRadius: 6, fontSize: 12 }}>⚙ Config</button>
+          <button className="btn" onClick={() => setIsMonitoring(!isMonitoring)} style={{ background: isMonitoring ? "#1A2A1A" : "#2A1A1A", color: isMonitoring ? "#34C759" : "#FF3B30", padding: "6px 14px", borderRadius: 6, fontSize: 12 }}>
+            {isMonitoring ? "● LIVE" : "■ PAUSED"}
+          </button>
+        </div>
+      </div>
+
+      {/* Connection error banner */}
+      {!backendConnected && (
+        <div style={{ background: "#2A1A1A", borderBottom: "1px solid #FF3B3033", padding: "8px 24px", fontSize: 11, color: "#FF6B6B" }}>
+          ⚠ Backend not reachable at {API_BASE} — make sure monitor.py is running.
+        </div>
+      )}
+
+      <div style={{ display: "flex", height: backendConnected ? "calc(100vh - 57px)" : "calc(100vh - 89px)" }}>
+        {/* Sidebar */}
+        <div style={{ width: showConfig ? 320 : 0, overflow: "hidden", transition: "width 0.3s", borderRight: "1px solid #1A1A25", flexShrink: 0 }}>
+          <div style={{ width: 320, padding: 20, overflowY: "auto", height: "100%" }}>
+            <div style={{ marginBottom: 24 }}>
+              <div style={{ fontSize: 10, fontWeight: 600, color: "#666", letterSpacing: 2, marginBottom: 10, textTransform: "uppercase" }}>Keywords ({keywords.length})</div>
+              <div style={{ display: "flex", gap: 6, marginBottom: 12 }}>
+                <input value={newKeyword} onChange={e => setNewKeyword(e.target.value)} onKeyDown={e => e.key === "Enter" && addKeyword()} placeholder="add keyword..." style={{ flex: 1, background: "#14141F", border: "1px solid #2A2A35", borderRadius: 6, padding: "6px 10px", color: "#E8E8ED", fontSize: 12, outline: "none", fontFamily: "inherit" }} />
+                <button className="btn" onClick={addKeyword} style={{ background: "#5448C8", color: "#fff", padding: "6px 12px", borderRadius: 6, fontSize: 12 }}>+</button>
+              </div>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 6, maxHeight: 200, overflowY: "auto" }}>
+                {keywords.map(k => <span key={k} className="kw-tag" onClick={() => removeKeyword(k)} style={{ background: "#1A1A25", padding: "4px 10px", borderRadius: 4, fontSize: 11, color: "#AAA", display: "flex", alignItems: "center", gap: 6 }}>{k} <span style={{ color: "#555", fontSize: 10 }}>✕</span></span>)}
+              </div>
+            </div>
+
+            {/* Monitored Accounts */}
+            <div style={{ marginBottom: 24 }}>
+              <div style={{ fontSize: 10, fontWeight: 600, color: "#666", letterSpacing: 2, marginBottom: 10, textTransform: "uppercase" }}>Monitored Accounts ({accounts.length})</div>
+              <div style={{ display: "flex", gap: 6, marginBottom: 8 }}>
+                <input value={newAccountUrl} onChange={e => { setNewAccountUrl(e.target.value); setAccountError(""); }} onKeyDown={e => e.key === "Enter" && addAccount()} placeholder="paste profile URL..." style={{ flex: 1, background: "#14141F", border: "1px solid #2A2A35", borderRadius: 6, padding: "6px 10px", color: "#E8E8ED", fontSize: 11, outline: "none", fontFamily: "inherit" }} />
+                <button className="btn" onClick={addAccount} style={{ background: "#5448C8", color: "#fff", padding: "6px 12px", borderRadius: 6, fontSize: 12 }}>+</button>
+              </div>
+              <div style={{ fontSize: 9, color: "#555", marginBottom: 6, lineHeight: 1.5 }}>
+                Supports: x.com/username · truthsocial.com/@username
+              </div>
+              {accountError && <div style={{ fontSize: 10, color: "#FF3B30", marginBottom: 6 }}>⚠ {accountError}</div>}
+              <div style={{ display: "flex", flexDirection: "column", gap: 4, maxHeight: 200, overflowY: "auto" }}>
+                {accounts.map(a => {
+                  const isX = a.platform === "x";
+                  const profileUrl = isX ? "https://x.com/" + a.username : "https://truthsocial.com/@" + a.username;
+                  return (
+                    <div key={a.platform + ":" + a.username} style={{ display: "flex", alignItems: "center", gap: 8, padding: "5px 8px", borderRadius: 6, background: "#14141F" }}>
+                      <span style={{ fontSize: 14, flexShrink: 0 }}>{isX ? "𝕏" : "📢"}</span>
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <a href={profileUrl} target="_blank" rel="noopener noreferrer" style={{ fontSize: 11, color: "#CCC", textDecoration: "none" }}>@{a.username}</a>
+                        {a.label && a.label !== "@" + a.username && <span style={{ fontSize: 9, color: "#555", marginLeft: 6 }}>{a.label}</span>}
+                      </div>
+                      <span style={{ fontSize: 9, color: "#555", textTransform: "uppercase" }}>{a.platform}</span>
+                      <span className="kw-tag" onClick={() => removeAccount(a.platform, a.username)} style={{ fontSize: 10, color: "#555", cursor: "pointer", padding: "2px 4px" }}>✕</span>
+                    </div>
+                  );
+                })}
+                {accounts.length === 0 && <div style={{ fontSize: 11, color: "#333", padding: 4 }}>No accounts added</div>}
+              </div>
+            </div>
+
+            <div>
+              <div style={{ fontSize: 10, fontWeight: 600, color: "#666", letterSpacing: 2, marginBottom: 10, textTransform: "uppercase" }}>Sources ({enabledSources.length}/{SOURCES.length})</div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                {SOURCES.map(s => (
+                  <div key={s.id} className="src-toggle" onClick={() => toggleSource(s.id)} style={{ display: "flex", alignItems: "center", gap: 10, padding: "6px 8px", borderRadius: 6, background: enabledSources.includes(s.id) ? "#14141F" : "transparent", opacity: enabledSources.includes(s.id) ? 1 : 0.35 }}>
+                    <div style={{ width: 8, height: 8, borderRadius: "50%", background: enabledSources.includes(s.id) ? s.color : "#333", flexShrink: 0 }} />
+                    <span style={{ fontSize: 12 }}>{s.icon} {s.name}</span>
+                    <span style={{ marginLeft: "auto", fontSize: 9, color: "#555", textTransform: "uppercase" }}>{s.type}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* Main */}
+        <div style={{ flex: 1, display: "flex", flexDirection: "column", minWidth: 0 }}>
+          {/* Stats */}
+          <div style={{ display: "flex", gap: 1, padding: "12px 20px", borderBottom: "1px solid #1A1A25" }}>
+            {[
+              { label: "Total Alerts", value: alerts.length, color: "#5448C8" },
+              { label: "High Priority", value: alerts.filter(a => a.severity === "high").length, color: "#FF3B30" },
+              { label: "Last 1h", value: alerts.filter(a => Date.now() - new Date(a.timestamp) < 3600000).length, color: "#FF9500" },
+              { label: "Sources Active", value: enabledSources.length, color: "#34C759" },
+            ].map((s, i) => (
+              <div key={i} style={{ flex: 1, padding: "8px 14px", background: "#0F0F18", borderRadius: i === 0 ? "8px 0 0 8px" : i === 3 ? "0 8px 8px 0" : 0 }}>
+                <div style={{ fontSize: 9, color: "#555", textTransform: "uppercase", letterSpacing: 1.5 }}>{s.label}</div>
+                <div style={{ fontSize: 22, fontWeight: 700, color: s.color, fontFamily: "'Space Grotesk',sans-serif" }}>{s.value}</div>
+              </div>
+            ))}
+          </div>
+
+          {/* Filters */}
+          <div style={{ display: "flex", gap: 8, padding: "10px 20px", borderBottom: "1px solid #1A1A25", flexWrap: "wrap", alignItems: "center" }}>
+            <select value={filter} onChange={e => setFilter(e.target.value)} style={{ background: "#14141F", border: "1px solid #2A2A35", borderRadius: 6, padding: "5px 8px", color: "#AAA", fontSize: 11, fontFamily: "inherit", outline: "none" }}>
+              <option value="all">All Keywords</option>
+              {keywords.map(k => <option key={k} value={k}>{k}</option>)}
+            </select>
+            <select value={severityFilter} onChange={e => setSeverityFilter(e.target.value)} style={{ background: "#14141F", border: "1px solid #2A2A35", borderRadius: 6, padding: "5px 8px", color: "#AAA", fontSize: 11, fontFamily: "inherit", outline: "none" }}>
+              <option value="all">All Severity</option>
+              <option value="high">🔴 High</option>
+              <option value="medium">🟠 Medium</option>
+              <option value="low">🟢 Low</option>
+            </select>
+            <button className="btn" onClick={() => { fetch(API_BASE + "/api/alerts", { method: "DELETE" }).catch(() => {}); setAlerts([]); }} style={{ marginLeft: "auto", background: "transparent", color: "#555", padding: "5px 10px", fontSize: 11, border: "none" }}>Clear All</button>
+          </div>
+
+          {/* Alert Feed */}
+          <div style={{ flex: 1, overflowY: "auto", padding: "4px 0" }}>
+            {filtered.length === 0 && (
+              <div style={{ textAlign: "center", padding: 60, color: "#333" }}>
+                <div style={{ fontSize: 32, marginBottom: 8 }}>◎</div>
+                <div style={{ fontSize: 13 }}>{backendConnected ? "No alerts matching filters — waiting for next poll cycle" : "Waiting for backend connection..."}</div>
+              </div>
+            )}
+            {filtered.map(a => {
+              const src = srcMap[a.source] || { icon: "?", name: a.source_name || a.source, color: "#888" };
+              return (
+                <div key={a.id} className="alert-row" style={{ display: "flex", gap: 12, padding: "12px 20px", borderBottom: "1px solid #111118" }}>
+                  <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 4, width: 44, flexShrink: 0, paddingTop: 2 }}>
+                    <div style={{ width: 8, height: 8, borderRadius: "50%", background: sevColors[a.severity] || "#888" }} />
+                    <span style={{ fontSize: 18 }}>{src.icon}</span>
+                  </div>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontSize: 13, fontWeight: 500, color: "#E8E8ED", lineHeight: 1.3, marginBottom: 4 }}>{a.title}</div>
+                    <div style={{ fontSize: 11, color: "#555", lineHeight: 1.5, marginBottom: 6 }}>{a.snippet}</div>
+                    <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                      <span style={{ fontSize: 10, background: "#1A1A25", padding: "2px 8px", borderRadius: 3, color: src.color, border: "1px solid " + src.color + "33" }}>{a.source_name || src.name}</span>
+                      <span style={{ fontSize: 10, background: "#5448C820", padding: "2px 8px", borderRadius: 3, color: "#8B80F0", border: "1px solid #5448C833" }}>{a.keyword}</span>
+                      {a.url && <a href={a.url} target="_blank" rel="noopener noreferrer" className="src-link">↗ View Source</a>}
+                      <span style={{ fontSize: 10, color: "#444", marginLeft: "auto" }}>{timeAgo(a.timestamp)}</span>
+                      <span style={{ fontSize: 9, color: "#333" }}>{new Date(a.timestamp).toLocaleTimeString()}</span>
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>

@@ -33,9 +33,9 @@ python monitor.py
 ## Deploy to Server
 
 ```bash
-# First time — on your server
+# First time — on server
 cd /opt/sigint
-git clone https://github.com/YOUR_USERNAME/sigint-monitor.git .
+git clone https://github.com/USERNAME/sigint-monitor.git .
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt

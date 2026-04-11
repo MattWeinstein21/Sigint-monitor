@@ -68,7 +68,6 @@ function App() {
   const [accounts, setAccounts] = useState([]);
   const [newAccountUrl, setNewAccountUrl] = useState("");
   const [accountError, setAccountError] = useState("");
-  const [refreshing, setRefreshing] = useState(false);
   const [, setTick] = useState(0);
 
   // Load keywords + accounts from backend on mount
@@ -157,23 +156,6 @@ function App() {
       .catch(() => {});
   };
 
-  const triggerRefresh = () => {
-    if (refreshing) return;
-    setRefreshing(true);
-    fetch(API_BASE + "/api/refresh", { method: "POST" })
-      .then(() => {
-        // Wait a few seconds for the poll cycle to run, then fetch new alerts
-        setTimeout(() => {
-          fetch(API_BASE + "/api/alerts?limit=300")
-            .then(r => r.json())
-            .then(d => { if (d.alerts) setAlerts(d.alerts); })
-            .catch(() => {})
-            .finally(() => setRefreshing(false));
-        }, 5000);
-      })
-      .catch(() => setRefreshing(false));
-  };
-
   const toggleSource = (id) => setEnabledSources(prev =>
     prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]
   );
@@ -200,9 +182,6 @@ function App() {
           </span>
         </div>
         <div style={{ display: "flex", gap: 8 }}>
-          <button className="btn" onClick={triggerRefresh} disabled={refreshing} style={{ background: refreshing ? "#2A2A35" : "#14141F", color: refreshing ? "#666" : "#AAA", padding: "6px 14px", borderRadius: 6, fontSize: 12, opacity: refreshing ? 0.7 : 1 }}>
-            {refreshing ? "⟳ Polling..." : "⟳ Refresh"}
-          </button>
           <button className="btn" onClick={() => setShowConfig(!showConfig)} style={{ background: showConfig ? "#2A2A35" : "#14141F", color: "#AAA", padding: "6px 14px", borderRadius: 6, fontSize: 12 }}>⚙ Config</button>
           <button className="btn" onClick={() => setIsMonitoring(!isMonitoring)} style={{ background: isMonitoring ? "#1A2A1A" : "#2A1A1A", color: isMonitoring ? "#34C759" : "#FF3B30", padding: "6px 14px", borderRadius: 6, fontSize: 12 }}>
             {isMonitoring ? "● LIVE" : "■ PAUSED"}

@@ -288,6 +288,19 @@ class AlertStore:
             if h in self.seen_hashes:
                 return False
             self.seen_hashes.add(h)
+
+        # Fetch article text for deeper analysis (outside lock to avoid blocking)
+        article_text, fetched = fetch_article_text(url)
+        analysis_text = article_text if fetched else f"{title}. {snippet}"
+
+        # Run sentiment analysis
+        sentiment = analyze_sentiment(
+            analysis_text,
+            source_id=source_id,
+            matched_keywords=[keyword],
+        )
+
+        with self.lock:
             alert = {
                 "id": int(time.time() * 1000),
                 "source": source_id,
@@ -296,13 +309,21 @@ class AlertStore:
                 "url": url.strip(),
                 "snippet": (snippet or "").strip(),
                 "keyword": keyword.strip().lower(),
-                "severity": severity,
+                "severity": sentiment["severity"],
+                "sentiment": sentiment["sentiment"],
+                "sentiment_score": sentiment["score"],
+                "confidence": sentiment["confidence"],
+                "summary": sentiment["summary"],
+                "positive_signals": sentiment["positive_signals"],
+                "negative_signals": sentiment["negative_signals"],
+                "article_fetched": fetched,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
             self.alerts.insert(0, alert)
             if len(self.alerts) > self.max_alerts:
                 self.alerts = self.alerts[: self.max_alerts]
-            log.info(f"🔔 [{source_id}] keyword='{keyword}' → {title[:80]}")
+            emoji = {"positive": "📈", "negative": "📉", "neutral": "➡️"}.get(sentiment["sentiment"], "➡️")
+            log.info(f"{emoji} [{source_id}] {sentiment['sentiment']}({sentiment['score']:+.1f}) keyword='{keyword}' → {title[:70]}")
             return True
 
     def get_all(self, since=None, limit=None):
@@ -379,6 +400,238 @@ def extract_snippet(text, keyword, context_chars=120):
     if end < len(clean_text):
         snippet = snippet + "..."
     return snippet
+
+
+# ─── Sentiment Analysis Engine ────────────────────────────────────────────────
+
+# Source credibility weights — higher = more market impact
+SOURCE_WEIGHTS = {
+    "whitehouse": 1.0, "fed_reserve": 1.0, "sec_edgar": 0.95, "treasury": 0.95,
+    "federal_register": 0.9, "congress": 0.85,
+    "truthsocial": 0.9, "x_twitter": 0.85,
+    "reuters": 0.85, "ap_news": 0.85, "bloomberg": 0.85, "wsj": 0.8,
+    "ft": 0.8, "cnbc": 0.75, "nytimes": 0.7, "cnn": 0.65, "foxnews": 0.65,
+    "marketwatch": 0.7, "yahoo_finance": 0.6, "google_news": 0.55,
+    "newsapi": 0.6, "coindesk": 0.65, "cointelegraph": 0.6,
+    "eia": 0.75, "opec": 0.8,
+}
+
+# Sentiment word lists — weighted for financial/political context
+POSITIVE_SIGNALS = {
+    # Strong positive
+    "surge": 3, "soar": 3, "rally": 3, "boom": 3, "skyrocket": 3,
+    "breakthrough": 3, "historic deal": 4, "record high": 3,
+    # Moderate positive
+    "gain": 2, "rise": 2, "climb": 2, "jump": 2, "advance": 2,
+    "recover": 2, "rebound": 2, "uptick": 2, "bullish": 2,
+    "growth": 2, "expand": 2, "strong": 1.5, "boost": 2,
+    "optimism": 2, "confidence": 1.5, "upgrade": 2, "approve": 2,
+    "agreement": 2, "deal": 1.5, "cooperat": 1.5, "peace": 2,
+    "cut taxes": 3, "tax cut": 3, "rate cut": 2.5, "stimulus": 2.5,
+    "deregulat": 2, "ease restrictions": 2, "lift sanctions": 2,
+    "beat expectations": 3, "exceed": 2, "outperform": 2,
+    "profit": 1.5, "revenue growth": 2, "jobs added": 2,
+    "unemployment fell": 3, "unemployment low": 2,
+    "bipartisan": 1.5, "unanimously": 2, "signed into law": 2,
+}
+
+NEGATIVE_SIGNALS = {
+    # Strong negative
+    "crash": 4, "plunge": 4, "collapse": 4, "plummet": 4, "freefall": 4,
+    "crisis": 3, "catastroph": 3, "recession": 3, "depression": 3,
+    "default": 3, "bankrupt": 3, "insolven": 3,
+    # Moderate negative
+    "drop": 2, "fall": 1.5, "decline": 2, "slip": 1.5, "tumble": 2.5,
+    "selloff": 2.5, "sell-off": 2.5, "bearish": 2, "downturn": 2,
+    "loss": 1.5, "deficit": 1.5, "debt": 1, "inflation": 1.5,
+    "warn": 2, "threat": 2, "fear": 2, "concern": 1.5, "uncertain": 1.5,
+    "volatil": 1.5, "risk": 1, "panic": 3,
+    "sanction": 2, "tariff": 1.5, "trade war": 2.5, "ban": 2,
+    "restrict": 2, "penalt": 2, "fine": 1.5, "investigat": 1.5,
+    "indict": 3, "lawsuit": 2, "subpoena": 2,
+    "shutdown": 2.5, "layoff": 2.5, "cut jobs": 2.5, "downsiz": 2,
+    "missed expectations": 3, "underperform": 2, "downgrade": 2.5,
+    "impeach": 2, "veto": 2, "block": 1.5, "reject": 2, "oppose": 1.5,
+    "escalat": 2, "retaliat": 2.5, "war": 2, "conflict": 2, "invasion": 3,
+    "unemployment rose": 3, "unemployment high": 2,
+}
+
+AMPLIFIERS = {
+    "breaking": 1.5, "just in": 1.5, "alert": 1.3, "urgent": 1.5,
+    "exclusive": 1.3, "developing": 1.2, "major": 1.3,
+    "immediately": 1.4, "effective immediately": 1.6,
+    "executive order": 1.4, "signed": 1.2,
+}
+
+# Keyword combos that signal high market impact
+HIGH_IMPACT_COMBOS = [
+    ({"tariff", "china"}, 2.0),
+    ({"tariff", "eu"}, 1.8),
+    ({"tariff", "canada"}, 1.8),
+    ({"tariff", "mexico"}, 1.8),
+    ({"rate", "cut"}, 1.8),
+    ({"rate", "hike"}, 1.8),
+    ({"executive order"}, 1.5),
+    ({"fed", "rate"}, 1.7),
+    ({"sanctions", "russia"}, 1.6),
+    ({"sanctions", "iran"}, 1.6),
+    ({"sanctions", "china"}, 1.8),
+    ({"ban", "import"}, 1.7),
+    ({"trade", "deal"}, 1.6),
+    ({"debt", "ceiling"}, 1.8),
+    ({"government", "shutdown"}, 1.9),
+    ({"nuclear"}, 1.5),
+    ({"war"}, 1.5),
+    ({"invasion"}, 1.8),
+    ({"default"}, 2.0),
+    ({"recession"}, 1.8),
+]
+
+
+def fetch_article_text(url, timeout=10):
+    """
+    Attempt to fetch and extract the main text from an article URL.
+    Returns (text, success). Gracefully fails for paywalled/blocked content.
+    """
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                          "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        resp = requests.get(url, headers=headers, timeout=timeout, allow_redirects=True)
+        if resp.status_code != 200:
+            return "", False
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        # Remove scripts, styles, nav, footer, ads
+        for tag in soup.find_all(["script", "style", "nav", "footer", "aside",
+                                   "iframe", "noscript", "header"]):
+            tag.decompose()
+
+        # Try common article containers
+        article = None
+        for selector in ["article", '[role="main"]', ".article-body",
+                         ".story-body", ".post-content", ".entry-content",
+                         ".article-content", "#article-body", ".body-text"]:
+            article = soup.select_one(selector)
+            if article:
+                break
+
+        if article:
+            text = article.get_text(" ", strip=True)
+        else:
+            # Fallback: grab all <p> tags
+            paragraphs = soup.find_all("p")
+            text = " ".join(p.get_text(" ", strip=True) for p in paragraphs)
+
+        text = normalize_whitespace(text)
+
+        # If we got very little text, it's probably paywalled
+        if len(text) < 100:
+            return "", False
+
+        # Cap at ~3000 chars to keep analysis fast
+        return text[:3000], True
+
+    except Exception as e:
+        log.debug(f"Article fetch failed [{url[:60]}]: {e}")
+        return "", False
+
+
+def analyze_sentiment(text, source_id="", matched_keywords=None):
+    """
+    Analyze sentiment of text. Returns dict with:
+      - sentiment: "positive" | "negative" | "neutral"
+      - score: float from -10 to +10
+      - confidence: float 0-1
+      - summary: brief auto-generated summary
+      - market_signals: list of detected signal words
+    """
+    text_lower = text.lower()
+    matched_keywords = matched_keywords or []
+
+    pos_score = 0.0
+    neg_score = 0.0
+    pos_signals = []
+    neg_signals = []
+
+    # Score positive signals
+    for word, weight in POSITIVE_SIGNALS.items():
+        pattern = re.compile(rf"(?<!\w){re.escape(word)}", re.IGNORECASE)
+        matches = pattern.findall(text_lower)
+        if matches:
+            pos_score += weight * len(matches)
+            pos_signals.append(word)
+
+    # Score negative signals
+    for word, weight in NEGATIVE_SIGNALS.items():
+        pattern = re.compile(rf"(?<!\w){re.escape(word)}", re.IGNORECASE)
+        matches = pattern.findall(text_lower)
+        if matches:
+            neg_score += weight * len(matches)
+            neg_signals.append(word)
+
+    # Apply amplifiers
+    amplifier = 1.0
+    for word, mult in AMPLIFIERS.items():
+        if word.lower() in text_lower:
+            amplifier = max(amplifier, mult)
+
+    # Apply keyword combo bonuses
+    kw_set = set(k.lower() for k in matched_keywords)
+    combo_mult = 1.0
+    for combo_words, mult in HIGH_IMPACT_COMBOS:
+        if combo_words.issubset(kw_set) or all(w in text_lower for w in combo_words):
+            combo_mult = max(combo_mult, mult)
+
+    # Apply source weight
+    src_weight = SOURCE_WEIGHTS.get(source_id, 0.5)
+
+    # Calculate raw score (-10 to +10)
+    raw = (pos_score - neg_score) * amplifier * combo_mult * src_weight
+    score = max(-10.0, min(10.0, raw))
+
+    # Determine sentiment
+    if score > 1.5:
+        sentiment = "positive"
+    elif score < -1.5:
+        sentiment = "negative"
+    else:
+        sentiment = "neutral"
+
+    # Confidence based on signal density
+    total_signals = len(pos_signals) + len(neg_signals)
+    text_len = max(len(text.split()), 1)
+    confidence = min(1.0, (total_signals / text_len) * 10 + (abs(score) / 10) * 0.5)
+    confidence = round(confidence, 2)
+
+    # Auto-generate summary from first 2 sentences
+    sentences = re.split(r'(?<=[.!?])\s+', text[:500])
+    summary = " ".join(sentences[:2]).strip()
+    if len(summary) > 200:
+        summary = summary[:197] + "..."
+
+    # Severity based on composite score
+    abs_score = abs(score)
+    if abs_score >= 5:
+        severity = "high"
+    elif abs_score >= 2:
+        severity = "medium"
+    else:
+        severity = "low"
+
+    return {
+        "sentiment": sentiment,
+        "score": round(score, 2),
+        "confidence": confidence,
+        "severity": severity,
+        "summary": summary,
+        "positive_signals": pos_signals[:5],
+        "negative_signals": neg_signals[:5],
+    }
 
 
 def cleaned_entry_text(*parts):

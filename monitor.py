@@ -287,7 +287,7 @@ class AlertStore:
         dedupe_basis = url.strip() if url else f"{source_id}:{title.strip().lower()}"
         return hashlib.md5(dedupe_basis.encode()).hexdigest()
 
-    def add(self, source_id, source_name, title, url, snippet, keyword, severity="medium"):
+    def add(self, source_id, source_name, title, url, snippet, keyword, severity="medium", published_at=None):
         if not title or not is_valid_source_url(url):
             return False
         h = self._hash(source_id, title, url)
@@ -309,6 +309,14 @@ class AlertStore:
             ollama_model=self.ollama_model,
         )
 
+        # Format published_at for display
+        pub_str = ""
+        if published_at:
+            try:
+                pub_str = published_at.astimezone(timezone(timedelta(hours=-5))).strftime("%b %d, %I:%M %p EST")
+            except Exception:
+                pub_str = str(published_at)
+
         with self.lock:
             alert = {
                 "id": int(time.time() * 1000),
@@ -327,6 +335,7 @@ class AlertStore:
                 "positive_signals": sentiment["positive_signals"],
                 "negative_signals": sentiment["negative_signals"],
                 "article_fetched": fetched,
+                "published_at": pub_str,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
             self.alerts.insert(0, alert)
@@ -926,6 +935,7 @@ def poll_rss(keywords):
                             snippet=snippet,
                             keyword=kw,
                             severity=sev,
+                            published_at=entry_date,
                         )
             except Exception as e:
                 log.warning(f"RSS error [{source_id}] {feed_url}: {e}")
@@ -975,6 +985,7 @@ def poll_newsapi(keywords, api_key):
                         snippet=snippet,
                         keyword=matched_kw,
                         severity=sev,
+                        published_at=pub_date,
                     )
             time.sleep(1)
     except Exception as e:
@@ -1511,25 +1522,65 @@ def ollama_chat():
 # ─── Market Data API ──────────────────────────────────────────────────────────
 
 YAHOO_QUOTE_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-YAHOO_SEARCH_URL = "https://query1.finance.yahoo.com/v1/finance/search"
+COINGECKO_URL = "https://api.coingecko.com/api/v3"
 
-# Stored watchlist
+# Stored watchlist — items are {"symbol": "NVDA", "type": "stock"} or {"symbol": "bitcoin", "type": "crypto"}
 WATCHLIST_PATH = Path("watchlist.json")
-DEFAULT_WATCHLIST = ["NVDA"]
-DEFAULT_INDICES = ["^GSPC", "^IXIC", "^DJI", "SPY"]  # S&P 500, NASDAQ, DOW, SPY
+DEFAULT_WATCHLIST = [{"symbol": "NVDA", "type": "stock"}]
+DEFAULT_INDICES = ["^GSPC", "^IXIC", "^DJI", "SPY"]
+
+# Common crypto ID mapping (coingecko uses slugs)
+CRYPTO_MAP = {
+    "BTC": "bitcoin", "ETH": "ethereum", "SOL": "solana", "XRP": "ripple",
+    "ADA": "cardano", "DOGE": "dogecoin", "DOT": "polkadot", "AVAX": "avalanche-2",
+    "MATIC": "matic-network", "LINK": "chainlink", "UNI": "uniswap", "ATOM": "cosmos",
+    "LTC": "litecoin", "SHIB": "shiba-inu", "ARB": "arbitrum", "OP": "optimism",
+    "APT": "aptos", "SUI": "sui", "NEAR": "near", "FIL": "filecoin",
+    "PEPE": "pepe", "BONK": "bonk", "WIF": "dogwifcoin",
+}
+
+# Market news source config — separate from alert sources
+MARKET_NEWS_PATH = Path("market_news_config.json")
+DEFAULT_MARKET_NEWS_SOURCES = {
+    "reuters_markets": {"name": "Reuters Markets", "enabled": True, "feed": "https://feeds.reuters.com/reuters/businessNews"},
+    "cnbc_markets": {"name": "CNBC Markets", "enabled": True, "feed": "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=10001147"},
+    "bloomberg_markets": {"name": "Bloomberg Markets", "enabled": True, "feed": "https://feeds.bloomberg.com/markets/news.rss"},
+    "marketwatch": {"name": "MarketWatch", "enabled": True, "feed": "https://feeds.marketwatch.com/marketwatch/topstories"},
+    "yahoo_finance": {"name": "Yahoo Finance", "enabled": True, "feed": "https://finance.yahoo.com/news/rssindex"},
+    "coindesk": {"name": "CoinDesk", "enabled": False, "feed": "https://www.coindesk.com/arc/outboundfeeds/rss/"},
+    "cointelegraph": {"name": "CoinTelegraph", "enabled": False, "feed": "https://cointelegraph.com/rss"},
+}
 
 
 def load_watchlist():
     if not WATCHLIST_PATH.exists():
         WATCHLIST_PATH.write_text(json.dumps(DEFAULT_WATCHLIST))
     try:
-        return json.loads(WATCHLIST_PATH.read_text())
+        wl = json.loads(WATCHLIST_PATH.read_text())
+        # Migrate old format (list of strings) to new format
+        if wl and isinstance(wl[0], str):
+            wl = [{"symbol": s, "type": "stock"} for s in wl]
+            WATCHLIST_PATH.write_text(json.dumps(wl))
+        return wl
     except Exception:
         return DEFAULT_WATCHLIST
 
 
 def save_watchlist(wl):
     WATCHLIST_PATH.write_text(json.dumps(wl))
+
+
+def load_market_news_sources():
+    if not MARKET_NEWS_PATH.exists():
+        MARKET_NEWS_PATH.write_text(json.dumps(DEFAULT_MARKET_NEWS_SOURCES, indent=2))
+    try:
+        return json.loads(MARKET_NEWS_PATH.read_text())
+    except Exception:
+        return DEFAULT_MARKET_NEWS_SOURCES
+
+
+def save_market_news_sources(sources):
+    MARKET_NEWS_PATH.write_text(json.dumps(sources, indent=2))
 
 
 def fetch_yahoo_quote(symbol, range_str="1d", interval="5m"):
@@ -1551,7 +1602,6 @@ def fetch_yahoo_quote(symbol, range_str="1d", interval="5m"):
         closes = indicators.get("close", [])
         volumes = indicators.get("volume", [])
 
-        # Build chart points
         chart_data = []
         for i, ts in enumerate(timestamps):
             if i < len(closes) and closes[i] is not None:
@@ -1569,6 +1619,7 @@ def fetch_yahoo_quote(symbol, range_str="1d", interval="5m"):
         return {
             "symbol": meta.get("symbol", symbol).upper(),
             "name": meta.get("shortName", meta.get("longName", symbol)),
+            "type": "stock",
             "price": round(current, 2),
             "prev_close": round(prev_close, 2),
             "change": round(change, 2),
@@ -1583,15 +1634,95 @@ def fetch_yahoo_quote(symbol, range_str="1d", interval="5m"):
             "fifty_two_wk_high": round(meta.get("fiftyTwoWeekHigh", 0), 2),
             "fifty_two_wk_low": round(meta.get("fiftyTwoWeekLow", 0), 2),
             "chart": chart_data,
+            "valid": True,
         }
     except Exception as e:
         log.warning(f"Yahoo Finance error [{symbol}]: {e}")
         return None
 
 
+def fetch_crypto_quote(crypto_id, range_str="1d"):
+    """Fetch crypto data from CoinGecko (free, no key needed)."""
+    try:
+        # Map range to CoinGecko days param
+        days_map = {"1d": "1", "5d": "5", "1mo": "30", "3mo": "90", "6mo": "180", "1y": "365"}
+        days = days_map.get(range_str, "1")
+
+        # Get current price + market data
+        resp = requests.get(f"{COINGECKO_URL}/coins/{crypto_id}", params={
+            "localization": "false", "tickers": "false", "community_data": "false",
+            "developer_data": "false", "sparkline": "false"
+        }, timeout=10)
+        if resp.status_code != 200:
+            return None
+        coin = resp.json()
+        md = coin.get("market_data", {})
+
+        # Get chart data
+        chart_resp = requests.get(f"{COINGECKO_URL}/coins/{crypto_id}/market_chart", params={
+            "vs_currency": "usd", "days": days
+        }, timeout=10)
+        chart_data = []
+        if chart_resp.status_code == 200:
+            prices = chart_resp.json().get("prices", [])
+            for ts, price in prices:
+                chart_data.append({
+                    "time": datetime.fromtimestamp(ts / 1000, tz=timezone.utc).isoformat(),
+                    "close": round(price, 2),
+                    "volume": 0,
+                })
+
+        current = md.get("current_price", {}).get("usd", 0)
+        change_24h = md.get("price_change_24h", 0) or 0
+        change_pct = md.get("price_change_percentage_24h", 0) or 0
+        symbol = coin.get("symbol", crypto_id).upper()
+
+        return {
+            "symbol": symbol,
+            "name": coin.get("name", crypto_id),
+            "type": "crypto",
+            "price": round(current, 2),
+            "prev_close": round(current - change_24h, 2),
+            "change": round(change_24h, 2),
+            "change_pct": round(change_pct, 2),
+            "currency": "USD",
+            "exchange": "Crypto",
+            "market_state": "24/7",
+            "day_high": round(md.get("high_24h", {}).get("usd", 0), 2),
+            "day_low": round(md.get("low_24h", {}).get("usd", 0), 2),
+            "volume": md.get("total_volume", {}).get("usd", 0),
+            "market_cap": md.get("market_cap", {}).get("usd", 0),
+            "fifty_two_wk_high": round(md.get("ath", {}).get("usd", 0), 2),
+            "fifty_two_wk_low": round(md.get("atl", {}).get("usd", 0), 2),
+            "chart": chart_data,
+            "valid": True,
+            "coingecko_id": crypto_id,
+        }
+    except Exception as e:
+        log.warning(f"CoinGecko error [{crypto_id}]: {e}")
+        return None
+
+
+def resolve_crypto_id(symbol):
+    """Resolve a crypto ticker to a CoinGecko ID."""
+    sym = symbol.upper().strip()
+    if sym in CRYPTO_MAP:
+        return CRYPTO_MAP[sym]
+    # Try searching CoinGecko
+    try:
+        resp = requests.get(f"{COINGECKO_URL}/search", params={"query": sym}, timeout=10)
+        if resp.status_code == 200:
+            coins = resp.json().get("coins", [])
+            if coins:
+                return coins[0]["id"]
+    except Exception:
+        pass
+    return None
+
+
 @app.route("/api/market/indices")
 def get_indices():
-    """Get major index data — S&P 500, NASDAQ, DOW, SPY."""
+    """Get major index data."""
     range_str = request.args.get("range", "1d")
     interval = request.args.get("interval", "5m")
     results = {}
@@ -1604,13 +1735,23 @@ def get_indices():
 
 @app.route("/api/market/quote/<symbol>")
 def get_quote(symbol):
-    """Get detailed quote + chart for a specific symbol."""
+    """Get detailed quote + chart for a stock or crypto."""
     range_str = request.args.get("range", "1d")
     interval = request.args.get("interval", "5m")
-    data = fetch_yahoo_quote(symbol.upper(), range_str, interval)
-    if data:
-        return jsonify({"quote": data})
-    return jsonify({"error": f"Could not fetch data for {symbol}"}), 404
+    asset_type = request.args.get("type", "stock")
+
+    if asset_type == "crypto":
+        crypto_id = resolve_crypto_id(symbol)
+        if crypto_id:
+            data = fetch_crypto_quote(crypto_id, range_str)
+            if data:
+                return jsonify({"quote": data})
+        return jsonify({"error": f"Crypto '{symbol}' not found"}), 404
+    else:
+        data = fetch_yahoo_quote(symbol.upper(), range_str, interval)
+        if data:
+            return jsonify({"quote": data})
+        return jsonify({"error": f"Stock '{symbol}' not found"}), 404
 
 
 @app.route("/api/market/watchlist")
@@ -1618,30 +1759,174 @@ def get_watchlist():
     """Get watchlist with live quotes."""
     wl = load_watchlist()
     quotes = {}
-    for sym in wl:
-        data = fetch_yahoo_quote(sym, "1d", "5m")
-        if data:
-            quotes[sym] = data
-    return jsonify({"watchlist": wl, "quotes": quotes})
+    errors = []
+    for item in wl:
+        sym = item["symbol"]
+        atype = item.get("type", "stock")
+        if atype == "crypto":
+            crypto_id = resolve_crypto_id(sym)
+            if crypto_id:
+                data = fetch_crypto_quote(crypto_id)
+                if data:
+                    quotes[sym] = data
+                    continue
+            errors.append(sym)
+        else:
+            data = fetch_yahoo_quote(sym, "1d", "5m")
+            if data:
+                quotes[sym] = data
+            else:
+                errors.append(sym)
+    return jsonify({"watchlist": wl, "quotes": quotes, "errors": errors})
 
 
 @app.route("/api/market/watchlist", methods=["POST"])
 def update_watchlist():
-    """Add or remove symbols from watchlist."""
+    """Add or remove symbols from watchlist with validation."""
     data = request.get_json(silent=True) or {}
     wl = load_watchlist()
 
     if data.get("add"):
         sym = data["add"].upper().strip()
-        if sym and sym not in wl:
-            wl.append(sym)
-            save_watchlist(wl)
+        atype = data.get("type", "stock")
+        # Check for duplicates
+        for item in wl:
+            if item["symbol"] == sym:
+                return jsonify({"watchlist": wl, "status": "exists"})
+
+        # Validate the symbol actually exists
+        if atype == "crypto":
+            crypto_id = resolve_crypto_id(sym)
+            if not crypto_id:
+                return jsonify({"error": f"Crypto '{sym}' not found. Try the full name or common ticker (BTC, ETH, SOL, etc.)"}), 404
+            wl.append({"symbol": sym, "type": "crypto"})
+        else:
+            test = fetch_yahoo_quote(sym, "1d", "5m")
+            if not test:
+                return jsonify({"error": f"Stock ticker '{sym}' not found"}), 404
+            wl.append({"symbol": sym, "type": "stock"})
+
+        save_watchlist(wl)
+        return jsonify({"watchlist": wl, "status": "added"})
+
     elif data.get("remove"):
         sym = data["remove"].upper().strip()
-        wl = [s for s in wl if s != sym]
+        wl = [item for item in wl if item["symbol"] != sym]
         save_watchlist(wl)
+        return jsonify({"watchlist": wl, "status": "removed"})
 
     return jsonify({"watchlist": wl})
+
+
+# ─── Market News ──────────────────────────────────────────────────────────────
+
+@app.route("/api/market/news")
+def get_market_news():
+    """Fetch market news from configured sources. Optional ?symbol= to filter by ticker."""
+    symbol = request.args.get("symbol", "").upper()
+    sources = load_market_news_sources()
+    articles = []
+
+    for src_id, src in sources.items():
+        if not src.get("enabled", True):
+            continue
+        try:
+            feed = feedparser.parse(src["feed"])
+            for entry in feed.entries[:10]:
+                entry_date = parse_entry_date(entry)
+                if not is_fresh(entry_date, 24):  # 24h for market news
+                    continue
+                title = normalize_whitespace(entry.get("title", ""))
+                summary = normalize_whitespace(entry.get("summary", entry.get("description", "")))
+                link = normalize_whitespace(entry.get("link", ""))
+                if not title or not is_valid_source_url(link):
+                    continue
+                # If symbol filter, check if mentioned
+                if symbol and symbol.lower() not in title.lower() and symbol.lower() not in summary.lower():
+                    continue
+                pub_str = ""
+                if entry_date:
+                    try:
+                        pub_str = entry_date.astimezone(timezone(timedelta(hours=-5))).strftime("%b %d, %I:%M %p EST")
+                    except Exception:
+                        pass
+                articles.append({
+                    "title": title,
+                    "summary": BeautifulSoup(summary or "", "html.parser").get_text(" ")[:200],
+                    "url": link,
+                    "source": src["name"],
+                    "published_at": pub_str,
+                })
+        except Exception as e:
+            log.debug(f"Market news error [{src_id}]: {e}")
+
+    return jsonify({"articles": articles[:30]})
+
+
+@app.route("/api/market/news-sources")
+def get_market_news_sources():
+    return jsonify({"sources": load_market_news_sources()})
+
+
+@app.route("/api/market/news-sources", methods=["POST"])
+def update_market_news_sources():
+    data = request.get_json(silent=True) or {}
+    sources = load_market_news_sources()
+    if data.get("toggle"):
+        src_id = data["toggle"]
+        if src_id in sources:
+            sources[src_id]["enabled"] = not sources[src_id].get("enabled", True)
+            save_market_news_sources(sources)
+    return jsonify({"sources": sources})
+
+
+# ─── CSV Template Download ────────────────────────────────────────────────────
+
+@app.route("/api/signal-sets/template.csv")
+def csv_template():
+    """Download a CSV template for signal word import."""
+    csv_content = (
+        "word,sentiment,weight\n"
+        "bull run,positive,3\n"
+        "moon,positive,2.5\n"
+        "rug pull,negative,4\n"
+        "liquidation,negative,3\n"
+        "breakout,positive,2\n"
+        "flash crash,negative,4\n"
+        "accumulation,positive,2\n"
+        "pump and dump,negative,3.5\n"
+    )
+    return csv_content, 200, {
+        "Content-Type": "text/csv",
+        "Content-Disposition": "attachment; filename=signal_words_template.csv",
+    }
+
+
+# ─── Signal Set Weight Editing ────────────────────────────────────────────────
+
+@app.route("/api/signal-sets/edit-weight", methods=["POST"])
+def edit_signal_weight():
+    """Edit the weight of an existing signal word."""
+    data = request.get_json(silent=True) or {}
+    set_id = data.get("set_id")
+    sentiment = data.get("sentiment")
+    word = data.get("word", "").strip().lower()
+    new_weight = data.get("weight")
+
+    if not all([set_id, sentiment, word, new_weight is not None]):
+        return jsonify({"error": "Provide set_id, sentiment, word, and weight"}), 400
+
+    sets = load_signal_sets()
+    if set_id not in sets:
+        return jsonify({"error": f"Set '{set_id}' not found"}), 404
+    if sentiment not in ("positive", "negative"):
+        return jsonify({"error": "sentiment must be 'positive' or 'negative'"}), 400
+    if word not in sets[set_id].get(sentiment, {}):
+        return jsonify({"error": f"Word '{word}' not found in {set_id}/{sentiment}"}), 404
+
+    sets[set_id][sentiment][word] = float(new_weight)
+    save_signal_sets(sets)
+    return jsonify({"status": "updated", "sets": sets})
 
 
 _monitor_started = False

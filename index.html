@@ -249,28 +249,56 @@ function App() {
     }).then(r => r.json()).then(d => { if (d.sets) setSignalSets(d.sets); }).catch(() => {});
   };
 
+  const editSignalWeight = (setId, sentiment, word, newWeight) => {
+    fetch(API_BASE + "/api/signal-sets/edit-weight", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ set_id: setId, sentiment, word, weight: parseFloat(newWeight) })
+    }).then(r => r.json()).then(d => { if (d.sets) setSignalSets(d.sets); }).catch(() => {});
+  };
+
   // Market data
+  const [assetType, setAssetType] = useState("stock");
+  const [addError, setAddError] = useState("");
+  const [addingSymbol, setAddingSymbol] = useState(false);
+  const [marketNews, setMarketNews] = useState([]);
+  const [stockNews, setStockNews] = useState([]);
+  const [marketNewsSources, setMarketNewsSources] = useState({});
+
   useEffect(() => {
     if (mainView !== "market") return;
     const loadMarket = () => {
       fetch(API_BASE + "/api/market/indices?range=" + selectedRange + "&interval=" + (selectedRange === "1d" ? "5m" : selectedRange === "5d" ? "15m" : "1d"))
         .then(r => r.json()).then(d => { if (d.indices) setIndices(d.indices); }).catch(() => {});
       fetch(API_BASE + "/api/market/watchlist")
-        .then(r => r.json()).then(d => { if (d.watchlist) setWatchlist(d.watchlist); if (d.quotes) setWatchlistQuotes(d.quotes); }).catch(() => {});
+        .then(r => r.json()).then(d => {
+          if (d.watchlist) setWatchlist(d.watchlist);
+          if (d.quotes) setWatchlistQuotes(d.quotes);
+        }).catch(() => {});
+      fetch(API_BASE + "/api/market/news")
+        .then(r => r.json()).then(d => { if (d.articles) setMarketNews(d.articles); }).catch(() => {});
+      fetch(API_BASE + "/api/market/news-sources")
+        .then(r => r.json()).then(d => { if (d.sources) setMarketNewsSources(d.sources); }).catch(() => {});
     };
     loadMarket();
-    const iv = setInterval(loadMarket, 30000);
+    const iv = setInterval(loadMarket, 60000);
     return () => clearInterval(iv);
   }, [mainView, selectedRange]);
 
   const addToWatchlist = () => {
     const sym = newSymbol.trim().toUpperCase();
     if (!sym) return;
-    fetch(API_BASE + "/api/market/watchlist", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ add: sym }) })
-      .then(r => r.json()).then(d => { if (d.watchlist) setWatchlist(d.watchlist); setNewSymbol(""); })
-      .catch(() => {});
-    fetch(API_BASE + "/api/market/quote/" + sym + "?range=" + selectedRange)
-      .then(r => r.json()).then(d => { if (d.quote) setWatchlistQuotes(prev => ({...prev, [sym]: d.quote})); }).catch(() => {});
+    setAddingSymbol(true); setAddError("");
+    fetch(API_BASE + "/api/market/watchlist", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ add: sym, type: assetType })
+    }).then(r => r.json()).then(d => {
+      if (d.error) { setAddError(d.error); setAddingSymbol(false); return; }
+      if (d.watchlist) setWatchlist(d.watchlist);
+      setNewSymbol(""); setAddingSymbol(false);
+      // Fetch quote for the new symbol
+      fetch(API_BASE + "/api/market/quote/" + sym + "?type=" + assetType + "&range=" + selectedRange)
+        .then(r => r.json()).then(qd => { if (qd.quote) setWatchlistQuotes(prev => ({...prev, [sym]: qd.quote})); }).catch(() => {});
+    }).catch(() => { setAddError("Network error"); setAddingSymbol(false); });
   };
 
   const removeFromWatchlist = (sym) => {
@@ -281,9 +309,20 @@ function App() {
   };
 
   const selectStock = (sym) => {
-    setSelectedStock(sym);
-    fetch(API_BASE + "/api/market/quote/" + sym + "?range=" + selectedRange + "&interval=" + (selectedRange === "1d" ? "5m" : selectedRange === "5d" ? "15m" : "1d"))
+    const item = watchlist.find(w => w.symbol === sym);
+    const atype = item ? item.type : "stock";
+    setSelectedStock(selectedStock === sym ? null : sym);
+    setStockNews([]);
+    fetch(API_BASE + "/api/market/quote/" + sym + "?type=" + atype + "&range=" + selectedRange + "&interval=" + (selectedRange === "1d" ? "5m" : selectedRange === "5d" ? "15m" : "1d"))
       .then(r => r.json()).then(d => { if (d.quote) setWatchlistQuotes(prev => ({...prev, [sym]: d.quote})); }).catch(() => {});
+    // Fetch news for this symbol
+    fetch(API_BASE + "/api/market/news?symbol=" + sym)
+      .then(r => r.json()).then(d => { if (d.articles) setStockNews(d.articles); }).catch(() => {});
+  };
+
+  const toggleMarketNewsSource = (srcId) => {
+    fetch(API_BASE + "/api/market/news-sources", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ toggle: srcId }) })
+      .then(r => r.json()).then(d => { if (d.sources) setMarketNewsSources(d.sources); }).catch(() => {});
   };
 
   // Ollama chat
@@ -440,7 +479,7 @@ function App() {
                 <label className="btn" style={{ display: "inline-block", background: "#5448C8", color: "#fff", padding: "4px 10px", borderRadius: 4, fontSize: 10, cursor: "pointer" }}>
                   Choose CSV <input type="file" accept=".csv" onChange={importCsv} style={{ display: "none" }} />
                 </label>
-                <span style={{ fontSize: 8, color: "#555", marginLeft: 6 }}>word,sentiment,weight</span>
+                <a href={API_BASE + "/api/signal-sets/template.csv"} download style={{ fontSize: 9, color: "#5A8FD4", marginLeft: 8, textDecoration: "none" }}>⬇ Download Template</a>
               </div>
 
               {/* Signal set categories */}
@@ -457,16 +496,24 @@ function App() {
                     {set.enabled && (
                       <div style={{ padding: "0 10px 8px" }}>
                         <div style={{ fontSize: 9, color: "#34C759", marginBottom: 3 }}>POSITIVE</div>
-                        <div style={{ display: "flex", flexWrap: "wrap", gap: 3, marginBottom: 6 }}>
+                        <div style={{ display: "flex", flexWrap: "wrap", gap: 3, marginBottom: 6, maxHeight: 120, overflowY: "auto" }}>
                           {Object.entries(set.positive || {}).map(([w, wt]) => (
-                            <span key={w} className="kw-tag" onClick={() => removeSignalWord(setId, "positive", w)} style={{ background: "#34C75915", padding: "2px 6px", borderRadius: 3, fontSize: 9, color: "#34C759", border: "1px solid #34C75922" }}>{w} ({wt})</span>
+                            <span key={w} style={{ background: "#34C75915", padding: "2px 4px", borderRadius: 3, fontSize: 9, color: "#34C759", border: "1px solid #34C75922", display: "inline-flex", alignItems: "center", gap: 3 }}>
+                              {w}
+                              <input type="number" value={wt} step="0.5" min="0.5" max="5" onChange={e => editSignalWeight(setId, "positive", w, e.target.value)} style={{ width: 28, background: "#0A0A0F", border: "1px solid #34C75933", borderRadius: 2, color: "#34C759", fontSize: 8, textAlign: "center", padding: "0 2px", fontFamily: "inherit", outline: "none" }} />
+                              <span className="kw-tag" onClick={() => removeSignalWord(setId, "positive", w)} style={{ color: "#555", fontSize: 8, cursor: "pointer" }}>✕</span>
+                            </span>
                           ))}
                           {Object.keys(set.positive || {}).length === 0 && <span style={{ fontSize: 9, color: "#333" }}>none</span>}
                         </div>
                         <div style={{ fontSize: 9, color: "#FF3B30", marginBottom: 3 }}>NEGATIVE</div>
-                        <div style={{ display: "flex", flexWrap: "wrap", gap: 3 }}>
+                        <div style={{ display: "flex", flexWrap: "wrap", gap: 3, maxHeight: 120, overflowY: "auto" }}>
                           {Object.entries(set.negative || {}).map(([w, wt]) => (
-                            <span key={w} className="kw-tag" onClick={() => removeSignalWord(setId, "negative", w)} style={{ background: "#FF3B3015", padding: "2px 6px", borderRadius: 3, fontSize: 9, color: "#FF3B30", border: "1px solid #FF3B3022" }}>{w} ({wt})</span>
+                            <span key={w} style={{ background: "#FF3B3015", padding: "2px 4px", borderRadius: 3, fontSize: 9, color: "#FF3B30", border: "1px solid #FF3B3022", display: "inline-flex", alignItems: "center", gap: 3 }}>
+                              {w}
+                              <input type="number" value={wt} step="0.5" min="0.5" max="5" onChange={e => editSignalWeight(setId, "negative", w, e.target.value)} style={{ width: 28, background: "#0A0A0F", border: "1px solid #FF3B3033", borderRadius: 2, color: "#FF3B30", fontSize: 8, textAlign: "center", padding: "0 2px", fontFamily: "inherit", outline: "none" }} />
+                              <span className="kw-tag" onClick={() => removeSignalWord(setId, "negative", w)} style={{ color: "#555", fontSize: 8, cursor: "pointer" }}>✕</span>
+                            </span>
                           ))}
                           {Object.keys(set.negative || {}).length === 0 && <span style={{ fontSize: 9, color: "#333" }}>none</span>}
                         </div>
@@ -598,6 +645,7 @@ function App() {
                       <span style={{ fontSize: 10, background: "#5448C820", padding: "2px 8px", borderRadius: 3, color: "#8B80F0", border: "1px solid #5448C833" }}>{a.keyword}</span>
                       {a.url && <a href={a.url} target="_blank" rel="noopener noreferrer" className="src-link">↗ View Source</a>}
                       <span style={{ fontSize: 10, color: "#444", marginLeft: "auto" }}>{timeAgo(a.timestamp)}</span>
+                      {a.published_at ? <span style={{ fontSize: 9, color: "#555" }}>📅 {a.published_at}</span> : <span style={{ fontSize: 9, color: "#333" }}>⏱ no pub date</span>}
                       <span style={{ fontSize: 9, color: "#333" }}>{new Date(a.timestamp).toLocaleTimeString()}</span>
                     </div>
                   </div>
@@ -642,55 +690,94 @@ function App() {
 
             {/* Watchlist */}
             <div style={{ fontSize: 10, fontWeight: 600, color: "#666", letterSpacing: 2, marginBottom: 12, textTransform: "uppercase" }}>Watchlist</div>
-            <div style={{ display: "flex", gap: 6, marginBottom: 16 }}>
-              <input value={newSymbol} onChange={e => setNewSymbol(e.target.value.toUpperCase())} onKeyDown={e => e.key === "Enter" && addToWatchlist()} placeholder="Add symbol (e.g. AAPL)..." style={{ flex: 1, maxWidth: 250, background: "#14141F", border: "1px solid #2A2A35", borderRadius: 6, padding: "6px 10px", color: "#E8E8ED", fontSize: 12, outline: "none", fontFamily: "inherit" }} />
-              <button className="btn" onClick={addToWatchlist} style={{ background: "#5448C8", color: "#fff", padding: "6px 14px", borderRadius: 6, fontSize: 12 }}>+</button>
+            <div style={{ display: "flex", gap: 6, marginBottom: 8, flexWrap: "wrap", alignItems: "center" }}>
+              <div style={{ display: "flex", borderRadius: 6, overflow: "hidden", border: "1px solid #2A2A35" }}>
+                <button className="btn" onClick={() => setAssetType("stock")} style={{ padding: "6px 12px", fontSize: 11, background: assetType === "stock" ? "#5448C8" : "#14141F", color: assetType === "stock" ? "#fff" : "#AAA", borderRadius: 0 }}>Stock</button>
+                <button className="btn" onClick={() => setAssetType("crypto")} style={{ padding: "6px 12px", fontSize: 11, background: assetType === "crypto" ? "#F7931A" : "#14141F", color: assetType === "crypto" ? "#fff" : "#AAA", borderRadius: 0 }}>Crypto</button>
+              </div>
+              <input value={newSymbol} onChange={e => { setNewSymbol(e.target.value.toUpperCase()); setAddError(""); }} onKeyDown={e => e.key === "Enter" && addToWatchlist()} placeholder={assetType === "crypto" ? "BTC, ETH, SOL..." : "AAPL, TSLA, MSFT..."} style={{ flex: 1, maxWidth: 220, background: "#14141F", border: "1px solid #2A2A35", borderRadius: 6, padding: "6px 10px", color: "#E8E8ED", fontSize: 12, outline: "none", fontFamily: "inherit" }} />
+              <button className="btn" onClick={addToWatchlist} disabled={addingSymbol} style={{ background: "#5448C8", color: "#fff", padding: "6px 14px", borderRadius: 6, fontSize: 12, opacity: addingSymbol ? 0.5 : 1 }}>{addingSymbol ? "..." : "+"}</button>
             </div>
+            {addError && <div style={{ fontSize: 10, color: "#FF3B30", marginBottom: 10 }}>⚠ {addError}</div>}
 
             <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))", gap: 10, marginBottom: 24 }}>
-              {watchlist.map(sym => {
+              {watchlist.map(item => {
+                const sym = item.symbol;
                 const q = watchlistQuotes[sym];
-                if (!q) return <div key={sym} style={{ background: "#0F0F18", borderRadius: 8, padding: 14, border: "1px solid #1A1A25", color: "#555", fontSize: 11 }}>{sym} — loading...</div>;
+                if (!q) return <div key={sym} style={{ background: "#0F0F18", borderRadius: 8, padding: 14, border: "1px solid #1A1A25", color: "#555", fontSize: 11 }}>{item.type === "crypto" ? "₿" : "📊"} {sym} — loading...</div>;
                 const isUp = q.change >= 0;
                 const isSelected = selectedStock === sym;
                 return (
                   <div key={sym} className="src-toggle" onClick={() => selectStock(sym)} style={{ background: isSelected ? "#14141F" : "#0F0F18", borderRadius: 8, padding: 14, border: isSelected ? "1px solid #5448C8" : "1px solid #1A1A25", cursor: "pointer" }}>
                     <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
                       <div>
-                        <span style={{ fontSize: 14, fontWeight: 700, color: "#E8E8ED" }}>{sym}</span>
+                        <span style={{ fontSize: 14, fontWeight: 700, color: "#E8E8ED" }}>{q.type === "crypto" ? "₿ " : ""}{sym}</span>
                         <span style={{ fontSize: 10, color: "#555", marginLeft: 6 }}>{q.name}</span>
                       </div>
                       <span className="kw-tag" onClick={e => { e.stopPropagation(); removeFromWatchlist(sym); }} style={{ fontSize: 10, color: "#555", padding: "2px 4px" }}>✕</span>
                     </div>
                     <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 8 }}>
-                      <span style={{ fontSize: 20, fontWeight: 700, color: "#E8E8ED", fontFamily: "'Space Grotesk',sans-serif" }}>${q.price}</span>
+                      <span style={{ fontSize: 20, fontWeight: 700, color: "#E8E8ED", fontFamily: "'Space Grotesk',sans-serif" }}>${q.price?.toLocaleString()}</span>
                       <span style={{ fontSize: 12, color: isUp ? "#34C759" : "#FF3B30", fontWeight: 600 }}>
                         {isUp ? "▲" : "▼"} {q.change > 0 ? "+" : ""}{q.change} ({q.change_pct > 0 ? "+" : ""}{q.change_pct}%)
                       </span>
                     </div>
                     <Sparkline data={q.chart} width={250} height={50} color={isUp ? "#34C759" : "#FF3B30"} />
                     {isSelected && (
-                      <div style={{ marginTop: 10, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
-                        {[
-                          ["Day High", "$" + q.day_high],
-                          ["Day Low", "$" + q.day_low],
-                          ["Volume", (q.volume || 0).toLocaleString()],
-                          ["Prev Close", "$" + q.prev_close],
-                          ["52w High", "$" + q.fifty_two_wk_high],
-                          ["52w Low", "$" + q.fifty_two_wk_low],
-                          ["Exchange", q.exchange],
-                          ["Mkt Cap", q.market_cap ? (q.market_cap > 1e12 ? (q.market_cap/1e12).toFixed(1)+"T" : q.market_cap > 1e9 ? (q.market_cap/1e9).toFixed(1)+"B" : (q.market_cap/1e6).toFixed(0)+"M") : "N/A"],
-                        ].map(([l,v]) => (
-                          <div key={l} style={{ fontSize: 10 }}>
-                            <span style={{ color: "#555" }}>{l}: </span>
-                            <span style={{ color: "#AAA" }}>{v}</span>
+                      <div style={{ marginTop: 10 }}>
+                        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6, marginBottom: 10 }}>
+                          {[
+                            ["Day High", "$" + q.day_high], ["Day Low", "$" + q.day_low],
+                            ["Volume", (q.volume || 0).toLocaleString()], ["Prev Close", "$" + q.prev_close],
+                            ["52w High", "$" + q.fifty_two_wk_high], ["52w Low", "$" + q.fifty_two_wk_low],
+                            ["Exchange", q.exchange],
+                            ["Mkt Cap", q.market_cap ? (q.market_cap > 1e12 ? (q.market_cap/1e12).toFixed(1)+"T" : q.market_cap > 1e9 ? (q.market_cap/1e9).toFixed(1)+"B" : (q.market_cap/1e6).toFixed(0)+"M") : "N/A"],
+                          ].map(([l,v]) => (
+                            <div key={l} style={{ fontSize: 10 }}><span style={{ color: "#555" }}>{l}: </span><span style={{ color: "#AAA" }}>{v}</span></div>
+                          ))}
+                        </div>
+                        {/* News for this stock */}
+                        {stockNews.length > 0 && (
+                          <div style={{ borderTop: "1px solid #1A1A25", paddingTop: 8 }}>
+                            <div style={{ fontSize: 9, color: "#666", letterSpacing: 1, textTransform: "uppercase", marginBottom: 6 }}>Related News (24h)</div>
+                            {stockNews.slice(0, 5).map((n, i) => (
+                              <a key={i} href={n.url} target="_blank" rel="noopener noreferrer" style={{ display: "block", fontSize: 10, color: "#AAA", textDecoration: "none", padding: "4px 0", borderBottom: "1px solid #0A0A0F", lineHeight: 1.4 }}>
+                                {n.title}
+                                <span style={{ fontSize: 8, color: "#555", marginLeft: 6 }}>{n.source} · {n.published_at}</span>
+                              </a>
+                            ))}
                           </div>
-                        ))}
+                        )}
                       </div>
                     )}
                   </div>
                 );
               })}
+            </div>
+
+            {/* Market News Feed */}
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+              <div style={{ fontSize: 10, fontWeight: 600, color: "#666", letterSpacing: 2, textTransform: "uppercase" }}>Market News</div>
+              <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+                {Object.entries(marketNewsSources).map(([id, src]) => (
+                  <button key={id} className="btn" onClick={() => toggleMarketNewsSource(id)} style={{ fontSize: 8, padding: "2px 6px", borderRadius: 3, background: src.enabled ? "#1A2A1A" : "#14141F", color: src.enabled ? "#34C759" : "#555", border: "1px solid " + (src.enabled ? "#34C75933" : "#2A2A35") }}>{src.name}</button>
+                ))}
+              </div>
+            </div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+              {marketNews.slice(0, 15).map((n, i) => (
+                <a key={i} href={n.url} target="_blank" rel="noopener noreferrer" style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 10, padding: "8px 10px", background: "#0F0F18", borderRadius: 6, border: "1px solid #1A1A25", textDecoration: "none" }}>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontSize: 12, color: "#E8E8ED", lineHeight: 1.3 }}>{n.title}</div>
+                    {n.summary && <div style={{ fontSize: 10, color: "#555", marginTop: 3 }}>{n.summary}</div>}
+                  </div>
+                  <div style={{ textAlign: "right", flexShrink: 0 }}>
+                    <div style={{ fontSize: 9, color: "#5448C8" }}>{n.source}</div>
+                    <div style={{ fontSize: 8, color: "#555" }}>{n.published_at}</div>
+                  </div>
+                </a>
+              ))}
+              {marketNews.length === 0 && <div style={{ color: "#333", fontSize: 11, padding: 20, textAlign: "center" }}>Loading market news...</div>}
             </div>
           </div>
           )}

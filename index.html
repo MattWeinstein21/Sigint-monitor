@@ -88,6 +88,25 @@ function App() {
   const [accountError, setAccountError] = useState("");
   const [refreshing, setRefreshing] = useState(false);
   const [sentimentFilter, setSentimentFilter] = useState("all");
+  const [signalSets, setSignalSets] = useState({});
+  const [configTab, setConfigTab] = useState("general");
+  const [expandedAlerts, setExpandedAlerts] = useState(new Set());
+  const [newSignalWord, setNewSignalWord] = useState("");
+  const [newSignalSet, setNewSignalSet] = useState("");
+  const [newSignalSentiment, setNewSignalSentiment] = useState("positive");
+  const [mainView, setMainView] = useState("alerts"); // "alerts" | "market"
+  const [indices, setIndices] = useState({});
+  const [watchlist, setWatchlist] = useState([]);
+  const [watchlistQuotes, setWatchlistQuotes] = useState({});
+  const [newSymbol, setNewSymbol] = useState("");
+  const [selectedStock, setSelectedStock] = useState(null);
+  const [selectedRange, setSelectedRange] = useState("1d");
+  const [chatQuestion, setChatQuestion] = useState("");
+  const [chatAlertId, setChatAlertId] = useState(null);
+  const [chatAnswer, setChatAnswer] = useState("");
+  const [chatLoading, setChatLoading] = useState(false);
+  const [csvSetId, setCsvSetId] = useState("custom");
+  const [csvNewLabel, setCsvNewLabel] = useState("");
   const [, setTick] = useState(0);
 
   // Load keywords + accounts from backend on mount
@@ -99,6 +118,10 @@ function App() {
     fetch(API_BASE + "/api/accounts")
       .then(r => r.json())
       .then(d => { if (d.accounts) setAccounts(d.accounts); })
+      .catch(() => {});
+    fetch(API_BASE + "/api/signal-sets")
+      .then(r => r.json())
+      .then(d => { if (d.sets) setSignalSets(d.sets); })
       .catch(() => {});
   }, []);
 
@@ -197,6 +220,103 @@ function App() {
     prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]
   );
 
+  const toggleExpand = (id) => setExpandedAlerts(prev => {
+    const next = new Set(prev);
+    next.has(id) ? next.delete(id) : next.add(id);
+    return next;
+  });
+
+  const toggleSignalSet = (setId) => {
+    fetch(API_BASE + "/api/signal-sets", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ toggle: setId })
+    }).then(r => r.json()).then(d => { if (d.sets) setSignalSets(d.sets); }).catch(() => {});
+  };
+
+  const addSignalWord = () => {
+    const word = newSignalWord.trim().toLowerCase();
+    if (!word || !newSignalSet) return;
+    fetch(API_BASE + "/api/signal-sets", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ set_id: newSignalSet, sentiment: newSignalSentiment, add: word, weight: 2 })
+    }).then(r => r.json()).then(d => { if (d.sets) setSignalSets(d.sets); setNewSignalWord(""); }).catch(() => {});
+  };
+
+  const removeSignalWord = (setId, sentiment, word) => {
+    fetch(API_BASE + "/api/signal-sets", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ set_id: setId, sentiment, remove: word })
+    }).then(r => r.json()).then(d => { if (d.sets) setSignalSets(d.sets); }).catch(() => {});
+  };
+
+  // Market data
+  useEffect(() => {
+    if (mainView !== "market") return;
+    const loadMarket = () => {
+      fetch(API_BASE + "/api/market/indices?range=" + selectedRange + "&interval=" + (selectedRange === "1d" ? "5m" : selectedRange === "5d" ? "15m" : "1d"))
+        .then(r => r.json()).then(d => { if (d.indices) setIndices(d.indices); }).catch(() => {});
+      fetch(API_BASE + "/api/market/watchlist")
+        .then(r => r.json()).then(d => { if (d.watchlist) setWatchlist(d.watchlist); if (d.quotes) setWatchlistQuotes(d.quotes); }).catch(() => {});
+    };
+    loadMarket();
+    const iv = setInterval(loadMarket, 30000);
+    return () => clearInterval(iv);
+  }, [mainView, selectedRange]);
+
+  const addToWatchlist = () => {
+    const sym = newSymbol.trim().toUpperCase();
+    if (!sym) return;
+    fetch(API_BASE + "/api/market/watchlist", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ add: sym }) })
+      .then(r => r.json()).then(d => { if (d.watchlist) setWatchlist(d.watchlist); setNewSymbol(""); })
+      .catch(() => {});
+    fetch(API_BASE + "/api/market/quote/" + sym + "?range=" + selectedRange)
+      .then(r => r.json()).then(d => { if (d.quote) setWatchlistQuotes(prev => ({...prev, [sym]: d.quote})); }).catch(() => {});
+  };
+
+  const removeFromWatchlist = (sym) => {
+    fetch(API_BASE + "/api/market/watchlist", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ remove: sym }) })
+      .then(r => r.json()).then(d => { if (d.watchlist) setWatchlist(d.watchlist); }).catch(() => {});
+    setWatchlistQuotes(prev => { const n = {...prev}; delete n[sym]; return n; });
+    if (selectedStock === sym) setSelectedStock(null);
+  };
+
+  const selectStock = (sym) => {
+    setSelectedStock(sym);
+    fetch(API_BASE + "/api/market/quote/" + sym + "?range=" + selectedRange + "&interval=" + (selectedRange === "1d" ? "5m" : selectedRange === "5d" ? "15m" : "1d"))
+      .then(r => r.json()).then(d => { if (d.quote) setWatchlistQuotes(prev => ({...prev, [sym]: d.quote})); }).catch(() => {});
+  };
+
+  // Ollama chat
+  const askFollowUp = (alertId) => {
+    if (!chatQuestion.trim()) return;
+    setChatLoading(true); setChatAlertId(alertId); setChatAnswer("");
+    fetch(API_BASE + "/api/chat", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ alert_id: alertId, question: chatQuestion }) })
+      .then(r => r.json()).then(d => { setChatAnswer(d.answer || d.error || "No response"); setChatLoading(false); })
+      .catch(() => { setChatAnswer("Failed to reach Ollama"); setChatLoading(false); });
+  };
+
+  // CSV import
+  const importCsv = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const formData = new FormData();
+    formData.append("file", file);
+    formData.append("set_id", csvSetId === "__new__" ? "__new__" : csvSetId);
+    if (csvSetId === "__new__") formData.append("new_set_label", csvNewLabel);
+    fetch(API_BASE + "/api/signal-sets/import", { method: "POST", body: formData })
+      .then(r => r.json()).then(d => { if (d.sets) setSignalSets(d.sets); e.target.value = ""; }).catch(() => {});
+  };
+
+  // Mini sparkline SVG component
+  const Sparkline = ({data, width, height, color}) => {
+    if (!data || data.length < 2) return null;
+    const vals = data.map(d => d.close);
+    const min = Math.min(...vals), max = Math.max(...vals);
+    const range = max - min || 1;
+    const points = vals.map((v, i) => `${(i / (vals.length - 1)) * width},${height - ((v - min) / range) * height}`).join(" ");
+    return <svg width={width} height={height} style={{display:"block"}}><polyline points={points} fill="none" stroke={color} strokeWidth="1.5"/></svg>;
+  };
+
   const filtered = alerts.filter(a => {
     if (filter !== "all" && a.keyword !== filter) return false;
     if (severityFilter !== "all" && a.severity !== severityFilter) return false;
@@ -222,6 +342,8 @@ function App() {
           </span>
         </div>
         <div style={{ display: "flex", gap: 8 }}>
+          <button className="btn" onClick={() => setMainView("alerts")} style={{ background: mainView === "alerts" ? "#5448C8" : "#14141F", color: mainView === "alerts" ? "#fff" : "#AAA", padding: "6px 14px", borderRadius: 6, fontSize: 12 }}>📋 Alerts</button>
+          <button className="btn" onClick={() => setMainView("market")} style={{ background: mainView === "market" ? "#5448C8" : "#14141F", color: mainView === "market" ? "#fff" : "#AAA", padding: "6px 14px", borderRadius: 6, fontSize: 12 }}>📊 Markets</button>
           <button className="btn" onClick={triggerRefresh} disabled={refreshing} style={{ background: refreshing ? "#2A2A35" : "#14141F", color: refreshing ? "#666" : "#AAA", padding: "6px 14px", borderRadius: 6, fontSize: 12, opacity: refreshing ? 0.7 : 1 }}>
             {refreshing ? "⟳ Polling..." : "⟳ Refresh"}
           </button>
@@ -241,51 +363,121 @@ function App() {
 
       <div style={{ display: "flex", height: backendConnected ? "calc(100vh - 57px)" : "calc(100vh - 89px)" }}>
         {/* Sidebar */}
-        <div style={{ width: showConfig ? 320 : 0, overflow: "hidden", transition: "width 0.3s", borderRight: "1px solid #1A1A25", flexShrink: 0 }}>
-          <div style={{ width: 320, padding: 20, overflowY: "auto", height: "100%" }}>
-            <div style={{ marginBottom: 24 }}>
-              <div style={{ fontSize: 10, fontWeight: 600, color: "#666", letterSpacing: 2, marginBottom: 10, textTransform: "uppercase" }}>Keywords ({keywords.length})</div>
-              <div style={{ display: "flex", gap: 6, marginBottom: 12 }}>
-                <input value={newKeyword} onChange={e => setNewKeyword(e.target.value)} onKeyDown={e => e.key === "Enter" && addKeyword()} placeholder="add keyword..." style={{ flex: 1, background: "#14141F", border: "1px solid #2A2A35", borderRadius: 6, padding: "6px 10px", color: "#E8E8ED", fontSize: 12, outline: "none", fontFamily: "inherit" }} />
-                <button className="btn" onClick={addKeyword} style={{ background: "#5448C8", color: "#fff", padding: "6px 12px", borderRadius: 6, fontSize: 12 }}>+</button>
-              </div>
-              <div style={{ display: "flex", flexWrap: "wrap", gap: 6, maxHeight: 200, overflowY: "auto" }}>
-                {keywords.map(k => <span key={k} className="kw-tag" onClick={() => removeKeyword(k)} style={{ background: "#1A1A25", padding: "4px 10px", borderRadius: 4, fontSize: 11, color: "#AAA", display: "flex", alignItems: "center", gap: 6 }}>{k} <span style={{ color: "#555", fontSize: 10 }}>✕</span></span>)}
-              </div>
+        <div style={{ width: showConfig ? 360 : 0, overflow: "hidden", transition: "width 0.3s", borderRight: "1px solid #1A1A25", flexShrink: 0 }}>
+          <div style={{ width: 360, padding: 0, overflowY: "auto", height: "100%" }}>
+            {/* Config tabs */}
+            <div style={{ display: "flex", borderBottom: "1px solid #1A1A25" }}>
+              {[{id:"general",label:"General"},{id:"signals",label:"Signal Words"},{id:"sources",label:"Sources"}].map(tab => (
+                <button key={tab.id} className="btn" onClick={() => setConfigTab(tab.id)} style={{ flex: 1, padding: "8px 0", fontSize: 10, letterSpacing: 1, textTransform: "uppercase", background: configTab === tab.id ? "#14141F" : "transparent", color: configTab === tab.id ? "#E8E8ED" : "#555", borderBottom: configTab === tab.id ? "2px solid #5448C8" : "2px solid transparent" }}>{tab.label}</button>
+              ))}
             </div>
 
-            {/* Monitored Accounts */}
-            <div style={{ marginBottom: 24 }}>
-              <div style={{ fontSize: 10, fontWeight: 600, color: "#666", letterSpacing: 2, marginBottom: 10, textTransform: "uppercase" }}>Monitored Accounts ({accounts.length})</div>
-              <div style={{ display: "flex", gap: 6, marginBottom: 8 }}>
-                <input value={newAccountUrl} onChange={e => { setNewAccountUrl(e.target.value); setAccountError(""); }} onKeyDown={e => e.key === "Enter" && addAccount()} placeholder="paste profile URL..." style={{ flex: 1, background: "#14141F", border: "1px solid #2A2A35", borderRadius: 6, padding: "6px 10px", color: "#E8E8ED", fontSize: 11, outline: "none", fontFamily: "inherit" }} />
-                <button className="btn" onClick={addAccount} style={{ background: "#5448C8", color: "#fff", padding: "6px 12px", borderRadius: 6, fontSize: 12 }}>+</button>
+            <div style={{ padding: 16 }}>
+            {configTab === "general" && (<>
+              {/* Keywords */}
+              <div style={{ marginBottom: 24 }}>
+                <div style={{ fontSize: 10, fontWeight: 600, color: "#666", letterSpacing: 2, marginBottom: 10, textTransform: "uppercase" }}>Keywords ({keywords.length})</div>
+                <div style={{ display: "flex", gap: 6, marginBottom: 12 }}>
+                  <input value={newKeyword} onChange={e => setNewKeyword(e.target.value)} onKeyDown={e => e.key === "Enter" && addKeyword()} placeholder="add keyword..." style={{ flex: 1, background: "#14141F", border: "1px solid #2A2A35", borderRadius: 6, padding: "6px 10px", color: "#E8E8ED", fontSize: 12, outline: "none", fontFamily: "inherit" }} />
+                  <button className="btn" onClick={addKeyword} style={{ background: "#5448C8", color: "#fff", padding: "6px 12px", borderRadius: 6, fontSize: 12 }}>+</button>
+                </div>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 6, maxHeight: 200, overflowY: "auto" }}>
+                  {keywords.map(k => <span key={k} className="kw-tag" onClick={() => removeKeyword(k)} style={{ background: "#1A1A25", padding: "4px 10px", borderRadius: 4, fontSize: 11, color: "#AAA", display: "flex", alignItems: "center", gap: 6 }}>{k} <span style={{ color: "#555", fontSize: 10 }}>✕</span></span>)}
+                </div>
               </div>
-              <div style={{ fontSize: 9, color: "#555", marginBottom: 6, lineHeight: 1.5 }}>
-                Supports: x.com/username · truthsocial.com/@username
-              </div>
-              {accountError && <div style={{ fontSize: 10, color: "#FF3B30", marginBottom: 6 }}>⚠ {accountError}</div>}
-              <div style={{ display: "flex", flexDirection: "column", gap: 4, maxHeight: 200, overflowY: "auto" }}>
-                {accounts.map(a => {
-                  const isX = a.platform === "x";
-                  const profileUrl = isX ? "https://x.com/" + a.username : "https://truthsocial.com/@" + a.username;
-                  return (
+
+              {/* Monitored Accounts */}
+              <div style={{ marginBottom: 24 }}>
+                <div style={{ fontSize: 10, fontWeight: 600, color: "#666", letterSpacing: 2, marginBottom: 10, textTransform: "uppercase" }}>Monitored Accounts ({accounts.length})</div>
+                <div style={{ display: "flex", gap: 6, marginBottom: 8 }}>
+                  <input value={newAccountUrl} onChange={e => { setNewAccountUrl(e.target.value); setAccountError(""); }} onKeyDown={e => e.key === "Enter" && addAccount()} placeholder="paste profile URL..." style={{ flex: 1, background: "#14141F", border: "1px solid #2A2A35", borderRadius: 6, padding: "6px 10px", color: "#E8E8ED", fontSize: 11, outline: "none", fontFamily: "inherit" }} />
+                  <button className="btn" onClick={addAccount} style={{ background: "#5448C8", color: "#fff", padding: "6px 12px", borderRadius: 6, fontSize: 12 }}>+</button>
+                </div>
+                <div style={{ fontSize: 9, color: "#555", marginBottom: 6 }}>x.com/username · truthsocial.com/@username</div>
+                {accountError && <div style={{ fontSize: 10, color: "#FF3B30", marginBottom: 6 }}>⚠ {accountError}</div>}
+                <div style={{ display: "flex", flexDirection: "column", gap: 4, maxHeight: 180, overflowY: "auto" }}>
+                  {accounts.map(a => (
                     <div key={a.platform + ":" + a.username} style={{ display: "flex", alignItems: "center", gap: 8, padding: "5px 8px", borderRadius: 6, background: "#14141F" }}>
-                      <span style={{ fontSize: 14, flexShrink: 0 }}>{isX ? "𝕏" : "📢"}</span>
-                      <div style={{ flex: 1, minWidth: 0 }}>
-                        <a href={profileUrl} target="_blank" rel="noopener noreferrer" style={{ fontSize: 11, color: "#CCC", textDecoration: "none" }}>@{a.username}</a>
-                        {a.label && a.label !== "@" + a.username && <span style={{ fontSize: 9, color: "#555", marginLeft: 6 }}>{a.label}</span>}
-                      </div>
-                      <span style={{ fontSize: 9, color: "#555", textTransform: "uppercase" }}>{a.platform}</span>
-                      <span className="kw-tag" onClick={() => removeAccount(a.platform, a.username)} style={{ fontSize: 10, color: "#555", cursor: "pointer", padding: "2px 4px" }}>✕</span>
+                      <span style={{ fontSize: 14, flexShrink: 0 }}>{a.platform === "x" ? "𝕏" : "📢"}</span>
+                      <a href={(a.platform === "x" ? "https://x.com/" : "https://truthsocial.com/@") + a.username} target="_blank" rel="noopener noreferrer" style={{ fontSize: 11, color: "#CCC", textDecoration: "none", flex: 1 }}>@{a.username}</a>
+                      <span className="kw-tag" onClick={() => removeAccount(a.platform, a.username)} style={{ fontSize: 10, color: "#555", padding: "2px 4px" }}>✕</span>
                     </div>
-                  );
-                })}
-                {accounts.length === 0 && <div style={{ fontSize: 11, color: "#333", padding: 4 }}>No accounts added</div>}
+                  ))}
+                </div>
               </div>
-            </div>
+            </>)}
 
-            <div>
+            {configTab === "signals" && (<>
+              <div style={{ fontSize: 10, fontWeight: 600, color: "#666", letterSpacing: 2, marginBottom: 12, textTransform: "uppercase" }}>Signal Word Sets</div>
+              <div style={{ fontSize: 9, color: "#555", marginBottom: 12, lineHeight: 1.5 }}>
+                Toggle sets on/off to focus analysis on relevant sectors. Click any word to remove it.
+              </div>
+
+              {/* Add word form */}
+              <div style={{ display: "flex", gap: 4, marginBottom: 12, flexWrap: "wrap" }}>
+                <input value={newSignalWord} onChange={e => setNewSignalWord(e.target.value)} onKeyDown={e => e.key === "Enter" && addSignalWord()} placeholder="new word..." style={{ flex: 1, minWidth: 80, background: "#14141F", border: "1px solid #2A2A35", borderRadius: 6, padding: "5px 8px", color: "#E8E8ED", fontSize: 11, outline: "none", fontFamily: "inherit" }} />
+                <select value={newSignalSet} onChange={e => setNewSignalSet(e.target.value)} style={{ background: "#14141F", border: "1px solid #2A2A35", borderRadius: 6, padding: "5px 6px", color: "#AAA", fontSize: 10, fontFamily: "inherit", outline: "none" }}>
+                  <option value="">set...</option>
+                  {Object.entries(signalSets).map(([id, s]) => <option key={id} value={id}>{s.label}</option>)}
+                </select>
+                <select value={newSignalSentiment} onChange={e => setNewSignalSentiment(e.target.value)} style={{ background: "#14141F", border: "1px solid #2A2A35", borderRadius: 6, padding: "5px 6px", color: "#AAA", fontSize: 10, fontFamily: "inherit", outline: "none" }}>
+                  <option value="positive">+ Pos</option>
+                  <option value="negative">− Neg</option>
+                </select>
+                <button className="btn" onClick={addSignalWord} style={{ background: "#5448C8", color: "#fff", padding: "5px 10px", borderRadius: 6, fontSize: 11 }}>+</button>
+              </div>
+
+              {/* CSV Import */}
+              <div style={{ marginBottom: 12, padding: 8, background: "#0F0F18", borderRadius: 6, border: "1px solid #1A1A25" }}>
+                <div style={{ fontSize: 9, fontWeight: 600, color: "#666", letterSpacing: 1, marginBottom: 6, textTransform: "uppercase" }}>Import CSV</div>
+                <div style={{ display: "flex", gap: 4, marginBottom: 6, flexWrap: "wrap" }}>
+                  <select value={csvSetId} onChange={e => setCsvSetId(e.target.value)} style={{ flex: 1, minWidth: 70, background: "#14141F", border: "1px solid #2A2A35", borderRadius: 4, padding: "4px 6px", color: "#AAA", fontSize: 10, fontFamily: "inherit", outline: "none" }}>
+                    {Object.entries(signalSets).map(([id, s]) => <option key={id} value={id}>{s.label}</option>)}
+                    <option value="__new__">+ New Set</option>
+                  </select>
+                  {csvSetId === "__new__" && <input value={csvNewLabel} onChange={e => setCsvNewLabel(e.target.value)} placeholder="Set name..." style={{ flex: 1, background: "#14141F", border: "1px solid #2A2A35", borderRadius: 4, padding: "4px 6px", color: "#E8E8ED", fontSize: 10, outline: "none", fontFamily: "inherit" }} />}
+                </div>
+                <label className="btn" style={{ display: "inline-block", background: "#5448C8", color: "#fff", padding: "4px 10px", borderRadius: 4, fontSize: 10, cursor: "pointer" }}>
+                  Choose CSV <input type="file" accept=".csv" onChange={importCsv} style={{ display: "none" }} />
+                </label>
+                <span style={{ fontSize: 8, color: "#555", marginLeft: 6 }}>word,sentiment,weight</span>
+              </div>
+
+              {/* Signal set categories */}
+              <div style={{ display: "flex", flexDirection: "column", gap: 8, maxHeight: "calc(100vh - 280px)", overflowY: "auto" }}>
+                {Object.entries(signalSets).map(([setId, set]) => (
+                  <div key={setId} style={{ background: "#0F0F18", borderRadius: 6, border: "1px solid #1A1A25", overflow: "hidden" }}>
+                    <div className="src-toggle" onClick={() => toggleSignalSet(setId)} style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 10px" }}>
+                      <div style={{ width: 8, height: 8, borderRadius: "50%", background: set.enabled ? "#34C759" : "#555" }} />
+                      <span style={{ fontSize: 11, fontWeight: 600, color: set.enabled ? "#E8E8ED" : "#555" }}>{set.label}</span>
+                      <span style={{ marginLeft: "auto", fontSize: 9, color: "#555" }}>
+                        {Object.keys(set.positive || {}).length}+ / {Object.keys(set.negative || {}).length}−
+                      </span>
+                    </div>
+                    {set.enabled && (
+                      <div style={{ padding: "0 10px 8px" }}>
+                        <div style={{ fontSize: 9, color: "#34C759", marginBottom: 3 }}>POSITIVE</div>
+                        <div style={{ display: "flex", flexWrap: "wrap", gap: 3, marginBottom: 6 }}>
+                          {Object.entries(set.positive || {}).map(([w, wt]) => (
+                            <span key={w} className="kw-tag" onClick={() => removeSignalWord(setId, "positive", w)} style={{ background: "#34C75915", padding: "2px 6px", borderRadius: 3, fontSize: 9, color: "#34C759", border: "1px solid #34C75922" }}>{w} ({wt})</span>
+                          ))}
+                          {Object.keys(set.positive || {}).length === 0 && <span style={{ fontSize: 9, color: "#333" }}>none</span>}
+                        </div>
+                        <div style={{ fontSize: 9, color: "#FF3B30", marginBottom: 3 }}>NEGATIVE</div>
+                        <div style={{ display: "flex", flexWrap: "wrap", gap: 3 }}>
+                          {Object.entries(set.negative || {}).map(([w, wt]) => (
+                            <span key={w} className="kw-tag" onClick={() => removeSignalWord(setId, "negative", w)} style={{ background: "#FF3B3015", padding: "2px 6px", borderRadius: 3, fontSize: 9, color: "#FF3B30", border: "1px solid #FF3B3022" }}>{w} ({wt})</span>
+                          ))}
+                          {Object.keys(set.negative || {}).length === 0 && <span style={{ fontSize: 9, color: "#333" }}>none</span>}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </>)}
+
+            {configTab === "sources" && (<>
               <div style={{ fontSize: 10, fontWeight: 600, color: "#666", letterSpacing: 2, marginBottom: 10, textTransform: "uppercase" }}>Sources ({enabledSources.length}/{SOURCES.length})</div>
               <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
                 {SOURCES.map(s => (
@@ -296,12 +488,15 @@ function App() {
                   </div>
                 ))}
               </div>
+            </>)}
             </div>
           </div>
         </div>
 
         {/* Main */}
         <div style={{ flex: 1, display: "flex", flexDirection: "column", minWidth: 0 }}>
+
+          {mainView === "alerts" && (<>
           {/* Stats */}
           <div style={{ display: "flex", gap: 1, padding: "12px 20px", borderBottom: "1px solid #1A1A25" }}>
             {[
@@ -354,6 +549,7 @@ function App() {
               const sentColor = sentColors[sent] || "#8E8E93";
               const sentIcon = sentIcons[sent] || "➡️";
               const scoreStr = a.sentiment_score != null ? (a.sentiment_score > 0 ? "+" : "") + a.sentiment_score.toFixed(1) : "";
+              const isExpanded = expandedAlerts.has(a.id);
               return (
                 <div key={a.id} className="alert-row" style={{ display: "flex", gap: 12, padding: "12px 20px", borderBottom: "1px solid #111118", borderLeft: "3px solid " + sentColor + "44" }}>
                   <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 4, width: 44, flexShrink: 0, paddingTop: 2 }}>
@@ -362,42 +558,45 @@ function App() {
                     <span style={{ fontSize: 14 }}>{sentIcon}</span>
                   </div>
                   <div style={{ flex: 1, minWidth: 0 }}>
-                    <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
-                      <span style={{ fontSize: 13, fontWeight: 500, color: "#E8E8ED", lineHeight: 1.3 }}>{a.title}</span>
-                    </div>
+                    <div style={{ fontSize: 13, fontWeight: 500, color: "#E8E8ED", lineHeight: 1.3, marginBottom: 4 }}>{a.title}</div>
 
-                    {/* Summary */}
+                    {/* Expandable Summary */}
                     {a.summary && (
-                      <div style={{ fontSize: 11, color: "#999", lineHeight: 1.5, marginBottom: 4, padding: "4px 8px", background: "#0F0F18", borderRadius: 4, borderLeft: "2px solid " + sentColor + "66" }}>
-                        {a.summary}
+                      <div style={{ marginBottom: 4 }}>
+                        <button className="btn" onClick={() => toggleExpand(a.id)} style={{ fontSize: 9, color: "#666", background: "none", padding: "2px 0", marginBottom: 3, display: "flex", alignItems: "center", gap: 4 }}>
+                          <span style={{ fontSize: 8, transition: "transform 0.2s", transform: isExpanded ? "rotate(90deg)" : "rotate(0deg)", display: "inline-block" }}>▶</span>
+                          {isExpanded ? "Hide Summary" : "Show Summary"}
+                          {a.ai_summary && <span style={{ fontSize: 8, background: "#5448C820", color: "#8B80F0", padding: "1px 4px", borderRadius: 3 }}>🤖 AI</span>}
+                          {!a.ai_summary && a.article_fetched && <span style={{ fontSize: 8, color: "#444" }}>◉ full text</span>}
+                        </button>
+                        {isExpanded && (
+                          <div style={{ marginTop: 2 }}>
+                            <div style={{ fontSize: 11, color: "#BBB", lineHeight: 1.6, padding: "8px 10px", background: "#0F0F18", borderRadius: 6, borderLeft: "2px solid " + sentColor + "66" }}>
+                              {a.summary}
+                            </div>
+                            {/* Ollama follow-up chat */}
+                            <div style={{ display: "flex", gap: 4, marginTop: 6 }}>
+                              <input value={chatAlertId === a.id ? chatQuestion : ""} onChange={e => { setChatAlertId(a.id); setChatQuestion(e.target.value); }} onKeyDown={e => e.key === "Enter" && askFollowUp(a.id)} placeholder="Ask a follow-up question..." style={{ flex: 1, background: "#14141F", border: "1px solid #2A2A35", borderRadius: 4, padding: "4px 8px", color: "#E8E8ED", fontSize: 10, outline: "none", fontFamily: "inherit" }} />
+                              <button className="btn" onClick={() => askFollowUp(a.id)} disabled={chatLoading} style={{ background: "#5448C8", color: "#fff", padding: "4px 10px", borderRadius: 4, fontSize: 10, opacity: chatLoading ? 0.5 : 1 }}>{chatLoading && chatAlertId === a.id ? "..." : "Ask"}</button>
+                            </div>
+                            {chatAlertId === a.id && chatAnswer && (
+                              <div style={{ fontSize: 10, color: "#AAA", lineHeight: 1.5, padding: "6px 10px", background: "#0A0A14", borderRadius: 4, marginTop: 4, borderLeft: "2px solid #5448C866" }}>
+                                🤖 {chatAnswer}
+                              </div>
+                            )}
+                          </div>
+                        )}
                       </div>
                     )}
 
-                    <div style={{ fontSize: 11, color: "#555", lineHeight: 1.5, marginBottom: 6 }}>{a.snippet}</div>
-
                     <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
-                      {/* Sentiment badge */}
-                      <span style={{ fontSize: 10, padding: "2px 8px", borderRadius: 3, color: sentColor, background: sentColor + "15", border: "1px solid " + sentColor + "33", fontWeight: 600 }}>
-                        {sent.toUpperCase()} {scoreStr}
-                      </span>
-
-                      {/* Confidence */}
-                      {a.confidence != null && (
-                        <span style={{ fontSize: 9, color: "#555" }}>{Math.round(a.confidence * 100)}% conf</span>
-                      )}
-
-                      {/* Signal words */}
-                      {a.positive_signals && a.positive_signals.length > 0 && (
-                        <span style={{ fontSize: 9, color: "#34C759" }}>+{a.positive_signals.join(", +")}</span>
-                      )}
-                      {a.negative_signals && a.negative_signals.length > 0 && (
-                        <span style={{ fontSize: 9, color: "#FF3B30" }}>−{a.negative_signals.join(", −")}</span>
-                      )}
-
+                      <span style={{ fontSize: 10, padding: "2px 8px", borderRadius: 3, color: sentColor, background: sentColor + "15", border: "1px solid " + sentColor + "33", fontWeight: 600 }}>{sent.toUpperCase()} {scoreStr}</span>
+                      {a.confidence != null && <span style={{ fontSize: 9, color: "#555" }}>{Math.round(a.confidence * 100)}% conf</span>}
+                      {a.positive_signals && a.positive_signals.length > 0 && <span style={{ fontSize: 9, color: "#34C759" }}>+{a.positive_signals.join(", +")}</span>}
+                      {a.negative_signals && a.negative_signals.length > 0 && <span style={{ fontSize: 9, color: "#FF3B30" }}>−{a.negative_signals.join(", −")}</span>}
                       <span style={{ fontSize: 10, background: "#1A1A25", padding: "2px 8px", borderRadius: 3, color: src.color, border: "1px solid " + src.color + "33" }}>{a.source_name || src.name}</span>
                       <span style={{ fontSize: 10, background: "#5448C820", padding: "2px 8px", borderRadius: 3, color: "#8B80F0", border: "1px solid #5448C833" }}>{a.keyword}</span>
                       {a.url && <a href={a.url} target="_blank" rel="noopener noreferrer" className="src-link">↗ View Source</a>}
-                      {a.article_fetched && <span style={{ fontSize: 8, color: "#444" }}>◉ full text</span>}
                       <span style={{ fontSize: 10, color: "#444", marginLeft: "auto" }}>{timeAgo(a.timestamp)}</span>
                       <span style={{ fontSize: 9, color: "#333" }}>{new Date(a.timestamp).toLocaleTimeString()}</span>
                     </div>
@@ -406,6 +605,96 @@ function App() {
               );
             })}
           </div>
+          </>)}
+
+          {/* ═══ MARKET DASHBOARD ═══ */}
+          {mainView === "market" && (
+          <div style={{ flex: 1, overflowY: "auto", padding: 20 }}>
+
+            {/* Index Cards */}
+            <div style={{ fontSize: 10, fontWeight: 600, color: "#666", letterSpacing: 2, marginBottom: 12, textTransform: "uppercase" }}>Major Indices</div>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: 10, marginBottom: 24 }}>
+              {Object.entries(indices).map(([sym, q]) => {
+                const isUp = q.change >= 0;
+                return (
+                  <div key={sym} style={{ background: "#0F0F18", borderRadius: 8, padding: 14, border: "1px solid #1A1A25" }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}>
+                      <span style={{ fontSize: 11, fontWeight: 600, color: "#E8E8ED" }}>{q.name || sym}</span>
+                      <span style={{ fontSize: 9, color: "#555" }}>{q.market_state}</span>
+                    </div>
+                    <div style={{ fontSize: 20, fontWeight: 700, color: "#E8E8ED", fontFamily: "'Space Grotesk',sans-serif" }}>${q.price?.toLocaleString()}</div>
+                    <div style={{ fontSize: 12, color: isUp ? "#34C759" : "#FF3B30", fontWeight: 600, marginBottom: 8 }}>
+                      {isUp ? "▲" : "▼"} {q.change > 0 ? "+" : ""}{q.change} ({q.change_pct > 0 ? "+" : ""}{q.change_pct}%)
+                    </div>
+                    <Sparkline data={q.chart} width={180} height={40} color={isUp ? "#34C759" : "#FF3B30"} />
+                  </div>
+                );
+              })}
+              {Object.keys(indices).length === 0 && <div style={{ color: "#333", fontSize: 12, padding: 20 }}>Loading market data...</div>}
+            </div>
+
+            {/* Range selector */}
+            <div style={{ display: "flex", gap: 6, marginBottom: 16 }}>
+              {[["1d","1D"],["5d","5D"],["1mo","1M"],["3mo","3M"],["6mo","6M"],["1y","1Y"]].map(([val, label]) => (
+                <button key={val} className="btn" onClick={() => setSelectedRange(val)} style={{ background: selectedRange === val ? "#5448C8" : "#14141F", color: selectedRange === val ? "#fff" : "#AAA", padding: "4px 12px", borderRadius: 4, fontSize: 10 }}>{label}</button>
+              ))}
+            </div>
+
+            {/* Watchlist */}
+            <div style={{ fontSize: 10, fontWeight: 600, color: "#666", letterSpacing: 2, marginBottom: 12, textTransform: "uppercase" }}>Watchlist</div>
+            <div style={{ display: "flex", gap: 6, marginBottom: 16 }}>
+              <input value={newSymbol} onChange={e => setNewSymbol(e.target.value.toUpperCase())} onKeyDown={e => e.key === "Enter" && addToWatchlist()} placeholder="Add symbol (e.g. AAPL)..." style={{ flex: 1, maxWidth: 250, background: "#14141F", border: "1px solid #2A2A35", borderRadius: 6, padding: "6px 10px", color: "#E8E8ED", fontSize: 12, outline: "none", fontFamily: "inherit" }} />
+              <button className="btn" onClick={addToWatchlist} style={{ background: "#5448C8", color: "#fff", padding: "6px 14px", borderRadius: 6, fontSize: 12 }}>+</button>
+            </div>
+
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))", gap: 10, marginBottom: 24 }}>
+              {watchlist.map(sym => {
+                const q = watchlistQuotes[sym];
+                if (!q) return <div key={sym} style={{ background: "#0F0F18", borderRadius: 8, padding: 14, border: "1px solid #1A1A25", color: "#555", fontSize: 11 }}>{sym} — loading...</div>;
+                const isUp = q.change >= 0;
+                const isSelected = selectedStock === sym;
+                return (
+                  <div key={sym} className="src-toggle" onClick={() => selectStock(sym)} style={{ background: isSelected ? "#14141F" : "#0F0F18", borderRadius: 8, padding: 14, border: isSelected ? "1px solid #5448C8" : "1px solid #1A1A25", cursor: "pointer" }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+                      <div>
+                        <span style={{ fontSize: 14, fontWeight: 700, color: "#E8E8ED" }}>{sym}</span>
+                        <span style={{ fontSize: 10, color: "#555", marginLeft: 6 }}>{q.name}</span>
+                      </div>
+                      <span className="kw-tag" onClick={e => { e.stopPropagation(); removeFromWatchlist(sym); }} style={{ fontSize: 10, color: "#555", padding: "2px 4px" }}>✕</span>
+                    </div>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 8 }}>
+                      <span style={{ fontSize: 20, fontWeight: 700, color: "#E8E8ED", fontFamily: "'Space Grotesk',sans-serif" }}>${q.price}</span>
+                      <span style={{ fontSize: 12, color: isUp ? "#34C759" : "#FF3B30", fontWeight: 600 }}>
+                        {isUp ? "▲" : "▼"} {q.change > 0 ? "+" : ""}{q.change} ({q.change_pct > 0 ? "+" : ""}{q.change_pct}%)
+                      </span>
+                    </div>
+                    <Sparkline data={q.chart} width={250} height={50} color={isUp ? "#34C759" : "#FF3B30"} />
+                    {isSelected && (
+                      <div style={{ marginTop: 10, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
+                        {[
+                          ["Day High", "$" + q.day_high],
+                          ["Day Low", "$" + q.day_low],
+                          ["Volume", (q.volume || 0).toLocaleString()],
+                          ["Prev Close", "$" + q.prev_close],
+                          ["52w High", "$" + q.fifty_two_wk_high],
+                          ["52w Low", "$" + q.fifty_two_wk_low],
+                          ["Exchange", q.exchange],
+                          ["Mkt Cap", q.market_cap ? (q.market_cap > 1e12 ? (q.market_cap/1e12).toFixed(1)+"T" : q.market_cap > 1e9 ? (q.market_cap/1e9).toFixed(1)+"B" : (q.market_cap/1e6).toFixed(0)+"M") : "N/A"],
+                        ].map(([l,v]) => (
+                          <div key={l} style={{ fontSize: 10 }}>
+                            <span style={{ color: "#555" }}>{l}: </span>
+                            <span style={{ color: "#AAA" }}>{v}</span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          )}
+
         </div>
       </div>
     </div>

@@ -31,8 +31,10 @@ const { useState, useEffect, useCallback } = React;
 const API_BASE = `${window.location.protocol}//${window.location.hostname}:${window.location.port || 5000}`;
 
 const SOURCES = [
+  // Social
   { id: "truthsocial", name: "Truth Social", icon: "📢", type: "social", color: "#5448C8" },
   { id: "x_twitter", name: "X / Twitter", icon: "𝕏", type: "social", color: "#1DA1F2" },
+  // Major News
   { id: "reuters", name: "Reuters", icon: "◉", type: "news", color: "#FF8000" },
   { id: "ap_news", name: "AP News", icon: "◆", type: "news", color: "#E4002B" },
   { id: "bloomberg", name: "Bloomberg", icon: "▮", type: "news", color: "#472F92" },
@@ -41,8 +43,24 @@ const SOURCES = [
   { id: "foxnews", name: "Fox News", icon: "★", type: "news", color: "#003366" },
   { id: "cnn", name: "CNN", icon: "◼", type: "news", color: "#CC0000" },
   { id: "nytimes", name: "New York Times", icon: "⬡", type: "news", color: "#888" },
-  { id: "whitehouse", name: "White House", icon: "🏛", type: "gov", color: "#002868" },
+  { id: "ft", name: "Financial Times", icon: "▤", type: "news", color: "#FCD0A1" },
+  { id: "marketwatch", name: "MarketWatch", icon: "◈", type: "news", color: "#16A085" },
+  { id: "yahoo_finance", name: "Yahoo Finance", icon: "◇", type: "news", color: "#6001D2" },
+  { id: "google_news", name: "Google News", icon: "●", type: "news", color: "#4285F4" },
   { id: "newsapi", name: "NewsAPI", icon: "◈", type: "news", color: "#4A90D9" },
+  // Government
+  { id: "whitehouse", name: "White House", icon: "🏛", type: "gov", color: "#002868" },
+  { id: "sec_edgar", name: "SEC EDGAR", icon: "📋", type: "gov", color: "#004B87" },
+  { id: "federal_register", name: "Federal Register", icon: "📜", type: "gov", color: "#8B4513" },
+  { id: "congress", name: "Congress.gov", icon: "🏛", type: "gov", color: "#1C3F6E" },
+  { id: "fed_reserve", name: "Federal Reserve", icon: "🏦", type: "gov", color: "#2E5090" },
+  { id: "treasury", name: "U.S. Treasury", icon: "💵", type: "gov", color: "#1B5E20" },
+  // Energy / Commodities
+  { id: "eia", name: "EIA Energy", icon: "⚡", type: "energy", color: "#F4A300" },
+  { id: "opec", name: "OPEC", icon: "🛢", type: "energy", color: "#1A237E" },
+  // Crypto
+  { id: "coindesk", name: "CoinDesk", icon: "₿", type: "crypto", color: "#F7931A" },
+  { id: "cointelegraph", name: "CoinTelegraph", icon: "₿", type: "crypto", color: "#27AE60" },
 ];
 
 function timeAgo(iso) {
@@ -68,6 +86,7 @@ function App() {
   const [accounts, setAccounts] = useState([]);
   const [newAccountUrl, setNewAccountUrl] = useState("");
   const [accountError, setAccountError] = useState("");
+  const [refreshing, setRefreshing] = useState(false);
   const [, setTick] = useState(0);
 
   // Load keywords + accounts from backend on mount
@@ -156,6 +175,23 @@ function App() {
       .catch(() => {});
   };
 
+  const triggerRefresh = () => {
+    if (refreshing) return;
+    setRefreshing(true);
+    fetch(API_BASE + "/api/refresh", { method: "POST" })
+      .then(() => {
+        // Wait a few seconds for the poll cycle to run, then fetch new alerts
+        setTimeout(() => {
+          fetch(API_BASE + "/api/alerts?limit=300")
+            .then(r => r.json())
+            .then(d => { if (d.alerts) setAlerts(d.alerts); })
+            .catch(() => {})
+            .finally(() => setRefreshing(false));
+        }, 5000);
+      })
+      .catch(() => setRefreshing(false));
+  };
+
   const toggleSource = (id) => setEnabledSources(prev =>
     prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]
   );
@@ -182,6 +218,9 @@ function App() {
           </span>
         </div>
         <div style={{ display: "flex", gap: 8 }}>
+          <button className="btn" onClick={triggerRefresh} disabled={refreshing} style={{ background: refreshing ? "#2A2A35" : "#14141F", color: refreshing ? "#666" : "#AAA", padding: "6px 14px", borderRadius: 6, fontSize: 12, opacity: refreshing ? 0.7 : 1 }}>
+            {refreshing ? "⟳ Polling..." : "⟳ Refresh"}
+          </button>
           <button className="btn" onClick={() => setShowConfig(!showConfig)} style={{ background: showConfig ? "#2A2A35" : "#14141F", color: "#AAA", padding: "6px 14px", borderRadius: 6, fontSize: 12 }}>⚙ Config</button>
           <button className="btn" onClick={() => setIsMonitoring(!isMonitoring)} style={{ background: isMonitoring ? "#1A2A1A" : "#2A1A1A", color: isMonitoring ? "#34C759" : "#FF3B30", padding: "6px 14px", borderRadius: 6, fontSize: 12 }}>
             {isMonitoring ? "● LIVE" : "■ PAUSED"}

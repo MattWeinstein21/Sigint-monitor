@@ -71,6 +71,7 @@ def save_config(config):
 
 
 RSS_SOURCES = {
+    # ── Major News Outlets ──
     "reuters": {
         "name": "Reuters",
         "feeds": [
@@ -131,6 +132,102 @@ RSS_SOURCES = {
         "feeds": [
             "https://feeds.bloomberg.com/politics/news.rss",
             "https://feeds.bloomberg.com/markets/news.rss",
+        ],
+    },
+    # ── Government / Regulatory ──
+    "sec_edgar": {
+        "name": "SEC EDGAR",
+        "feeds": [
+            "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=8-K&dateb=&owner=include&count=40&search_text=&start=0&output=atom",
+            "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=10-K&dateb=&owner=include&count=20&search_text=&start=0&output=atom",
+            "https://www.sec.gov/rss/news/press.xml",
+        ],
+    },
+    "federal_register": {
+        "name": "Federal Register",
+        "feeds": [
+            "https://www.federalregister.gov/documents/search.atom?conditions%5Btype%5D=RULE",
+            "https://www.federalregister.gov/documents/search.atom?conditions%5Btype%5D=PRESDOCU",
+            "https://www.federalregister.gov/documents/search.atom?conditions%5Btype%5D=NOTICE",
+        ],
+    },
+    "congress": {
+        "name": "Congress.gov",
+        "feeds": [
+            "https://www.congress.gov/rss/most-viewed-bills.xml",
+            "https://www.congress.gov/rss/presented-to-president.xml",
+        ],
+    },
+    "fed_reserve": {
+        "name": "Federal Reserve",
+        "feeds": [
+            "https://www.federalreserve.gov/feeds/press_all.xml",
+            "https://www.federalreserve.gov/feeds/press_monetary.xml",
+        ],
+    },
+    "treasury": {
+        "name": "U.S. Treasury",
+        "feeds": [
+            "https://home.treasury.gov/system/files/136/press-releases.xml",
+        ],
+    },
+    # ── Financial / Markets ──
+    "marketwatch": {
+        "name": "MarketWatch",
+        "feeds": [
+            "https://feeds.marketwatch.com/marketwatch/topstories",
+            "https://feeds.marketwatch.com/marketwatch/marketpulse",
+        ],
+    },
+    "ft": {
+        "name": "Financial Times",
+        "feeds": [
+            "https://www.ft.com/rss/home",
+            "https://www.ft.com/rss/companies",
+            "https://www.ft.com/rss/markets",
+        ],
+    },
+    "yahoo_finance": {
+        "name": "Yahoo Finance",
+        "feeds": [
+            "https://finance.yahoo.com/news/rssindex",
+        ],
+    },
+    # ── Broad Aggregation ──
+    "google_news": {
+        "name": "Google News",
+        "feeds": [
+            "https://news.google.com/rss/topics/CAAqJggKIiBDQkFTRWdvSUwyMHZNRGx6TVdZU0FtVnVHZ0pWVXlnQVAB?hl=en-US&gl=US&ceid=US:en",  # Business
+            "https://news.google.com/rss/topics/CAAqJggKIiBDQkFTRWdvSUwyMHZNRGRqTVhZU0FtVnVHZ0pWVXlnQVAB?hl=en-US&gl=US&ceid=US:en",  # Technology
+            "https://news.google.com/rss/topics/CAAqIQgKIhtDQkFTRGdvSUwyMHZNRFZ4ZERBU0FtVnVLQUFQAQ?hl=en-US&gl=US&ceid=US:en",          # Politics
+            "https://news.google.com/rss/search?q=Trump+tariff+trade&hl=en-US&gl=US&ceid=US:en",
+            "https://news.google.com/rss/search?q=Trump+executive+order&hl=en-US&gl=US&ceid=US:en",
+        ],
+    },
+    # ── Energy / Commodities ──
+    "eia": {
+        "name": "EIA (Energy Info)",
+        "feeds": [
+            "https://www.eia.gov/rss/todayinenergy.xml",
+        ],
+    },
+    "opec": {
+        "name": "OPEC",
+        "feeds": [
+            "https://www.opec.org/opec_web/en/pressreleases.rss",
+        ],
+    },
+    # ── Crypto ──
+    "coindesk": {
+        "name": "CoinDesk",
+        "feeds": [
+            "https://www.coindesk.com/arc/outboundfeeds/rss/",
+        ],
+    },
+    "cointelegraph": {
+        "name": "CoinTelegraph",
+        "feeds": [
+            "https://cointelegraph.com/rss",
         ],
     },
 }
@@ -435,55 +532,100 @@ def poll_truthsocial(keywords, accounts):
 def poll_twitter(keywords, bearer_token, accounts):
     """
     Poll X/Twitter for keyword mentions from each monitored account.
-    accounts: list of {"username": "...", "label": "..."} dicts
+    Strategy:
+      1. If bearer_token is set, try the user timeline API (requires Basic $100/mo tier).
+      2. Always try RSSHub RSS proxy as fallback (free, no key needed).
     """
-    if not bearer_token:
-        return
-    headers = {"Authorization": f"Bearer {bearer_token}"}
     for acct in accounts:
         username = acct.get("username", "")
         label = acct.get("label", "") or f"@{username}"
         if not username:
             continue
-        try:
-            # Search recent tweets from this account matching any keyword
-            # Batch keywords into groups to reduce API calls
-            kw_batches = [keywords[i:i+5] for i in range(0, min(len(keywords), 15), 5)]
-            for batch in kw_batches:
-                or_clause = " OR ".join(f'"{kw}"' for kw in batch)
-                query = f"from:{username} ({or_clause})"
-                url = "https://api.twitter.com/2/tweets/search/recent"
-                params = {
-                    "query": query,
-                    "max_results": 10,
-                    "tweet.fields": "created_at,text",
-                }
-                resp = requests.get(url, headers=headers, params=params, timeout=15)
-                if resp.status_code != 200:
-                    log.warning(f"Twitter API {resp.status_code} for @{username}")
-                    continue
-                data = resp.json()
-                for tweet in data.get("data", []):
-                    text = normalize_whitespace(tweet.get("text", ""))
-                    tweet_id = normalize_whitespace(tweet.get("id", ""))
-                    if not text or not tweet_id:
+
+        fetched_via_api = False
+
+        # ── Attempt 1: Twitter API v2 user timeline ──
+        if bearer_token:
+            try:
+                headers = {"Authorization": f"Bearer {bearer_token}"}
+                # First resolve username → user ID
+                user_resp = requests.get(
+                    f"https://api.twitter.com/2/users/by/username/{username}",
+                    headers=headers, timeout=15,
+                )
+                if user_resp.status_code == 200:
+                    user_id = user_resp.json().get("data", {}).get("id")
+                    if user_id:
+                        timeline_resp = requests.get(
+                            f"https://api.twitter.com/2/users/{user_id}/tweets",
+                            headers=headers, timeout=15,
+                            params={"max_results": 20, "tweet.fields": "created_at,text"},
+                        )
+                        if timeline_resp.status_code == 200:
+                            fetched_via_api = True
+                            for tweet in timeline_resp.json().get("data", []):
+                                text = normalize_whitespace(tweet.get("text", ""))
+                                tweet_id = tweet.get("id", "")
+                                if not text or not tweet_id:
+                                    continue
+                                link = f"https://x.com/{username}/status/{tweet_id}"
+                                matches = match_keywords(text, keywords)
+                                for matched_kw, sev in matches:
+                                    snippet = extract_snippet(text, matched_kw)
+                                    store.add(
+                                        source_id="x_twitter",
+                                        source_name=f"X – @{username}",
+                                        title=text[:150],
+                                        url=link,
+                                        snippet=snippet,
+                                        keyword=matched_kw,
+                                        severity="high",
+                                    )
+                        else:
+                            log.warning(f"Twitter timeline API {timeline_resp.status_code} for @{username} — "
+                                        f"free tier doesn't include this endpoint, falling back to RSS")
+                elif user_resp.status_code == 403:
+                    log.warning(f"Twitter API 403 for @{username} — free tier is limited, using RSS fallback")
+                time.sleep(1)
+            except Exception as e:
+                log.warning(f"Twitter API error [@{username}]: {e}")
+
+        # ── Attempt 2: RSSHub proxy (always works, no key needed) ──
+        if not fetched_via_api:
+            try:
+                feed_url = f"https://rsshub.app/twitter/user/{username}"
+                feed = feedparser.parse(feed_url)
+                if feed.bozo and not feed.entries:
+                    # Try alternative Nitter-based route
+                    feed = feedparser.parse(f"https://rsshub.app/twitter/tweets/{username}")
+                for entry in feed.entries[:20]:
+                    title = entry.get("title", "")
+                    summary = entry.get("summary", entry.get("description", ""))
+                    link = normalize_whitespace(entry.get("link", f"https://x.com/{username}"))
+                    if not is_valid_source_url(link):
+                        link = f"https://x.com/{username}"
+                    clean = cleaned_entry_text(title, summary)
+                    if not clean:
                         continue
-                    link = f"https://x.com/{username}/status/{tweet_id}"
-                    matches = match_keywords(text, keywords)
-                    for matched_kw, sev in matches:
-                        snippet = extract_snippet(text, matched_kw)
+                    matches = match_keywords(clean, keywords)
+                    for kw, sev in matches:
+                        snippet = extract_snippet(clean, kw)
                         store.add(
                             source_id="x_twitter",
                             source_name=f"X – @{username}",
-                            title=text[:150],
+                            title=clean[:150],
                             url=link,
                             snippet=snippet,
-                            keyword=matched_kw,
+                            keyword=kw,
                             severity="high",
                         )
-                time.sleep(1)
-        except Exception as e:
-            log.warning(f"Twitter API error [@{username}]: {e}")
+                if feed.entries:
+                    log.info(f"X/@{username}: fetched {len(feed.entries)} posts via RSS")
+            except Exception as e:
+                log.warning(f"X RSS fallback error [@{username}]: {e}")
+
+
+_refresh_requested = threading.Event()
 
 
 def monitor_loop():
@@ -514,11 +656,18 @@ def monitor_loop():
             if config.get("truthsocial_enabled", True) and ts_accounts:
                 poll_truthsocial(keywords, ts_accounts)
 
-            if config.get("twitter_bearer_token") and x_accounts:
-                poll_twitter(keywords, config["twitter_bearer_token"], x_accounts)
+            if x_accounts:
+                poll_twitter(keywords, config.get("twitter_bearer_token", ""), x_accounts)
 
             log.info(f"── Cycle complete — {len(store.alerts)} total alerts ──")
-            time.sleep(interval)
+
+            # Sleep in small increments so manual refresh can interrupt
+            for _ in range(interval):
+                if _refresh_requested.is_set():
+                    _refresh_requested.clear()
+                    log.info("Manual refresh requested — starting new cycle")
+                    break
+                time.sleep(1)
 
         except Exception as e:
             log.error(f"Monitor loop error: {e}")
@@ -623,6 +772,13 @@ def update_accounts():
         return jsonify({"status": "removed", "accounts": accounts})
 
     return jsonify({"error": "Provide 'url' to add or 'remove' to delete"}), 400
+
+
+@app.route("/api/refresh", methods=["POST"])
+def trigger_refresh():
+    """Trigger an immediate poll cycle."""
+    _refresh_requested.set()
+    return jsonify({"status": "refresh_triggered"})
 
 
 @app.route("/api/status")

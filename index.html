@@ -91,8 +91,6 @@ function App() {
   const [signalSets, setSignalSets] = useState({});
   const [configTab, setConfigTab] = useState("general");
   const [expandedAlerts, setExpandedAlerts] = useState(new Set());
-  const [newSignalWord, setNewSignalWord] = useState("");
-  const [newSignalSet, setNewSignalSet] = useState("");
   const [newSignalSentiment, setNewSignalSentiment] = useState("positive");
   const [mainView, setMainView] = useState("alerts"); // "alerts" | "market"
   const [indices, setIndices] = useState({});
@@ -107,7 +105,12 @@ function App() {
   const [chatLoading, setChatLoading] = useState(false);
   const [csvSetId, setCsvSetId] = useState("custom");
   const [csvNewLabel, setCsvNewLabel] = useState("");
+  const [toast, setToast] = useState("");
+  const [newSetName, setNewSetName] = useState("");
+  const [inlineAddWord, setInlineAddWord] = useState({});  // {setId: {word: "", sentiment: "positive"}}
   const [, setTick] = useState(0);
+
+  const showToast = (msg) => { setToast(msg); setTimeout(() => setToast(""), 3000); };
 
   // Load keywords + accounts from backend on mount
   useEffect(() => {
@@ -230,23 +233,23 @@ function App() {
     fetch(API_BASE + "/api/signal-sets", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ toggle: setId })
-    }).then(r => r.json()).then(d => { if (d.sets) setSignalSets(d.sets); }).catch(() => {});
+    }).then(r => r.json()).then(d => { if (d.sets) { setSignalSets(d.sets); showToast(d.sets[setId]?.enabled ? "✓ " + (d.sets[setId]?.label || setId) + " enabled" : "✗ " + (d.sets[setId]?.label || setId) + " disabled"); } }).catch(() => {});
   };
 
-  const addSignalWord = () => {
-    const word = newSignalWord.trim().toLowerCase();
-    if (!word || !newSignalSet) return;
+  const addSignalWord = (setId, sentiment, word) => {
+    const w = (word || "").trim().toLowerCase();
+    if (!w || !setId) return;
     fetch(API_BASE + "/api/signal-sets", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ set_id: newSignalSet, sentiment: newSignalSentiment, add: word, weight: 2 })
-    }).then(r => r.json()).then(d => { if (d.sets) setSignalSets(d.sets); setNewSignalWord(""); }).catch(() => {});
+      body: JSON.stringify({ set_id: setId, sentiment, add: w, weight: 2 })
+    }).then(r => r.json()).then(d => { if (d.sets) { setSignalSets(d.sets); showToast('✓ Added "' + w + '" to ' + (d.sets[setId]?.label || setId)); setInlineAddWord(prev => ({...prev, [setId]: {word: "", sentiment: prev[setId]?.sentiment || "positive"}})); } }).catch(() => {});
   };
 
   const removeSignalWord = (setId, sentiment, word) => {
     fetch(API_BASE + "/api/signal-sets", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ set_id: setId, sentiment, remove: word })
-    }).then(r => r.json()).then(d => { if (d.sets) setSignalSets(d.sets); }).catch(() => {});
+    }).then(r => r.json()).then(d => { if (d.sets) { setSignalSets(d.sets); showToast('✓ Removed "' + word + '"'); } }).catch(() => {});
   };
 
   const editSignalWeight = (setId, sentiment, word, newWeight) => {
@@ -254,6 +257,19 @@ function App() {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ set_id: setId, sentiment, word, weight: parseFloat(newWeight) })
     }).then(r => r.json()).then(d => { if (d.sets) setSignalSets(d.sets); }).catch(() => {});
+  };
+
+  const createNewSet = () => {
+    const name = newSetName.trim();
+    if (!name) return;
+    const id = name.toLowerCase().replace(/[^a-z0-9]/g, "_");
+    const sets = {...signalSets};
+    if (sets[id]) { showToast("⚠ Set already exists"); return; }
+    sets[id] = { label: name, enabled: true, positive: {}, negative: {} };
+    fetch(API_BASE + "/api/signal-sets", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sets })
+    }).then(r => r.json()).then(d => { if (d.sets) { setSignalSets(d.sets); setNewSetName(""); showToast('✓ Created set "' + name + '"'); } }).catch(() => {});
   };
 
   // Market data
@@ -292,10 +308,10 @@ function App() {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ add: sym, type: assetType })
     }).then(r => r.json()).then(d => {
-      if (d.error) { setAddError(d.error); setAddingSymbol(false); return; }
+      if (d.error) { setAddError(d.error); showToast("⚠ " + d.error); setAddingSymbol(false); return; }
       if (d.watchlist) setWatchlist(d.watchlist);
       setNewSymbol(""); setAddingSymbol(false);
-      // Fetch quote for the new symbol
+      showToast("✓ Added " + sym + " to watchlist");
       fetch(API_BASE + "/api/market/quote/" + sym + "?type=" + assetType + "&range=" + selectedRange)
         .then(r => r.json()).then(qd => { if (qd.quote) setWatchlistQuotes(prev => ({...prev, [sym]: qd.quote})); }).catch(() => {});
     }).catch(() => { setAddError("Network error"); setAddingSymbol(false); });
@@ -303,7 +319,7 @@ function App() {
 
   const removeFromWatchlist = (sym) => {
     fetch(API_BASE + "/api/market/watchlist", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ remove: sym }) })
-      .then(r => r.json()).then(d => { if (d.watchlist) setWatchlist(d.watchlist); }).catch(() => {});
+      .then(r => r.json()).then(d => { if (d.watchlist) setWatchlist(d.watchlist); showToast("✓ Removed " + sym); }).catch(() => {});
     setWatchlistQuotes(prev => { const n = {...prev}; delete n[sym]; return n; });
     if (selectedStock === sym) setSelectedStock(null);
   };
@@ -335,15 +351,16 @@ function App() {
   };
 
   // CSV import
-  const importCsv = (e) => {
-    const file = e.target.files[0];
+  const importCsv = (file, setId) => {
     if (!file) return;
     const formData = new FormData();
     formData.append("file", file);
-    formData.append("set_id", csvSetId === "__new__" ? "__new__" : csvSetId);
-    if (csvSetId === "__new__") formData.append("new_set_label", csvNewLabel);
+    formData.append("set_id", setId || "custom");
     fetch(API_BASE + "/api/signal-sets/import", { method: "POST", body: formData })
-      .then(r => r.json()).then(d => { if (d.sets) setSignalSets(d.sets); e.target.value = ""; }).catch(() => {});
+      .then(r => r.json()).then(d => {
+        if (d.sets) { setSignalSets(d.sets); showToast("✓ Imported " + (d.added || 0) + " words"); }
+        else if (d.error) showToast("⚠ " + d.error);
+      }).catch(() => showToast("⚠ Import failed"));
   };
 
   // Mini sparkline SVG component
@@ -370,6 +387,12 @@ function App() {
 
   return (
     <div style={{ minHeight: "100vh" }}>
+      {/* Toast notification */}
+      {toast && (
+        <div style={{ position: "fixed", top: 20, right: 20, zIndex: 100, background: toast.startsWith("⚠") ? "#2A1A1A" : "#1A2A1A", color: toast.startsWith("⚠") ? "#FF9500" : "#34C759", padding: "10px 18px", borderRadius: 8, fontSize: 12, border: "1px solid " + (toast.startsWith("⚠") ? "#FF950033" : "#34C75933"), animation: "slideIn 0.3s ease-out", fontFamily: "inherit" }}>
+          {toast}
+        </div>
+      )}
       {/* Header */}
       <div style={{ borderBottom: "1px solid #1A1A25", padding: "16px 24px", display: "flex", alignItems: "center", justifyContent: "space-between", position: "sticky", top: 0, background: "#0A0A0F", zIndex: 10 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
@@ -447,80 +470,81 @@ function App() {
             </>)}
 
             {configTab === "signals" && (<>
-              <div style={{ fontSize: 10, fontWeight: 600, color: "#666", letterSpacing: 2, marginBottom: 12, textTransform: "uppercase" }}>Signal Word Sets</div>
-              <div style={{ fontSize: 9, color: "#555", marginBottom: 12, lineHeight: 1.5 }}>
-                Toggle sets on/off to focus analysis on relevant sectors. Click any word to remove it.
+              <div style={{ fontSize: 10, fontWeight: 600, color: "#666", letterSpacing: 2, marginBottom: 10, textTransform: "uppercase" }}>Signal Word Sets</div>
+
+              {/* Create new set */}
+              <div style={{ display: "flex", gap: 6, marginBottom: 12 }}>
+                <input value={newSetName} onChange={e => setNewSetName(e.target.value)} onKeyDown={e => e.key === "Enter" && createNewSet()} placeholder="New set name..." style={{ flex: 1, background: "#14141F", border: "1px solid #2A2A35", borderRadius: 6, padding: "6px 10px", color: "#E8E8ED", fontSize: 11, outline: "none", fontFamily: "inherit" }} />
+                <button className="btn" onClick={createNewSet} style={{ background: "#5448C8", color: "#fff", padding: "6px 12px", borderRadius: 6, fontSize: 11 }}>+ Set</button>
               </div>
 
-              {/* Add word form */}
-              <div style={{ display: "flex", gap: 4, marginBottom: 12, flexWrap: "wrap" }}>
-                <input value={newSignalWord} onChange={e => setNewSignalWord(e.target.value)} onKeyDown={e => e.key === "Enter" && addSignalWord()} placeholder="new word..." style={{ flex: 1, minWidth: 80, background: "#14141F", border: "1px solid #2A2A35", borderRadius: 6, padding: "5px 8px", color: "#E8E8ED", fontSize: 11, outline: "none", fontFamily: "inherit" }} />
-                <select value={newSignalSet} onChange={e => setNewSignalSet(e.target.value)} style={{ background: "#14141F", border: "1px solid #2A2A35", borderRadius: 6, padding: "5px 6px", color: "#AAA", fontSize: 10, fontFamily: "inherit", outline: "none" }}>
-                  <option value="">set...</option>
-                  {Object.entries(signalSets).map(([id, s]) => <option key={id} value={id}>{s.label}</option>)}
-                </select>
-                <select value={newSignalSentiment} onChange={e => setNewSignalSentiment(e.target.value)} style={{ background: "#14141F", border: "1px solid #2A2A35", borderRadius: 6, padding: "5px 6px", color: "#AAA", fontSize: 10, fontFamily: "inherit", outline: "none" }}>
-                  <option value="positive">+ Pos</option>
-                  <option value="negative">− Neg</option>
-                </select>
-                <button className="btn" onClick={addSignalWord} style={{ background: "#5448C8", color: "#fff", padding: "5px 10px", borderRadius: 6, fontSize: 11 }}>+</button>
-              </div>
-
-              {/* CSV Import */}
-              <div style={{ marginBottom: 12, padding: 8, background: "#0F0F18", borderRadius: 6, border: "1px solid #1A1A25" }}>
-                <div style={{ fontSize: 9, fontWeight: 600, color: "#666", letterSpacing: 1, marginBottom: 6, textTransform: "uppercase" }}>Import CSV</div>
-                <div style={{ display: "flex", gap: 4, marginBottom: 6, flexWrap: "wrap" }}>
-                  <select value={csvSetId} onChange={e => setCsvSetId(e.target.value)} style={{ flex: 1, minWidth: 70, background: "#14141F", border: "1px solid #2A2A35", borderRadius: 4, padding: "4px 6px", color: "#AAA", fontSize: 10, fontFamily: "inherit", outline: "none" }}>
-                    {Object.entries(signalSets).map(([id, s]) => <option key={id} value={id}>{s.label}</option>)}
-                    <option value="__new__">+ New Set</option>
-                  </select>
-                  {csvSetId === "__new__" && <input value={csvNewLabel} onChange={e => setCsvNewLabel(e.target.value)} placeholder="Set name..." style={{ flex: 1, background: "#14141F", border: "1px solid #2A2A35", borderRadius: 4, padding: "4px 6px", color: "#E8E8ED", fontSize: 10, outline: "none", fontFamily: "inherit" }} />}
-                </div>
-                <label className="btn" style={{ display: "inline-block", background: "#5448C8", color: "#fff", padding: "4px 10px", borderRadius: 4, fontSize: 10, cursor: "pointer" }}>
-                  Choose CSV <input type="file" accept=".csv" onChange={importCsv} style={{ display: "none" }} />
-                </label>
-                <a href={API_BASE + "/api/signal-sets/template.csv"} download style={{ fontSize: 9, color: "#5A8FD4", marginLeft: 8, textDecoration: "none" }}>⬇ Download Template</a>
-              </div>
-
-              {/* Signal set categories */}
-              <div style={{ display: "flex", flexDirection: "column", gap: 8, maxHeight: "calc(100vh - 280px)", overflowY: "auto" }}>
-                {Object.entries(signalSets).map(([setId, set]) => (
+              {/* Signal set list */}
+              <div style={{ display: "flex", flexDirection: "column", gap: 8, maxHeight: "calc(100vh - 240px)", overflowY: "auto" }}>
+                {Object.entries(signalSets).map(([setId, set]) => {
+                  const isSetExpanded = expandedAlerts.has("set_" + setId);
+                  const inl = inlineAddWord[setId] || { word: "", sentiment: "positive" };
+                  return (
                   <div key={setId} style={{ background: "#0F0F18", borderRadius: 6, border: "1px solid #1A1A25", overflow: "hidden" }}>
-                    <div className="src-toggle" onClick={() => toggleSignalSet(setId)} style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 10px" }}>
-                      <div style={{ width: 8, height: 8, borderRadius: "50%", background: set.enabled ? "#34C759" : "#555" }} />
-                      <span style={{ fontSize: 11, fontWeight: 600, color: set.enabled ? "#E8E8ED" : "#555" }}>{set.label}</span>
-                      <span style={{ marginLeft: "auto", fontSize: 9, color: "#555" }}>
-                        {Object.keys(set.positive || {}).length}+ / {Object.keys(set.negative || {}).length}−
+                    {/* Set header — click to expand/collapse */}
+                    <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 10px" }}>
+                      <div className="src-toggle" onClick={() => toggleSignalSet(setId)} style={{ width: 8, height: 8, borderRadius: "50%", background: set.enabled ? "#34C759" : "#555", flexShrink: 0 }} />
+                      <span className="src-toggle" onClick={() => toggleExpand("set_" + setId)} style={{ fontSize: 11, fontWeight: 600, color: set.enabled ? "#E8E8ED" : "#555", flex: 1, display: "flex", alignItems: "center", gap: 4 }}>
+                        <span style={{ fontSize: 8, transform: isSetExpanded ? "rotate(90deg)" : "rotate(0deg)", display: "inline-block", transition: "transform 0.2s" }}>▶</span>
+                        {set.label}
                       </span>
+                      <span style={{ fontSize: 9, color: "#555" }}>{Object.keys(set.positive || {}).length}+ / {Object.keys(set.negative || {}).length}−</span>
                     </div>
-                    {set.enabled && (
-                      <div style={{ padding: "0 10px 8px" }}>
-                        <div style={{ fontSize: 9, color: "#34C759", marginBottom: 3 }}>POSITIVE</div>
-                        <div style={{ display: "flex", flexWrap: "wrap", gap: 3, marginBottom: 6, maxHeight: 120, overflowY: "auto" }}>
+
+                    {isSetExpanded && (
+                      <div style={{ padding: "0 10px 10px" }}>
+                        {/* Inline add word */}
+                        <div style={{ display: "flex", gap: 3, marginBottom: 8 }}>
+                          <input value={inl.word} onChange={e => setInlineAddWord(prev => ({...prev, [setId]: {...inl, word: e.target.value}}))} onKeyDown={e => e.key === "Enter" && addSignalWord(setId, inl.sentiment, inl.word)} placeholder="add word..." style={{ flex: 1, background: "#14141F", border: "1px solid #2A2A35", borderRadius: 4, padding: "4px 6px", color: "#E8E8ED", fontSize: 10, outline: "none", fontFamily: "inherit" }} />
+                          <select value={inl.sentiment} onChange={e => setInlineAddWord(prev => ({...prev, [setId]: {...inl, sentiment: e.target.value}}))} style={{ background: "#14141F", border: "1px solid #2A2A35", borderRadius: 4, padding: "4px 4px", color: "#AAA", fontSize: 9, fontFamily: "inherit", outline: "none" }}>
+                            <option value="positive">+Pos</option>
+                            <option value="negative">−Neg</option>
+                          </select>
+                          <button className="btn" onClick={() => addSignalWord(setId, inl.sentiment, inl.word)} style={{ background: "#5448C8", color: "#fff", padding: "4px 8px", borderRadius: 4, fontSize: 10 }}>+</button>
+                          <label className="btn" style={{ background: "#2A2A35", color: "#AAA", padding: "4px 8px", borderRadius: 4, fontSize: 9, cursor: "pointer", display: "flex", alignItems: "center" }}>
+                            CSV <input type="file" accept=".csv" onChange={e => { importCsv(e.target.files[0], setId); e.target.value = ""; }} style={{ display: "none" }} />
+                          </label>
+                        </div>
+
+                        {/* Positive words */}
+                        <div style={{ fontSize: 9, color: "#34C759", marginBottom: 3 }}>POSITIVE ({Object.keys(set.positive || {}).length})</div>
+                        <div style={{ display: "flex", flexWrap: "wrap", gap: 3, marginBottom: 8, maxHeight: 140, overflowY: "auto" }}>
                           {Object.entries(set.positive || {}).map(([w, wt]) => (
                             <span key={w} style={{ background: "#34C75915", padding: "2px 4px", borderRadius: 3, fontSize: 9, color: "#34C759", border: "1px solid #34C75922", display: "inline-flex", alignItems: "center", gap: 3 }}>
                               {w}
-                              <input type="number" value={wt} step="0.5" min="0.5" max="5" onChange={e => editSignalWeight(setId, "positive", w, e.target.value)} style={{ width: 28, background: "#0A0A0F", border: "1px solid #34C75933", borderRadius: 2, color: "#34C759", fontSize: 8, textAlign: "center", padding: "0 2px", fontFamily: "inherit", outline: "none" }} />
+                              <input type="number" value={wt} step="0.5" min="0.5" max="5" onChange={e => editSignalWeight(setId, "positive", w, e.target.value)} style={{ width: 28, background: "#0A0A0F", border: "1px solid #34C75933", borderRadius: 2, color: "#34C759", fontSize: 8, textAlign: "center", padding: "0 2px", fontFamily: "inherit", outline: "none" }} onClick={e => e.stopPropagation()} />
                               <span className="kw-tag" onClick={() => removeSignalWord(setId, "positive", w)} style={{ color: "#555", fontSize: 8, cursor: "pointer" }}>✕</span>
                             </span>
                           ))}
-                          {Object.keys(set.positive || {}).length === 0 && <span style={{ fontSize: 9, color: "#333" }}>none</span>}
+                          {Object.keys(set.positive || {}).length === 0 && <span style={{ fontSize: 9, color: "#333" }}>no words yet — add some above</span>}
                         </div>
-                        <div style={{ fontSize: 9, color: "#FF3B30", marginBottom: 3 }}>NEGATIVE</div>
-                        <div style={{ display: "flex", flexWrap: "wrap", gap: 3, maxHeight: 120, overflowY: "auto" }}>
+
+                        {/* Negative words */}
+                        <div style={{ fontSize: 9, color: "#FF3B30", marginBottom: 3 }}>NEGATIVE ({Object.keys(set.negative || {}).length})</div>
+                        <div style={{ display: "flex", flexWrap: "wrap", gap: 3, maxHeight: 140, overflowY: "auto" }}>
                           {Object.entries(set.negative || {}).map(([w, wt]) => (
                             <span key={w} style={{ background: "#FF3B3015", padding: "2px 4px", borderRadius: 3, fontSize: 9, color: "#FF3B30", border: "1px solid #FF3B3022", display: "inline-flex", alignItems: "center", gap: 3 }}>
                               {w}
-                              <input type="number" value={wt} step="0.5" min="0.5" max="5" onChange={e => editSignalWeight(setId, "negative", w, e.target.value)} style={{ width: 28, background: "#0A0A0F", border: "1px solid #FF3B3033", borderRadius: 2, color: "#FF3B30", fontSize: 8, textAlign: "center", padding: "0 2px", fontFamily: "inherit", outline: "none" }} />
+                              <input type="number" value={wt} step="0.5" min="0.5" max="5" onChange={e => editSignalWeight(setId, "negative", w, e.target.value)} style={{ width: 28, background: "#0A0A0F", border: "1px solid #FF3B3033", borderRadius: 2, color: "#FF3B30", fontSize: 8, textAlign: "center", padding: "0 2px", fontFamily: "inherit", outline: "none" }} onClick={e => e.stopPropagation()} />
                               <span className="kw-tag" onClick={() => removeSignalWord(setId, "negative", w)} style={{ color: "#555", fontSize: 8, cursor: "pointer" }}>✕</span>
                             </span>
                           ))}
-                          {Object.keys(set.negative || {}).length === 0 && <span style={{ fontSize: 9, color: "#333" }}>none</span>}
+                          {Object.keys(set.negative || {}).length === 0 && <span style={{ fontSize: 9, color: "#333" }}>no words yet — add some above</span>}
+                        </div>
+
+                        {/* CSV template link */}
+                        <div style={{ marginTop: 6 }}>
+                          <a href={API_BASE + "/api/signal-sets/template.csv"} download style={{ fontSize: 8, color: "#5A8FD4", textDecoration: "none" }}>⬇ Download CSV Template</a>
                         </div>
                       </div>
                     )}
                   </div>
-                ))}
+                  );
+                })}
               </div>
             </>)}
 
@@ -704,7 +728,12 @@ function App() {
               {watchlist.map(item => {
                 const sym = item.symbol;
                 const q = watchlistQuotes[sym];
-                if (!q) return <div key={sym} style={{ background: "#0F0F18", borderRadius: 8, padding: 14, border: "1px solid #1A1A25", color: "#555", fontSize: 11 }}>{item.type === "crypto" ? "₿" : "📊"} {sym} — loading...</div>;
+                if (!q) return (
+                  <div key={sym} style={{ background: "#0F0F18", borderRadius: 8, padding: 14, border: "1px solid #1A1A25", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                    <span style={{ color: "#555", fontSize: 11 }}>{item.type === "crypto" ? "₿" : "📊"} {sym} — loading...</span>
+                    <span className="kw-tag" onClick={() => removeFromWatchlist(sym)} style={{ fontSize: 10, color: "#FF3B30", padding: "2px 6px", cursor: "pointer" }}>✕</span>
+                  </div>
+                );
                 const isUp = q.change >= 0;
                 const isSelected = selectedStock === sym;
                 return (

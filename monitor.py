@@ -18,6 +18,7 @@ import hashlib
 import logging
 import threading
 import re
+import sqlite3
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from urllib.parse import urlparse
@@ -36,6 +37,110 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("sigint")
+
+
+# ─── Data Store (SQLite) ─────────────────────────────────────────────────────
+# Foundation for article storage, trend analysis, and AI learning.
+
+DATA_STORE_PATH = Path("sigint_data.db")
+
+
+def init_data_store():
+    """Initialize the SQLite database with required tables."""
+    conn = sqlite3.connect(str(DATA_STORE_PATH))
+    c = conn.cursor()
+    c.execute("""CREATE TABLE IF NOT EXISTS articles (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp TEXT NOT NULL,
+        source_id TEXT,
+        source_name TEXT,
+        title TEXT,
+        url TEXT UNIQUE,
+        keyword TEXT,
+        article_text TEXT,
+        summary TEXT,
+        sentiment TEXT,
+        sentiment_score REAL,
+        ai_sentiment TEXT,
+        word_sentiment TEXT,
+        confidence REAL,
+        severity TEXT,
+        published_at TEXT,
+        positive_signals TEXT,
+        negative_signals TEXT,
+        article_fetched INTEGER DEFAULT 0,
+        ai_summary INTEGER DEFAULT 0
+    )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS chat_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp TEXT NOT NULL,
+        alert_id INTEGER,
+        article_title TEXT,
+        question TEXT,
+        answer TEXT
+    )""")
+    c.execute("""CREATE INDEX IF NOT EXISTS idx_articles_timestamp ON articles(timestamp)""")
+    c.execute("""CREATE INDEX IF NOT EXISTS idx_articles_source ON articles(source_id)""")
+    c.execute("""CREATE INDEX IF NOT EXISTS idx_articles_sentiment ON articles(sentiment)""")
+    c.execute("""CREATE INDEX IF NOT EXISTS idx_articles_keyword ON articles(keyword)""")
+    conn.commit()
+    conn.close()
+    log.info(f"Data store initialized: {DATA_STORE_PATH}")
+
+
+def log_article(alert_data, article_text=""):
+    """Log an article and its analysis to the data store."""
+    try:
+        conn = sqlite3.connect(str(DATA_STORE_PATH))
+        c = conn.cursor()
+        c.execute("""INSERT OR IGNORE INTO articles
+            (timestamp, source_id, source_name, title, url, keyword,
+             article_text, summary, sentiment, sentiment_score,
+             ai_sentiment, word_sentiment, confidence, severity,
+             published_at, positive_signals, negative_signals,
+             article_fetched, ai_summary)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (alert_data.get("timestamp", ""),
+             alert_data.get("source", ""),
+             alert_data.get("source_name", ""),
+             alert_data.get("title", ""),
+             alert_data.get("url", ""),
+             alert_data.get("keyword", ""),
+             article_text[:5000] if article_text else "",
+             alert_data.get("summary", ""),
+             alert_data.get("sentiment", ""),
+             alert_data.get("sentiment_score", 0),
+             alert_data.get("ai_sentiment", ""),
+             alert_data.get("word_sentiment", ""),
+             alert_data.get("confidence", 0),
+             alert_data.get("severity", ""),
+             alert_data.get("published_at", ""),
+             json.dumps(alert_data.get("positive_signals", [])),
+             json.dumps(alert_data.get("negative_signals", [])),
+             1 if alert_data.get("article_fetched") else 0,
+             1 if alert_data.get("ai_summary") else 0))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log.debug(f"Data store log error: {e}")
+
+
+def log_chat(alert_id, article_title, question, answer):
+    """Log a chat interaction to the data store."""
+    try:
+        conn = sqlite3.connect(str(DATA_STORE_PATH))
+        c = conn.cursor()
+        c.execute("INSERT INTO chat_logs (timestamp, alert_id, article_title, question, answer) VALUES (?,?,?,?,?)",
+                  (datetime.now(timezone.utc).isoformat(), alert_id, article_title, question, answer))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log.debug(f"Chat log error: {e}")
+
+
+# Initialize on import
+init_data_store()
+
 
 CONFIG_PATH = Path("config.json")
 
@@ -332,6 +437,8 @@ class AlertStore:
                 "confidence": sentiment["confidence"],
                 "summary": sentiment["summary"],
                 "ai_summary": sentiment.get("ai_summary", False),
+                "ai_sentiment": sentiment.get("ai_sentiment"),
+                "word_sentiment": sentiment.get("word_sentiment"),
                 "positive_signals": sentiment["positive_signals"],
                 "negative_signals": sentiment["negative_signals"],
                 "article_fetched": fetched,
@@ -341,9 +448,14 @@ class AlertStore:
             self.alerts.insert(0, alert)
             if len(self.alerts) > self.max_alerts:
                 self.alerts = self.alerts[: self.max_alerts]
+
+            # Log to data store
+            log_article(alert, article_text)
+
             emoji = {"positive": "📈", "negative": "📉", "neutral": "➡️"}.get(sentiment["sentiment"], "➡️")
             ai_tag = " 🤖" if sentiment.get("ai_summary") else ""
-            log.info(f"{emoji}{ai_tag} [{source_id}] {sentiment['sentiment']}({sentiment['score']:+.1f}) keyword='{keyword}' → {title[:70]}")
+            disagree = " ⚡" if sentiment.get("ai_sentiment") and sentiment.get("word_sentiment") and sentiment["ai_sentiment"] != sentiment["word_sentiment"] else ""
+            log.info(f"{emoji}{ai_tag}{disagree} [{source_id}] {sentiment['sentiment']}({sentiment['score']:+.1f}) keyword='{keyword}' → {title[:70]}")
             return True
 
     def get_all(self, since=None, limit=None):
@@ -665,36 +777,53 @@ def get_active_signals():
 
 # ─── Ollama Integration ───────────────────────────────────────────────────────
 
-def summarize_with_ollama(text, ollama_url, model="llama3"):
+def ollama_analyze(text, ollama_url, model="llama3"):
     """
-    Send article text to Ollama for AI-powered summarization.
-    Returns (summary_text, success).
+    Send article text to Ollama for AI-powered summary AND sentiment judgment.
+    Returns (summary, ai_sentiment, success).
+    ai_sentiment is "positive", "negative", or "neutral".
     """
     if not ollama_url:
-        return "", False
+        return "", "", False
     try:
         prompt = (
-            "You are a financial news analyst. Summarize the following article in 2-3 sentences. "
-            "Focus on: what happened, which sectors/companies are affected, and the likely market impact. "
-            "Be concise and specific.\n\n"
+            "You are a financial market analyst. Analyze the following article.\n\n"
+            "Respond in EXACTLY this format (no extra text):\n"
+            "SENTIMENT: positive OR negative OR neutral\n"
+            "SUMMARY: 2-3 sentence summary focusing on market impact, affected sectors/companies, and what traders should know.\n\n"
             f"Article:\n{text[:2500]}"
         )
         resp = requests.post(
             f"{ollama_url.rstrip('/')}/api/generate",
             json={"model": model, "prompt": prompt, "stream": False},
-            timeout=30,
+            timeout=45,
         )
         if resp.status_code == 200:
             result = resp.json().get("response", "").strip()
             if result:
-                return result[:500], True
-        return "", False
+                # Parse structured response
+                ai_sentiment = ""
+                summary = result
+                lines = result.split("\n")
+                for line in lines:
+                    line_stripped = line.strip()
+                    if line_stripped.upper().startswith("SENTIMENT:"):
+                        val = line_stripped.split(":", 1)[1].strip().lower()
+                        if val in ("positive", "negative", "neutral"):
+                            ai_sentiment = val
+                    elif line_stripped.upper().startswith("SUMMARY:"):
+                        summary = line_stripped.split(":", 1)[1].strip()
+                # If parsing failed, use full response as summary
+                if not summary or summary == result:
+                    summary = result[:500]
+                return summary[:500], ai_sentiment, True
+        return "", "", False
     except Exception as e:
-        log.debug(f"Ollama summarize error: {e}")
-        return "", False
+        log.debug(f"Ollama analyze error: {e}")
+        return "", "", False
 
 
-def fetch_article_text(url, timeout=10):
+def fetch_article_text(url, timeout=12):
     """
     Attempt to fetch and extract the main text from an article URL.
     Returns (text, success). Gracefully fails for paywalled/blocked content.
@@ -702,37 +831,76 @@ def fetch_article_text(url, timeout=10):
     try:
         headers = {
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                          "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml",
+                          "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate",
+            "DNT": "1",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
         }
         resp = requests.get(url, headers=headers, timeout=timeout, allow_redirects=True)
         if resp.status_code != 200:
             return "", False
 
         soup = BeautifulSoup(resp.text, "html.parser")
-        for tag in soup.find_all(["script", "style", "nav", "footer", "aside",
-                                   "iframe", "noscript", "header"]):
-            tag.decompose()
 
+        # Remove noise elements
+        for tag in soup.find_all(["script", "style", "nav", "footer", "aside",
+                                   "iframe", "noscript", "header", "form",
+                                   "button", "svg", "figure", "figcaption"]):
+            tag.decompose()
+        # Remove common ad/tracker divs
+        for cls in ["ad", "ads", "advertisement", "social-share", "newsletter",
+                     "related-articles", "sidebar", "comment", "popup", "modal",
+                     "cookie", "banner", "promo"]:
+            for el in soup.find_all(class_=re.compile(cls, re.I)):
+                el.decompose()
+            for el in soup.find_all(id=re.compile(cls, re.I)):
+                el.decompose()
+
+        # Try article containers in priority order
         article = None
-        for selector in ["article", '[role="main"]', ".article-body",
-                         ".story-body", ".post-content", ".entry-content",
-                         ".article-content", "#article-body", ".body-text"]:
+        selectors = [
+            "article", '[role="main"]', '[itemprop="articleBody"]',
+            ".article-body", ".article__body", ".story-body", ".story-content",
+            ".post-content", ".entry-content", ".article-content",
+            "#article-body", "#story-body", ".body-text", ".article-text",
+            ".content-body", ".text-block", ".paywall", ".article__content",
+            "main", ".main-content",
+        ]
+        for selector in selectors:
             article = soup.select_one(selector)
-            if article:
+            if article and len(article.get_text(strip=True)) > 150:
                 break
+            article = None
 
         if article:
             text = article.get_text(" ", strip=True)
         else:
-            paragraphs = soup.find_all("p")
-            text = " ".join(p.get_text(" ", strip=True) for p in paragraphs)
+            # Fallback: get all paragraphs with substantial text
+            paragraphs = [p.get_text(" ", strip=True) for p in soup.find_all("p")
+                          if len(p.get_text(strip=True)) > 40]
+            text = " ".join(paragraphs)
 
         text = normalize_whitespace(text)
-        if len(text) < 100:
+
+        # Filter out common non-article text patterns
+        junk_patterns = [
+            r"sign up for our newsletter",
+            r"subscribe to continue reading",
+            r"cookies? (policy|consent|settings)",
+            r"accept all cookies",
+            r"privacy policy",
+            r"terms of (use|service)",
+        ]
+        for pat in junk_patterns:
+            text = re.sub(pat, "", text, flags=re.I)
+        text = normalize_whitespace(text)
+
+        if len(text) < 80:
             return "", False
-        return text[:3000], True
+        return text[:4000], True
 
     except Exception as e:
         log.debug(f"Article fetch failed [{url[:60]}]: {e}")
@@ -741,8 +909,10 @@ def fetch_article_text(url, timeout=10):
 
 def analyze_sentiment(text, source_id="", matched_keywords=None, ollama_url="", ollama_model="llama3"):
     """
-    Analyze sentiment of text using active signal sets.
-    Optionally uses Ollama for AI-generated summary.
+    Hybrid sentiment analysis:
+    1. Word-based scoring (instant, always runs)
+    2. Ollama AI judgment (when available, overrides word-based if they disagree)
+    Returns combined result with both scores visible.
     """
     text_lower = text.lower()
     matched_keywords = matched_keywords or []
@@ -755,17 +925,34 @@ def analyze_sentiment(text, source_id="", matched_keywords=None, ollama_url="", 
 
     for word, weight in pos_signals_dict.items():
         pattern = re.compile(rf"(?<!\w){re.escape(word)}", re.IGNORECASE)
-        matches = pattern.findall(text_lower)
-        if matches:
-            pos_score += weight * len(matches)
+        found = pattern.findall(text_lower)
+        if found:
+            pos_score += weight * len(found)
             pos_signals.append(word)
 
     for word, weight in neg_signals_dict.items():
         pattern = re.compile(rf"(?<!\w){re.escape(word)}", re.IGNORECASE)
-        matches = pattern.findall(text_lower)
-        if matches:
-            neg_score += weight * len(matches)
+        found = pattern.findall(text_lower)
+        if found:
+            neg_score += weight * len(found)
             neg_signals.append(word)
+
+    # Check for negation patterns that flip sentiment
+    negation_patterns = [
+        (r"not\s+(rising|gaining|improving|growing)", "neg_flip"),
+        (r"no\s+(deal|agreement|progress|recovery)", "neg_flip"),
+        (r"fail(ed|s)?\s+to\s+(rally|recover|gain|rise)", "neg_flip"),
+        (r"unlikely\s+to\s+(cut|ease|approve|pass)", "neg_flip"),
+        (r"(avoid|prevent|avert)(ed|s|ing)?\s+(crash|crisis|recession|default)", "pos_flip"),
+        (r"(ease|calm|cool)(ed|s|ing)?\s+(fears?|concerns?|tensions?|worries)", "pos_flip"),
+        (r"despite\s+(concerns?|fears?|worries|criticism)", "pos_context"),
+    ]
+    for pat, flip_type in negation_patterns:
+        if re.search(pat, text_lower):
+            if flip_type == "neg_flip":
+                neg_score += 2
+            elif flip_type == "pos_flip":
+                pos_score += 2
 
     amplifier = 1.0
     for word, mult in AMPLIFIERS.items():
@@ -780,29 +967,60 @@ def analyze_sentiment(text, source_id="", matched_keywords=None, ollama_url="", 
 
     src_weight = SOURCE_WEIGHTS.get(source_id, 0.5)
     raw = (pos_score - neg_score) * amplifier * combo_mult * src_weight
-    score = max(-10.0, min(10.0, raw))
+    word_score = max(-10.0, min(10.0, raw))
 
-    if score > 1.5:
-        sentiment = "positive"
-    elif score < -1.5:
-        sentiment = "negative"
+    if word_score > 1.5:
+        word_sentiment = "positive"
+    elif word_score < -1.5:
+        word_sentiment = "negative"
     else:
-        sentiment = "neutral"
+        word_sentiment = "neutral"
 
+    # Confidence from word analysis
     total_signals = len(pos_signals) + len(neg_signals)
     text_len = max(len(text.split()), 1)
-    confidence = min(1.0, (total_signals / text_len) * 10 + (abs(score) / 10) * 0.5)
-    confidence = round(confidence, 2)
+    word_confidence = min(1.0, (total_signals / text_len) * 10 + (abs(word_score) / 10) * 0.5)
 
-    # Try Ollama summary first, fall back to sentence extraction
-    ai_summary, used_ollama = summarize_with_ollama(text, ollama_url, ollama_model)
+    # Get Ollama analysis (summary + sentiment)
+    ai_summary, ai_sentiment, used_ollama = ollama_analyze(text, ollama_url, ollama_model)
+
+    # Fallback summary if Ollama didn't provide one
     if not ai_summary:
-        sentences = re.split(r'(?<=[.!?])\s+', text[:500])
+        sentences = re.split(r'(?<=[.!?])\s+', text[:600])
         ai_summary = " ".join(sentences[:2]).strip()
-        if len(ai_summary) > 200:
-            ai_summary = ai_summary[:197] + "..."
+        if len(ai_summary) > 250:
+            ai_summary = ai_summary[:247] + "..."
 
-    abs_score = abs(score)
+    # Hybrid decision: combine word-based and AI sentiment
+    if used_ollama and ai_sentiment:
+        if ai_sentiment == word_sentiment:
+            # Both agree — high confidence
+            final_sentiment = ai_sentiment
+            final_confidence = min(1.0, word_confidence + 0.3)
+        elif word_sentiment == "neutral":
+            # Words inconclusive, trust AI
+            final_sentiment = ai_sentiment
+            final_confidence = 0.7
+        elif ai_sentiment == "neutral":
+            # AI unsure, use words
+            final_sentiment = word_sentiment
+            final_confidence = word_confidence
+        else:
+            # Disagreement — trust AI over words (AI understands context better)
+            final_sentiment = ai_sentiment
+            final_confidence = 0.5  # Lower confidence due to disagreement
+    else:
+        final_sentiment = word_sentiment
+        final_confidence = round(word_confidence, 2)
+
+    # Map final sentiment to a score for display
+    if final_sentiment != word_sentiment:
+        # Remap score direction to match AI judgment
+        final_score = abs(word_score) if final_sentiment == "positive" else -abs(word_score) if final_sentiment == "negative" else 0
+    else:
+        final_score = word_score
+
+    abs_score = abs(final_score)
     if abs_score >= 5:
         severity = "high"
     elif abs_score >= 2:
@@ -811,12 +1029,14 @@ def analyze_sentiment(text, source_id="", matched_keywords=None, ollama_url="", 
         severity = "low"
 
     return {
-        "sentiment": sentiment,
-        "score": round(score, 2),
-        "confidence": confidence,
+        "sentiment": final_sentiment,
+        "score": round(final_score, 2),
+        "confidence": round(final_confidence, 2),
         "severity": severity,
         "summary": ai_summary,
         "ai_summary": used_ollama,
+        "ai_sentiment": ai_sentiment if used_ollama else None,
+        "word_sentiment": word_sentiment,
         "positive_signals": pos_signals[:5],
         "negative_signals": neg_signals[:5],
     }
@@ -893,13 +1113,20 @@ def parse_iso_date(iso_str):
 def is_fresh(dt, max_age_hours=4):
     """
     Check if a datetime is within max_age_hours of now.
-    If dt is None (unparseable), we allow it through (benefit of the doubt).
+    Rejects articles with no parseable date (previously allowed them through).
+    Also rejects articles with future timestamps (bad data) or dates > 48h old.
     """
     if dt is None:
-        return True  # Can't determine age, let it through
+        return False  # No timestamp = don't trust it
     now = datetime.now(timezone.utc)
     age = now - dt
-    return age < timedelta(hours=max_age_hours)
+    # Reject future dates (more than 5 min ahead = bad timestamp)
+    if age < timedelta(minutes=-5):
+        return False
+    # Reject anything older than max_age_hours
+    if age > timedelta(hours=max_age_hours):
+        return False
+    return True
 
 
 # Global max age — reloaded from config each cycle
@@ -1526,6 +1753,14 @@ def ollama_chat():
         )
         if resp.status_code == 200:
             answer = resp.json().get("response", "").strip()
+            # Log chat to data store
+            article_title = ""
+            with store.lock:
+                for a in store.alerts:
+                    if a["id"] == alert_id:
+                        article_title = a.get("title", "")
+                        break
+            log_chat(alert_id, article_title, question, answer)
             return jsonify({"answer": answer})
         return jsonify({"error": f"Ollama returned {resp.status_code}"}), 500
     except Exception as e:
@@ -1940,6 +2175,77 @@ def edit_signal_weight():
     sets[set_id][sentiment][word] = float(new_weight)
     save_signal_sets(sets)
     return jsonify({"status": "updated", "sets": sets})
+
+
+# ─── Data Store API ───────────────────────────────────────────────────────────
+
+@app.route("/api/data/stats")
+def data_stats():
+    """Get data store statistics for debugging and trend overview."""
+    try:
+        conn = sqlite3.connect(str(DATA_STORE_PATH))
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM articles")
+        total = c.fetchone()[0]
+        c.execute("SELECT sentiment, COUNT(*) FROM articles GROUP BY sentiment")
+        by_sentiment = dict(c.fetchall())
+        c.execute("SELECT source_id, COUNT(*) FROM articles GROUP BY source_id ORDER BY COUNT(*) DESC LIMIT 10")
+        by_source = dict(c.fetchall())
+        c.execute("SELECT keyword, COUNT(*) FROM articles GROUP BY keyword ORDER BY COUNT(*) DESC LIMIT 15")
+        by_keyword = dict(c.fetchall())
+        c.execute("SELECT COUNT(*) FROM chat_logs")
+        chats = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM articles WHERE article_fetched = 1")
+        fetched = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM articles WHERE ai_summary = 1")
+        ai_analyzed = c.fetchone()[0]
+        # Accuracy tracking: where AI and word-based disagreed
+        c.execute("SELECT COUNT(*) FROM articles WHERE ai_sentiment != '' AND ai_sentiment IS NOT NULL AND word_sentiment != '' AND ai_sentiment != word_sentiment")
+        disagreements = c.fetchone()[0]
+        conn.close()
+        return jsonify({
+            "total_articles": total,
+            "articles_fetched": fetched,
+            "ai_analyzed": ai_analyzed,
+            "sentiment_disagreements": disagreements,
+            "by_sentiment": by_sentiment,
+            "by_source": by_source,
+            "by_keyword": by_keyword,
+            "total_chats": chats,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/data/recent")
+def data_recent():
+    """Get recent articles from the data store with full text for debugging."""
+    limit = request.args.get("limit", 20, type=int)
+    try:
+        conn = sqlite3.connect(str(DATA_STORE_PATH))
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute("SELECT * FROM articles ORDER BY id DESC LIMIT ?", (min(limit, 100),))
+        rows = [dict(r) for r in c.fetchall()]
+        conn.close()
+        return jsonify({"articles": rows})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/data/export")
+def data_export():
+    """Export all articles as JSON for analysis."""
+    try:
+        conn = sqlite3.connect(str(DATA_STORE_PATH))
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute("SELECT * FROM articles ORDER BY id DESC")
+        rows = [dict(r) for r in c.fetchall()]
+        conn.close()
+        return jsonify({"articles": rows, "count": len(rows)})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 _monitor_started = False

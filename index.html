@@ -102,9 +102,9 @@ function App() {
   const [newSymbol, setNewSymbol] = useState("");
   const [selectedStock, setSelectedStock] = useState(null);
   const [selectedRange, setSelectedRange] = useState("1d");
-  const [chatQuestion, setChatQuestion] = useState("");
-  const [chatHistories, setChatHistories] = useState({});  // {alertId: [{role:"user",text:"..."},{role:"ai",text:"..."},...]}
-  const [chatLoading, setChatLoading] = useState(null);  // alertId or null
+  const [chatInputs, setChatInputs] = useState({});  // {alertId: "question text"}
+  const [chatHistories, setChatHistories] = useState({});
+  const [chatLoading, setChatLoading] = useState(null);
   const [csvSetId, setCsvSetId] = useState("custom");
   const [csvNewLabel, setCsvNewLabel] = useState("");
   const [toast, setToast] = useState("");
@@ -345,9 +345,9 @@ function App() {
 
   // Ollama chat
   const askFollowUp = (alertId) => {
-    if (!chatQuestion.trim()) return;
-    const question = chatQuestion.trim();
-    setChatQuestion("");
+    const question = (chatInputs[alertId] || "").trim();
+    if (!question) return;
+    setChatInputs(prev => ({...prev, [alertId]: ""}));
     setChatLoading(alertId);
 
     // Add user message to history immediately
@@ -711,10 +711,9 @@ function App() {
                               {/* Input */}
                               <div style={{ display: "flex", gap: 4, marginTop: 4 }}>
                                 <input
-                                  value={chatLoading === a.id ? "" : chatQuestion}
-                                  onChange={e => setChatQuestion(e.target.value)}
+                                  value={chatInputs[a.id] || ""}
+                                  onChange={e => setChatInputs(prev => ({...prev, [a.id]: e.target.value}))}
                                   onKeyDown={e => e.key === "Enter" && askFollowUp(a.id)}
-                                  onFocus={() => {}}
                                   placeholder={chatHistories[a.id]?.length ? "Ask another question..." : "Ask about this article..."}
                                   disabled={chatLoading === a.id}
                                   style={{ flex: 1, background: "#14141F", border: "1px solid #2A2A35", borderRadius: 6, padding: "5px 8px", color: "#E8E8ED", fontSize: 10, outline: "none", fontFamily: "inherit", opacity: chatLoading === a.id ? 0.5 : 1 }}
@@ -731,6 +730,9 @@ function App() {
 
                     <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
                       <span style={{ fontSize: 10, padding: "2px 8px", borderRadius: 3, color: sentColor, background: sentColor + "15", border: "1px solid " + sentColor + "33", fontWeight: 600 }}>{sent.toUpperCase()} {scoreStr}</span>
+                      {a.ai_sentiment && a.word_sentiment && a.ai_sentiment !== a.word_sentiment && (
+                        <span style={{ fontSize: 8, padding: "1px 6px", borderRadius: 3, background: "#FF950015", color: "#FF9500", border: "1px solid #FF950033" }}>⚡ AI: {a.ai_sentiment} / Words: {a.word_sentiment}</span>
+                      )}
                       {a.confidence != null && <span style={{ fontSize: 9, color: "#555" }}>{Math.round(a.confidence * 100)}% conf</span>}
                       {a.positive_signals && a.positive_signals.length > 0 && <span style={{ fontSize: 9, color: "#34C759" }}>+{a.positive_signals.join(", +")}</span>}
                       {a.negative_signals && a.negative_signals.length > 0 && <span style={{ fontSize: 9, color: "#FF3B30" }}>−{a.negative_signals.join(", −")}</span>}

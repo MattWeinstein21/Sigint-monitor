@@ -351,6 +351,264 @@ init_data_store()
 log_system_event("startup", "SIGINT monitor initialized")
 
 
+# ─── Self-Improvement / Historical Learning ───────────────────────────────────
+
+def get_correction_stats(source_id="", keyword=""):
+    """
+    Query historical corrections to determine AI vs lexicon accuracy.
+    Used by the ensemble to decide who to trust on disagreements.
+    Returns default values if insufficient data.
+    """
+    try:
+        conn = sqlite3.connect(str(DATA_STORE_PATH))
+        c = conn.cursor()
+
+        # Build query based on filters
+        where_parts = []
+        params = []
+        if source_id:
+            where_parts.append("sc.source_id = ?")
+            params.append(source_id)
+        if keyword:
+            where_parts.append("sc.keyword = ?")
+            params.append(keyword)
+
+        where_clause = "WHERE " + " OR ".join(where_parts) if where_parts else ""
+
+        c.execute(f"""SELECT
+            SUM(CASE WHEN sc.corrected_sentiment = a.ai_sentiment THEN 1 ELSE 0 END) as ai_right,
+            SUM(CASE WHEN sc.corrected_sentiment = a.word_sentiment THEN 1 ELSE 0 END) as word_right,
+            COUNT(*) as total
+            FROM sentiment_corrections sc
+            LEFT JOIN articles a ON sc.article_url = a.url
+            {where_clause}""", params)
+
+        row = c.fetchone()
+        conn.close()
+
+        if row and row[2] and row[2] > 5:
+            total = row[2]
+            return {
+                "llm_accuracy": (row[0] or 0) / total,
+                "lexicon_accuracy": (row[1] or 0) / total,
+                "sample_size": total,
+            }
+    except Exception as e:
+        log.debug(f"Correction stats error: {e}")
+
+    return {"llm_accuracy": 0.7, "lexicon_accuracy": 0.5, "sample_size": 0}
+
+
+def recalibrate_thresholds():
+    """
+    Analyze user corrections to find signal words that frequently misfire.
+    Returns list of adjustments to consider applying to signal sets.
+    Run periodically (daily/weekly) or on-demand.
+    """
+    try:
+        conn = sqlite3.connect(str(DATA_STORE_PATH))
+        c = conn.cursor()
+
+        c.execute("""
+            SELECT a.positive_signals, a.negative_signals,
+                   sc.original_sentiment, sc.corrected_sentiment
+            FROM sentiment_corrections sc
+            JOIN articles a ON sc.article_url = a.url
+        """)
+
+        bad_positive = {}  # Positive words that were in wrongly-positive articles
+        bad_negative = {}  # Negative words that were in wrongly-negative articles
+        total_corrections = 0
+
+        for row in c.fetchall():
+            total_corrections += 1
+            try:
+                pos_sigs = json.loads(row[0] or "[]")
+                neg_sigs = json.loads(row[1] or "[]")
+            except json.JSONDecodeError:
+                continue
+            original = row[2]
+            corrected = row[3]
+
+            if original == "positive" and corrected in ("negative", "neutral"):
+                for word in pos_sigs:
+                    bad_positive[word] = bad_positive.get(word, 0) + 1
+            elif original == "negative" and corrected in ("positive", "neutral"):
+                for word in neg_sigs:
+                    bad_negative[word] = bad_negative.get(word, 0) + 1
+
+        conn.close()
+
+        adjustments = []
+        for word, count in bad_positive.items():
+            if count >= 3:
+                adjustments.append({
+                    "word": word, "current_type": "positive",
+                    "action": "reduce_weight", "misfire_count": count,
+                    "recommendation": f'Word "{word}" triggered positive {count} times but articles were corrected to negative/neutral'
+                })
+        for word, count in bad_negative.items():
+            if count >= 3:
+                adjustments.append({
+                    "word": word, "current_type": "negative",
+                    "action": "reduce_weight", "misfire_count": count,
+                    "recommendation": f'Word "{word}" triggered negative {count} times but articles were corrected to positive/neutral'
+                })
+
+        return {"adjustments": adjustments, "total_corrections_analyzed": total_corrections}
+
+    except Exception as e:
+        log.debug(f"Recalibration error: {e}")
+        return {"adjustments": [], "total_corrections_analyzed": 0}
+
+
+def compute_source_accuracy():
+    """
+    Track which sources tend to produce misclassified articles.
+    Sources with high correction rates may need confidence discounting.
+    """
+    try:
+        conn = sqlite3.connect(str(DATA_STORE_PATH))
+        c = conn.cursor()
+
+        c.execute("""
+            SELECT a.source_id, a.source_name,
+                   COUNT(*) as total_corrected
+            FROM sentiment_corrections sc
+            JOIN articles a ON sc.article_url = a.url
+            GROUP BY a.source_id
+            ORDER BY total_corrected DESC
+        """)
+        correction_rows = c.fetchall()
+
+        c.execute("SELECT source_id, COUNT(*) FROM articles GROUP BY source_id")
+        total_by_source = dict(c.fetchall())
+
+        conn.close()
+
+        source_accuracy = {}
+        for source_id, source_name, corrected in correction_rows:
+            total = total_by_source.get(source_id, 0)
+            if total > 0:
+                error_rate = corrected / total
+                source_accuracy[source_id] = {
+                    "name": source_name,
+                    "error_rate": round(error_rate, 3),
+                    "corrections": corrected,
+                    "total_articles": total,
+                    "accuracy": round(1.0 - error_rate, 3),
+                }
+
+        return source_accuracy
+
+    except Exception as e:
+        log.debug(f"Source accuracy error: {e}")
+        return {}
+
+
+def calibrate_confidence():
+    """
+    Check: when the system says confidence=0.8, is it actually correct 80% of the time?
+    Returns calibration data for each confidence bucket.
+    """
+    try:
+        conn = sqlite3.connect(str(DATA_STORE_PATH))
+        c = conn.cursor()
+
+        buckets = [(0, 0.3, "low"), (0.3, 0.5, "medium-low"), (0.5, 0.7, "medium"),
+                   (0.7, 0.85, "medium-high"), (0.85, 1.01, "high")]
+        results = []
+
+        for low, high, label in buckets:
+            c.execute("SELECT COUNT(*) FROM articles WHERE confidence >= ? AND confidence < ?", (low, high))
+            total = c.fetchone()[0]
+
+            c.execute("""SELECT COUNT(*) FROM articles a
+                JOIN sentiment_corrections sc ON a.url = sc.article_url
+                WHERE a.confidence >= ? AND a.confidence < ?""", (low, high))
+            corrected = c.fetchone()[0]
+
+            if total > 0:
+                actual_accuracy = 1.0 - (corrected / total)
+                claimed_midpoint = (low + high) / 2
+                results.append({
+                    "bucket": label,
+                    "range": f"{low:.0%}-{high:.0%}",
+                    "total_articles": total,
+                    "corrections": corrected,
+                    "actual_accuracy": round(actual_accuracy, 3),
+                    "claimed_confidence": round(claimed_midpoint, 2),
+                    "calibration_ratio": round(actual_accuracy / max(claimed_midpoint, 0.01), 2),
+                    "overconfident": actual_accuracy < claimed_midpoint,
+                })
+
+        conn.close()
+        return results
+
+    except Exception as e:
+        log.debug(f"Calibration error: {e}")
+        return []
+
+
+def get_disagreement_outcomes():
+    """
+    When AI and word-based disagreed, who was right?
+    Uses corrections data to track this.
+    """
+    try:
+        conn = sqlite3.connect(str(DATA_STORE_PATH))
+        c = conn.cursor()
+
+        # Find articles where AI and words disagreed AND user later corrected
+        c.execute("""
+            SELECT
+                a.ai_sentiment, a.word_sentiment, sc.corrected_sentiment,
+                a.source_id, a.keyword
+            FROM sentiment_corrections sc
+            JOIN articles a ON sc.article_url = a.url
+            WHERE a.ai_sentiment != '' AND a.ai_sentiment IS NOT NULL
+              AND a.word_sentiment != '' AND a.word_sentiment IS NOT NULL
+              AND a.ai_sentiment != a.word_sentiment
+        """)
+
+        ai_wins = 0
+        words_wins = 0
+        neither_wins = 0
+        total = 0
+        examples = []
+
+        for row in c.fetchall():
+            total += 1
+            ai_sent, word_sent, corrected, source, keyword = row
+            if corrected == ai_sent:
+                ai_wins += 1
+            elif corrected == word_sent:
+                words_wins += 1
+            else:
+                neither_wins += 1
+            if len(examples) < 10:
+                examples.append({
+                    "ai_said": ai_sent, "words_said": word_sent,
+                    "correct_was": corrected, "source": source, "keyword": keyword
+                })
+
+        conn.close()
+
+        return {
+            "total_disagreements_corrected": total,
+            "ai_was_right": ai_wins,
+            "words_were_right": words_wins,
+            "neither_right": neither_wins,
+            "ai_accuracy_on_disagreements": round(ai_wins / max(total, 1), 3),
+            "word_accuracy_on_disagreements": round(words_wins / max(total, 1), 3),
+            "examples": examples,
+        }
+
+    except Exception as e:
+        log.debug(f"Disagreement outcomes error: {e}")
+        return {"total_disagreements_corrected": 0, "ai_was_right": 0, "words_were_right": 0}
+
+
 CONFIG_PATH = Path("config.json")
 
 DEFAULT_CONFIG = {
@@ -622,63 +880,110 @@ class AlertStore:
                 time.sleep(2)
 
     def _enrich_with_ai(self, job):
-        """Run Ollama analysis and update the alert in place."""
+        """Run Ollama analysis, ensemble with lexicon, update alert in place."""
         alert_id = job["alert_id"]
         analysis_text = job["analysis_text"]
         source_id = job["source_id"]
         keyword = job["keyword"]
 
         if not self.ollama_url:
+            with self.lock:
+                for a in self.alerts:
+                    if a["id"] == alert_id:
+                        a["ai_processing"] = False
+                        break
             return
 
-        ai_summary, ai_sentiment, success = ollama_analyze(
+        llm_result, raw_response, success = ollama_analyze(
             analysis_text, self.ollama_url, self.ollama_model, keyword=keyword
         )
-
-        if not success:
-            log.debug(f"AI enrichment failed for alert {alert_id}")
-            return
 
         with self.lock:
             for alert in self.alerts:
                 if alert["id"] == alert_id:
-                    # Update summary
-                    if ai_summary:
-                        alert["summary"] = ai_summary
+                    alert["ai_processing"] = False
+
+                    if not success:
+                        log.debug(f"AI enrichment failed for alert {alert_id}")
+                        break
+
+                    # ─── Ensemble: combine lexicon + LLM ───
+                    lexicon_tone = alert.get("article_tone", alert.get("sentiment", "neutral"))
+                    llm_tone = llm_result.get("article_tone", "neutral")
+                    llm_impact = llm_result.get("market_impact", "neutral")
+                    llm_conf = llm_result.get("confidence", 0.5)
+                    lex_conf = alert.get("confidence", 0.3)
+                    source_reliability = SOURCE_WEIGHTS.get(source_id, 0.5)
+
+                    # Update summary (always use LLM if available)
+                    if llm_result.get("summary"):
+                        alert["summary"] = llm_result["summary"][:500]
                         alert["ai_summary"] = True
 
-                    # Update sentiment with AI judgment
-                    if ai_sentiment:
-                        alert["ai_sentiment"] = ai_sentiment
-                        word_sent = alert.get("word_sentiment", "neutral")
-
-                        if ai_sentiment == word_sent:
-                            # Agreement — boost confidence
-                            alert["confidence"] = min(1.0, alert.get("confidence", 0.5) + 0.3)
-                        elif word_sent == "neutral":
-                            # Words were inconclusive, trust AI
-                            alert["sentiment"] = ai_sentiment
-                            alert["confidence"] = 0.7
-                            # Flip score direction
-                            score = abs(alert.get("sentiment_score", 0))
-                            alert["sentiment_score"] = score if ai_sentiment == "positive" else -score if ai_sentiment == "negative" else 0
+                    # Ensemble tone decision
+                    if lexicon_tone == llm_tone:
+                        final_tone = llm_tone
+                        final_conf = min(1.0, llm_conf * 0.6 + lex_conf * 0.3 + 0.1)
+                        method = "ensemble_agree"
+                    elif lexicon_tone == "neutral":
+                        final_tone = llm_tone
+                        final_conf = llm_conf * 0.7
+                        method = "llm_dominant"
+                    elif llm_tone == "neutral":
+                        if lex_conf > 0.5:
+                            final_tone = lexicon_tone
+                            final_conf = lex_conf * 0.5
+                            method = "lexicon_dominant"
                         else:
-                            # Disagreement — trust AI, lower confidence
-                            alert["sentiment"] = ai_sentiment
-                            alert["confidence"] = 0.5
-                            score = abs(alert.get("sentiment_score", 0))
-                            alert["sentiment_score"] = score if ai_sentiment == "positive" else -score if ai_sentiment == "negative" else 0
+                            final_tone = "neutral"
+                            final_conf = 0.4
+                            method = "both_weak"
+                    else:
+                        # Direct disagreement — use historical accuracy to decide
+                        stats = get_correction_stats(source_id, keyword)
+                        if stats["sample_size"] > 5 and stats["llm_accuracy"] > stats["lexicon_accuracy"] + 0.1:
+                            final_tone = llm_tone
+                            final_conf = 0.4
+                            method = "llm_override_learned"
+                        elif stats["sample_size"] > 5 and stats["lexicon_accuracy"] > stats["llm_accuracy"] + 0.1:
+                            final_tone = lexicon_tone
+                            final_conf = 0.4
+                            method = "lexicon_override_learned"
+                        else:
+                            final_tone = llm_tone  # default to LLM
+                            final_conf = 0.35
+                            method = "llm_override"
 
-                        # Recalculate severity
-                        abs_score = abs(alert.get("sentiment_score", 0))
-                        alert["severity"] = "high" if abs_score >= 5 else "medium" if abs_score >= 2 else "low"
+                    # Source reliability affects confidence, NOT polarity
+                    final_conf *= (0.7 + source_reliability * 0.3)
 
-                    # Update data store
+                    # Update alert fields
+                    alert["article_tone"] = final_tone
+                    alert["market_impact"] = llm_impact
+                    alert["sentiment"] = final_tone  # backward compat
+                    alert["ai_sentiment"] = llm_tone
+                    alert["confidence"] = round(min(1.0, final_conf), 2)
+                    alert["classification_method"] = method
+                    alert["event_type"] = llm_result.get("event_type", "other")
+                    alert["scope"] = llm_result.get("scope", "broad_market")
+                    alert["time_horizon"] = llm_result.get("time_horizon", "unclear")
+                    alert["mixed_signals"] = llm_result.get("mixed_signals", False) or alert.get("mixed_signals", False)
+
+                    # Severity from confidence + impact
+                    if llm_impact in ("bullish", "bearish") and final_conf > 0.6:
+                        alert["severity"] = "high"
+                    elif final_conf > 0.4:
+                        alert["severity"] = "medium"
+                    else:
+                        alert["severity"] = "low"
+
+                    # Re-log to data store with enriched data
                     log_article(alert, analysis_text)
 
-                    emoji = {"positive": "📈", "negative": "📉", "neutral": "➡️"}.get(alert["sentiment"], "➡️")
-                    disagree = " ⚡" if ai_sentiment and alert.get("word_sentiment") and ai_sentiment != alert["word_sentiment"] else ""
-                    log.info(f"🤖{emoji}{disagree} AI enriched [{source_id}] {alert['sentiment']}({alert['sentiment_score']:+.1f}) → {alert['title'][:60]}")
+                    emoji_map = {"bullish": "📈", "bearish": "📉", "neutral": "➡️"}
+                    emoji = emoji_map.get(llm_impact, "➡️")
+                    disagree = " ⚡DISAGREE" if lexicon_tone != llm_tone and lexicon_tone != "neutral" else ""
+                    log.info(f"🤖{emoji}{disagree} [{method}] tone={final_tone} impact={llm_impact} conf={alert['confidence']} → {alert['title'][:55]}")
                     break
 
     def add(self, source_id, source_name, title, url, snippet, keyword, severity="medium", published_at=None):
@@ -690,24 +995,24 @@ class AlertStore:
                 return False
             self.seen_hashes.add(h)
 
-        # Fetch article text (this is fast, ~1-2s)
+        # Fetch article text
         article_text, fetched = fetch_article_text(url)
         analysis_text = article_text if fetched else f"{title}. {snippet}"
 
-        # Run ONLY word-based sentiment (instant, no network call)
+        # Run sentence-level lexicon engine (instant)
         word_result = analyze_sentiment_words_only(
             analysis_text,
             source_id=source_id,
             matched_keywords=[keyword],
         )
 
-        # Generate fallback summary (first 2 sentences)
+        # Generate fallback summary
         sentences = re.split(r'(?<=[.!?])\s+', analysis_text[:600])
         fallback_summary = " ".join(sentences[:2]).strip()
         if len(fallback_summary) > 250:
             fallback_summary = fallback_summary[:247] + "..."
 
-        # Format published_at for display
+        # Format published_at
         pub_str = ""
         if published_at:
             try:
@@ -725,32 +1030,42 @@ class AlertStore:
                 "url": url.strip(),
                 "snippet": (snippet or "").strip(),
                 "keyword": keyword.strip().lower(),
-                "severity": word_result["severity"],
-                "sentiment": word_result["sentiment"],
-                "sentiment_score": word_result["score"],
+                # New multi-dimensional classification
+                "article_tone": word_result["article_tone"],
+                "market_impact": word_result["market_impact"],
+                "sentiment": word_result["article_tone"],  # backward compat
+                "sentiment_score": word_result["polarity"],
                 "confidence": word_result["confidence"],
+                "severity": word_result["severity"],
+                "mixed_signals": word_result.get("mixed_signals", False),
+                "event_type": "other",
+                "scope": "broad_market",
+                "time_horizon": "unclear",
+                "classification_method": "lexicon_only",
+                # AI fields — populated async
                 "summary": fallback_summary,
                 "ai_summary": False,
                 "ai_sentiment": None,
-                "ai_processing": True,  # Flag: AI is still working
-                "word_sentiment": word_result["sentiment"],
+                "ai_processing": bool(self.ollama_url),
+                "word_sentiment": word_result["article_tone"],
                 "positive_signals": word_result["positive_signals"],
                 "negative_signals": word_result["negative_signals"],
                 "article_fetched": fetched,
                 "published_at": pub_str,
+                "source_reliability": word_result.get("source_reliability", 0.5),
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
             self.alerts.insert(0, alert)
             if len(self.alerts) > self.max_alerts:
                 self.alerts = self.alerts[: self.max_alerts]
 
-            # Log immediately with word-based analysis
             log_article(alert, article_text)
 
-            emoji = {"positive": "📈", "negative": "📉", "neutral": "➡️"}.get(word_result["sentiment"], "➡️")
-            log.info(f"{emoji} [{source_id}] {word_result['sentiment']}({word_result['score']:+.1f}) keyword='{keyword}' → {title[:70]} [AI queued]")
+            emoji_map = {"positive": "📈", "negative": "📉", "neutral": "➡️"}
+            emoji = emoji_map.get(word_result["article_tone"], "➡️")
+            log.info(f"{emoji} [{source_id}] tone={word_result['article_tone']} conf={word_result['confidence']} keyword='{keyword}' → {title[:65]} [AI queued]")
 
-        # Queue AI enrichment in background
+        # Queue AI enrichment
         if self.ollama_url:
             with self._ai_lock:
                 self._ai_queue.append({
@@ -759,14 +1074,6 @@ class AlertStore:
                     "source_id": source_id,
                     "keyword": keyword,
                 })
-        else:
-            # No Ollama — mark as done
-            with self.lock:
-                for a in self.alerts:
-                    if a["id"] == alert_id:
-                        a["ai_processing"] = False
-                        break
-
         return True
 
     def get_all(self, since=None, limit=None):
@@ -1086,58 +1393,124 @@ def get_active_signals():
     return pos, neg
 
 
-# ─── Ollama Integration ───────────────────────────────────────────────────────
+# ─── Ollama Integration (Redesigned) ──────────────────────────────────────────
+
+OLLAMA_PROMPT = """You are a financial news classifier. Analyze the article below and return ONLY a JSON object. No extra text before or after the JSON.
+
+DEFINITIONS:
+- article_tone: The writing's emotional direction. "positive" = optimistic/celebratory. "negative" = alarming/critical. "neutral" = factual/balanced. If unsure, use "neutral".
+- market_impact: Likely effect on financial markets. "bullish" = prices likely rise. "bearish" = prices likely fall. "neutral" = no clear effect. If unsure, use "neutral".
+- event_type: One of: policy, legal, macro, earnings, geopolitics, crypto, social_post, rumor, other
+- scope: "single_company" if one company, "sector" if an industry, "broad_market" if economy-wide
+- time_horizon: "immediate" = this week, "short_term" = weeks, "long_term" = months+, "unclear"
+
+RULES:
+1. Base classification ONLY on the article text. Do not infer from source reputation.
+2. Article tone and market impact CAN differ. Neutral reporting about rate hikes = neutral tone, bearish impact.
+3. If mixed positive and negative elements, set mixed_signals true. Choose dominant direction or neutral if balanced.
+4. Prefer "neutral" when evidence is ambiguous.
+5. Summary: 2-3 sentences on what happened and why it matters for markets.
+
+Respond with ONLY this JSON:
+{{"article_tone":"positive|neutral|negative","market_impact":"bullish|neutral|bearish","confidence":0.0,"event_type":"string","scope":"string","time_horizon":"string","mixed_signals":false,"summary":"string"}}
+
+{trend_context}ARTICLE:
+{article_text}"""
+
+
+def parse_llm_response(raw_response):
+    """Parse and validate LLM JSON response with fallbacks."""
+    text = raw_response.strip()
+
+    # Strip markdown fences
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+
+    # Find JSON object
+    json_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', text, re.DOTALL)
+    if not json_match:
+        return None, "no_json_found"
+
+    try:
+        parsed = json.loads(json_match.group())
+    except json.JSONDecodeError:
+        return None, "json_parse_error"
+
+    # Validate required fields
+    required = {"article_tone", "market_impact", "confidence", "summary"}
+    missing = required - set(parsed.keys())
+    if missing:
+        return None, f"missing_fields:{','.join(missing)}"
+
+    # Validate enums
+    valid_tones = {"positive", "neutral", "negative"}
+    valid_impacts = {"bullish", "neutral", "bearish"}
+    if parsed.get("article_tone") not in valid_tones:
+        parsed["article_tone"] = "neutral"
+    if parsed.get("market_impact") not in valid_impacts:
+        parsed["market_impact"] = "neutral"
+
+    # Clamp confidence
+    try:
+        parsed["confidence"] = max(0.0, min(1.0, float(parsed.get("confidence", 0.5))))
+    except (ValueError, TypeError):
+        parsed["confidence"] = 0.5
+
+    # Fill defaults
+    parsed.setdefault("event_type", "other")
+    parsed.setdefault("scope", "broad_market")
+    parsed.setdefault("time_horizon", "unclear")
+    parsed.setdefault("mixed_signals", False)
+
+    return parsed, "ok"
+
 
 def ollama_analyze(text, ollama_url, model="llama3", keyword=""):
     """
-    Send article text to Ollama for AI-powered summary AND sentiment judgment.
-    Includes historical trend context from the data store when available.
-    Returns (summary, ai_sentiment, success).
+    Call Ollama with JSON-schema prompt. Returns (parsed_dict, raw_response, success).
+    Includes retry on parse failure.
     """
     if not ollama_url:
-        return "", "", False
-    try:
-        # Build trend context from stored articles
-        trend_ctx = build_trend_context(keyword=keyword, limit=5) if keyword else ""
+        return None, "", False
 
-        prompt = (
-            "You are a financial market analyst. Analyze the following article.\n\n"
-            "Respond in EXACTLY this format (no extra text):\n"
-            "SENTIMENT: positive OR negative OR neutral\n"
-            "SUMMARY: 2-3 sentence summary focusing on market impact, affected sectors/companies, and what traders should know.\n\n"
-        )
-        if trend_ctx:
-            prompt += f"Historical context:\n{trend_ctx}\n\n"
-        prompt += f"Article:\n{text[:2500]}"
+    trend_ctx = ""
+    if keyword:
+        ctx = build_trend_context(keyword=keyword, limit=5)
+        if ctx:
+            trend_ctx = f"RECENT CONTEXT:\n{ctx}\n\n"
 
-        resp = requests.post(
-            f"{ollama_url.rstrip('/')}/api/generate",
-            json={"model": model, "prompt": prompt, "stream": False},
-            timeout=45,
-        )
-        if resp.status_code == 200:
-            result = resp.json().get("response", "").strip()
-            if result:
-                # Parse structured response
-                ai_sentiment = ""
-                summary = result
-                lines = result.split("\n")
-                for line in lines:
-                    line_stripped = line.strip()
-                    if line_stripped.upper().startswith("SENTIMENT:"):
-                        val = line_stripped.split(":", 1)[1].strip().lower()
-                        if val in ("positive", "negative", "neutral"):
-                            ai_sentiment = val
-                    elif line_stripped.upper().startswith("SUMMARY:"):
-                        summary = line_stripped.split(":", 1)[1].strip()
-                # If parsing failed, use full response as summary
-                if not summary or summary == result:
-                    summary = result[:500]
-                return summary[:500], ai_sentiment, True
-        return "", "", False
-    except Exception as e:
-        log.debug(f"Ollama analyze error: {e}")
-        return "", "", False
+    for attempt in range(3):
+        try:
+            prompt = OLLAMA_PROMPT.format(
+                article_text=text[:2500],
+                trend_context=trend_ctx,
+            )
+            if attempt > 0:
+                prompt += "\n\nIMPORTANT: Respond with valid JSON ONLY. No other text."
+
+            resp = requests.post(
+                f"{ollama_url.rstrip('/')}/api/generate",
+                json={"model": model, "prompt": prompt, "stream": False},
+                timeout=50,
+            )
+            if resp.status_code != 200:
+                continue
+
+            raw = resp.json().get("response", "")
+            parsed, status = parse_llm_response(raw)
+
+            if parsed:
+                log_system_event("ollama_success", f"Parsed on attempt {attempt+1}", status)
+                return parsed, raw, True
+
+            log.debug(f"LLM parse attempt {attempt+1} failed: {status}")
+
+        except Exception as e:
+            log.debug(f"LLM call attempt {attempt+1} error: {e}")
+
+    log_system_event("ollama_fail", "All parse attempts failed")
+    return None, "", False
 
 
 def fetch_article_text(url, timeout=12):
@@ -1224,86 +1597,182 @@ def fetch_article_text(url, timeout=12):
         return "", False
 
 
+def split_sentences(text):
+    """Split text into sentences."""
+    return [s.strip() for s in re.split(r'(?<=[.!?])\s+', text) if len(s.strip()) > 10]
+
+
+def compute_position_weight(idx, total):
+    """Lead paragraph matters most. Middle is background. End has conclusions."""
+    if total <= 1:
+        return 1.0
+    ratio = idx / total
+    if ratio < 0.15:
+        return 2.0
+    elif ratio < 0.3:
+        return 1.5
+    elif ratio > 0.85:
+        return 1.3
+    return 0.8
+
+
+def quick_polarity(text_fragment):
+    """Fast polarity check on a text fragment for contrast clause handling."""
+    pos_signals, neg_signals = get_active_signals()
+    score = 0.0
+    text_lower = text_fragment.lower()
+    for word, weight in pos_signals.items():
+        if re.search(rf"(?<!\w){re.escape(word)}", text_lower):
+            score += weight
+    for word, weight in neg_signals.items():
+        if re.search(rf"(?<!\w){re.escape(word)}", text_lower):
+            score -= weight
+    return score
+
+
+def score_sentence(sentence, pos_signals, neg_signals):
+    """Score a single sentence with context-aware rules."""
+    tokens = sentence.lower()
+    score = 0.0
+    signals = []
+
+    # 1. Standard keyword matching
+    for word, weight in pos_signals.items():
+        if re.search(rf"(?<!\w){re.escape(word)}", tokens):
+            score += weight
+            signals.append(("pos", word))
+    for word, weight in neg_signals.items():
+        if re.search(rf"(?<!\w){re.escape(word)}", tokens):
+            score -= weight
+            signals.append(("neg", word))
+
+    # 2. Negation detection — flip if preceded by negation
+    negation_words = ["not", "no", "never", "neither", "fail", "failed",
+                      "unlikely", "unable", "without", "lack", "lacks", "don't", "doesn't", "won't"]
+    signal_words = [w for _, w in signals]
+    if signal_words:
+        for neg in negation_words:
+            pattern = rf"\b{neg}\b.{{0,30}}({'|'.join(re.escape(w) for w in signal_words)})"
+            if re.search(pattern, tokens):
+                score *= -0.7
+                break
+
+    # 3. Contrast clause detection — clause after "but/however" carries the point
+    contrast_words = ["but", "however", "despite", "although", "nevertheless", "yet", "though", "whereas"]
+    for cw in contrast_words:
+        if f" {cw} " in f" {tokens} ":
+            parts = tokens.split(cw, 1)
+            if len(parts) == 2 and len(parts[1]) > 15:
+                before = quick_polarity(parts[0])
+                after = quick_polarity(parts[1])
+                score = (before + after * 2.0) / 3.0
+
+    # 4. Expectation framing
+    if re.search(r"better\s+than\s+(expected|feared|forecast|anticipated)", tokens):
+        score += 2.5
+        signals.append(("pos", "better than expected"))
+    if re.search(r"worse\s+than\s+(expected|hoped|forecast|anticipated)", tokens):
+        score -= 2.5
+        signals.append(("neg", "worse than expected"))
+    if re.search(r"(easing|eased|ease)\s+(fears?|concerns?|tensions?|worries)", tokens):
+        score += 1.5
+        signals.append(("pos", "easing fears"))
+    if re.search(r"(escalating|escalated|heightened?)\s+(fears?|concerns?|tensions?|worries)", tokens):
+        score -= 1.5
+        signals.append(("neg", "escalating tensions"))
+
+    # 5. Modality / uncertainty discount
+    uncertain = ["may", "might", "could", "reportedly", "rumored", "considering",
+                 "expected to", "likely to", "possibly", "potentially", "alleged"]
+    if any(f" {u} " in f" {tokens} " for u in uncertain):
+        score *= 0.6
+
+    polarity = max(-1.0, min(1.0, score / 5.0))
+    return polarity, signals
+
+
 def analyze_sentiment_words_only(text, source_id="", matched_keywords=None):
     """
-    Word-based sentiment analysis only (instant, no network calls).
+    Sentence-level lexicon engine. Produces structured features, not a final verdict.
     Used for immediate alert posting. AI enrichment happens async.
     """
-    text_lower = text.lower()
     matched_keywords = matched_keywords or []
     pos_signals_dict, neg_signals_dict = get_active_signals()
 
-    pos_score = 0.0
-    neg_score = 0.0
-    pos_signals = []
-    neg_signals = []
+    title = text.split(".")[0] if "." in text[:200] else text[:150]
+    sentences = split_sentences(text)
 
-    for word, weight in pos_signals_dict.items():
-        pattern = re.compile(rf"(?<!\w){re.escape(word)}", re.IGNORECASE)
-        found = pattern.findall(text_lower)
-        if found:
-            pos_score += weight * len(found)
-            pos_signals.append(word)
+    # Score title with 3x weight
+    title_pol, title_sig = score_sentence(title, pos_signals_dict, neg_signals_dict)
 
-    for word, weight in neg_signals_dict.items():
-        pattern = re.compile(rf"(?<!\w){re.escape(word)}", re.IGNORECASE)
-        found = pattern.findall(text_lower)
-        if found:
-            neg_score += weight * len(found)
-            neg_signals.append(word)
+    # Score each sentence with position weighting
+    scored = []
+    for i, sent in enumerate(sentences):
+        pol, sigs = score_sentence(sent, pos_signals_dict, neg_signals_dict)
+        weight = compute_position_weight(i, len(sentences))
+        scored.append({"polarity": pol, "weight": weight, "signals": sigs})
 
-    # Negation detection
-    negation_patterns = [
-        (r"not\s+(rising|gaining|improving|growing)", "neg_flip"),
-        (r"no\s+(deal|agreement|progress|recovery)", "neg_flip"),
-        (r"fail(ed|s)?\s+to\s+(rally|recover|gain|rise)", "neg_flip"),
-        (r"unlikely\s+to\s+(cut|ease|approve|pass)", "neg_flip"),
-        (r"(avoid|prevent|avert)(ed|s|ing)?\s+(crash|crisis|recession|default)", "pos_flip"),
-        (r"(ease|calm|cool)(ed|s|ing)?\s+(fears?|concerns?|tensions?|worries)", "pos_flip"),
-    ]
-    for pat, flip_type in negation_patterns:
-        if re.search(pat, text_lower):
-            if flip_type == "neg_flip":
-                neg_score += 2
-            elif flip_type == "pos_flip":
-                pos_score += 2
+    # Weighted aggregate
+    weighted_sum = title_pol * 3.0
+    total_weight = 3.0
+    for s in scored:
+        weighted_sum += s["polarity"] * s["weight"]
+        total_weight += s["weight"]
 
-    amplifier = 1.0
-    for word, mult in AMPLIFIERS.items():
-        if word.lower() in text_lower:
-            amplifier = max(amplifier, mult)
+    final_polarity = weighted_sum / max(total_weight, 1)
 
-    kw_set = set(k.lower() for k in matched_keywords)
-    combo_mult = 1.0
-    for combo_words, mult in HIGH_IMPACT_COMBOS:
-        if combo_words.issubset(kw_set) or all(w in text_lower for w in combo_words):
-            combo_mult = max(combo_mult, mult)
+    # Collect all signals
+    all_pos = list(set(w for s in scored for t, w in s["signals"] if t == "pos"))
+    all_neg = list(set(w for s in scored for t, w in s["signals"] if t == "neg"))
+    all_pos += [w for t, w in title_sig if t == "pos"]
+    all_neg += [w for t, w in title_sig if t == "neg"]
 
-    src_weight = SOURCE_WEIGHTS.get(source_id, 0.5)
-    raw = (pos_score - neg_score) * amplifier * combo_mult * src_weight
-    score = max(-10.0, min(10.0, raw))
+    # Mixed signal detection
+    has_pos = any(s["polarity"] > 0.3 for s in scored) or title_pol > 0.3
+    has_neg = any(s["polarity"] < -0.3 for s in scored) or title_pol < -0.3
+    mixed = has_pos and has_neg
 
-    if score > 1.5:
-        sentiment = "positive"
-    elif score < -1.5:
-        sentiment = "negative"
+    # Confidence: agreement + signal density
+    if scored:
+        polarities = [s["polarity"] for s in scored if abs(s["polarity"]) > 0.05]
+        if polarities:
+            pos_count = sum(1 for p in polarities if p > 0)
+            neg_count = sum(1 for p in polarities if p < 0)
+            agreement = max(pos_count, neg_count) / max(pos_count + neg_count, 1)
+        else:
+            agreement = 0.5
+        total_signals = len(all_pos) + len(all_neg)
+        density = min(1.0, total_signals / 10)
+        confidence = agreement * 0.6 + density * 0.4
     else:
-        sentiment = "neutral"
+        confidence = 0.15
 
-    total_signals = len(pos_signals) + len(neg_signals)
-    text_len = max(len(text.split()), 1)
-    confidence = min(1.0, (total_signals / text_len) * 10 + (abs(score) / 10) * 0.5)
+    # Polarity to tone
+    if final_polarity > 0.15:
+        tone = "positive"
+    elif final_polarity < -0.15:
+        tone = "negative"
+    else:
+        tone = "neutral"
 
-    abs_score = abs(score)
-    severity = "high" if abs_score >= 5 else "medium" if abs_score >= 2 else "low"
+    # Severity from polarity magnitude
+    abs_pol = abs(final_polarity)
+    severity = "high" if abs_pol > 0.6 else "medium" if abs_pol > 0.25 else "low"
+
+    # Source reliability affects CONFIDENCE not polarity
+    source_reliability = SOURCE_WEIGHTS.get(source_id, 0.5)
+    confidence *= (0.7 + source_reliability * 0.3)
 
     return {
-        "sentiment": sentiment,
-        "score": round(score, 2),
-        "confidence": round(confidence, 2),
+        "article_tone": tone,
+        "market_impact": {"positive": "bullish", "negative": "bearish", "neutral": "neutral"}[tone],
+        "polarity": round(final_polarity, 3),
+        "confidence": round(min(1.0, confidence), 2),
         "severity": severity,
-        "positive_signals": pos_signals[:5],
-        "negative_signals": neg_signals[:5],
+        "mixed_signals": mixed,
+        "positive_signals": list(set(all_pos))[:8],
+        "negative_signals": list(set(all_neg))[:8],
+        "source_reliability": source_reliability,
     }
 
 
@@ -2628,6 +3097,57 @@ def system_logs():
         return jsonify({"logs": rows})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/data/accuracy")
+def accuracy_dashboard():
+    """
+    Full accuracy dashboard — signal word misfires, source error rates,
+    confidence calibration, disagreement outcomes.
+    """
+    return jsonify({
+        "signal_word_misfires": recalibrate_thresholds(),
+        "source_accuracy": compute_source_accuracy(),
+        "confidence_calibration": calibrate_confidence(),
+        "disagreement_outcomes": get_disagreement_outcomes(),
+        "correction_stats_global": get_correction_stats(),
+    })
+
+
+@app.route("/api/data/apply-recalibration", methods=["POST"])
+def apply_recalibration():
+    """
+    Auto-apply signal word weight reductions based on misfire data.
+    Reduces weight of frequently-misfiring words by 30%.
+    """
+    result = recalibrate_thresholds()
+    adjustments = result.get("adjustments", [])
+    if not adjustments:
+        return jsonify({"status": "no_adjustments_needed", "message": "Not enough correction data or no misfiring words found"})
+
+    sets = load_signal_sets()
+    applied = []
+
+    for adj in adjustments:
+        word = adj["word"]
+        sig_type = adj["current_type"]
+        for set_id, s in sets.items():
+            if word in s.get(sig_type, {}):
+                old_weight = s[sig_type][word]
+                new_weight = round(max(0.5, old_weight * 0.7), 1)  # Reduce by 30%, floor at 0.5
+                s[sig_type][word] = new_weight
+                applied.append({
+                    "set": set_id, "word": word, "type": sig_type,
+                    "old_weight": old_weight, "new_weight": new_weight,
+                    "misfire_count": adj["misfire_count"],
+                })
+
+    if applied:
+        save_signal_sets(sets)
+        log_system_event("recalibration", f"Applied {len(applied)} weight adjustments",
+                         json.dumps(applied))
+
+    return jsonify({"status": "applied", "adjustments": applied, "sets": sets})
 
 
 _monitor_started = False

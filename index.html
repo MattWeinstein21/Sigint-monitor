@@ -91,25 +91,27 @@ function App() {
   const [accountError, setAccountError] = useState("");
   const [refreshing, setRefreshing] = useState(false);
   const [sentimentFilter, setSentimentFilter] = useState("all");
+  const [impactFilter, setImpactFilter] = useState("all");
   const [signalSets, setSignalSets] = useState({});
   const [configTab, setConfigTab] = useState("general");
   const [expandedAlerts, setExpandedAlerts] = useState(new Set());
   const [newSignalSentiment, setNewSignalSentiment] = useState("positive");
-  const [mainView, setMainView] = useState("alerts"); // "alerts" | "market"
+  const [mainView, setMainView] = useState("alerts"); // "alerts" | "market" | "analytics"
   const [indices, setIndices] = useState({});
   const [watchlist, setWatchlist] = useState([]);
   const [watchlistQuotes, setWatchlistQuotes] = useState({});
   const [newSymbol, setNewSymbol] = useState("");
   const [selectedStock, setSelectedStock] = useState(null);
   const [selectedRange, setSelectedRange] = useState("1d");
-  const [chatInputs, setChatInputs] = useState({});  // {alertId: "question text"}
+  const [chatInputs, setChatInputs] = useState({});
   const [chatHistories, setChatHistories] = useState({});
   const [chatLoading, setChatLoading] = useState(null);
   const [csvSetId, setCsvSetId] = useState("custom");
   const [csvNewLabel, setCsvNewLabel] = useState("");
   const [toast, setToast] = useState("");
   const [newSetName, setNewSetName] = useState("");
-  const [inlineAddWord, setInlineAddWord] = useState({});  // {setId: {word: "", sentiment: "positive"}}
+  const [inlineAddWord, setInlineAddWord] = useState({});
+  const [accuracyData, setAccuracyData] = useState(null);
   const [, setTick] = useState(0);
 
   const showToast = (msg) => { setToast(msg); setTimeout(() => setToast(""), 3000); };
@@ -394,6 +396,39 @@ function App() {
       }).catch(() => showToast("⚠ Import failed"));
   };
 
+  // Sentiment correction — user tells us we got it wrong
+  const correctSentiment = (url, corrected) => {
+    fetch(API_BASE + "/api/data/correct", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url, corrected_sentiment: corrected })
+    }).then(r => r.json()).then(d => {
+      if (d.status === "corrected") {
+        showToast("✓ Correction logged: " + d.original + " → " + d.corrected);
+        // Update local alert
+        setAlerts(prev => prev.map(a => a.url === url ? {...a, sentiment: corrected, article_tone: corrected, user_corrected: true} : a));
+      } else if (d.error) showToast("⚠ " + d.error);
+    }).catch(() => showToast("⚠ Correction failed"));
+  };
+
+  // Analytics data loading
+  useEffect(() => {
+    if (mainView !== "analytics") return;
+    fetch(API_BASE + "/api/data/accuracy")
+      .then(r => r.json()).then(d => setAccuracyData(d)).catch(() => {});
+  }, [mainView]);
+
+  const applyRecalibration = () => {
+    fetch(API_BASE + "/api/data/apply-recalibration", { method: "POST" })
+      .then(r => r.json()).then(d => {
+        if (d.adjustments && d.adjustments.length > 0) {
+          showToast("✓ Applied " + d.adjustments.length + " weight adjustments");
+          if (d.sets) setSignalSets(d.sets);
+        } else {
+          showToast("ℹ No adjustments needed — need more correction data");
+        }
+      }).catch(() => showToast("⚠ Recalibration failed"));
+  };
+
   // Mini sparkline SVG component
   const Sparkline = ({data, width, height, color}) => {
     if (!data || data.length < 2) return null;
@@ -407,7 +442,8 @@ function App() {
   const filtered = alerts.filter(a => {
     if (filter !== "all" && a.keyword !== filter) return false;
     if (severityFilter !== "all" && a.severity !== severityFilter) return false;
-    if (sentimentFilter !== "all" && a.sentiment !== sentimentFilter) return false;
+    if (sentimentFilter !== "all" && (a.article_tone || a.sentiment) !== sentimentFilter) return false;
+    if (impactFilter !== "all" && (a.market_impact || "neutral") !== impactFilter) return false;
     return enabledSources.includes(a.source);
   });
 
@@ -437,6 +473,7 @@ function App() {
         <div style={{ display: "flex", gap: 8 }}>
           <button className="btn" onClick={() => setMainView("alerts")} style={{ background: mainView === "alerts" ? "#5448C8" : "#14141F", color: mainView === "alerts" ? "#fff" : "#AAA", padding: "6px 14px", borderRadius: 6, fontSize: 12 }}>📋 Alerts</button>
           <button className="btn" onClick={() => setMainView("market")} style={{ background: mainView === "market" ? "#5448C8" : "#14141F", color: mainView === "market" ? "#fff" : "#AAA", padding: "6px 14px", borderRadius: 6, fontSize: 12 }}>📊 Markets</button>
+          <button className="btn" onClick={() => setMainView("analytics")} style={{ background: mainView === "analytics" ? "#5448C8" : "#14141F", color: mainView === "analytics" ? "#fff" : "#AAA", padding: "6px 14px", borderRadius: 6, fontSize: 12 }}>🎯 Accuracy</button>
           <button className="btn" onClick={triggerRefresh} disabled={refreshing} style={{ background: refreshing ? "#2A2A35" : "#14141F", color: refreshing ? "#666" : "#AAA", padding: "6px 14px", borderRadius: 6, fontSize: 12, opacity: refreshing ? 0.7 : 1 }}>
             {refreshing ? "⟳ Polling..." : "⟳ Refresh"}
           </button>
@@ -603,11 +640,11 @@ function App() {
           <div style={{ display: "flex", gap: 1, padding: "12px 20px", borderBottom: "1px solid #1A1A25" }}>
             {[
               { label: "Total Alerts", value: alerts.length, color: "#5448C8" },
-              { label: "Positive", value: alerts.filter(a => a.sentiment === "positive").length, color: "#34C759" },
-              { label: "Negative", value: alerts.filter(a => a.sentiment === "negative").length, color: "#FF3B30" },
-              { label: "Neutral", value: alerts.filter(a => a.sentiment === "neutral" || !a.sentiment).length, color: "#8E8E93" },
+              { label: "Bullish", value: alerts.filter(a => a.market_impact === "bullish").length, color: "#34C759" },
+              { label: "Bearish", value: alerts.filter(a => a.market_impact === "bearish").length, color: "#FF3B30" },
+              { label: "Mixed", value: alerts.filter(a => a.mixed_signals).length, color: "#FF9500" },
               { label: "High Priority", value: alerts.filter(a => a.severity === "high").length, color: "#FF9500" },
-              { label: "Sources Active", value: enabledSources.length, color: "#34C759" },
+              { label: "AI Enriched", value: alerts.filter(a => a.ai_summary).length, color: "#8B80F0" },
             ].map((s, i) => (
               <div key={i} style={{ flex: 1, padding: "8px 14px", background: "#0F0F18", borderRadius: i === 0 ? "8px 0 0 8px" : i === 5 ? "0 8px 8px 0" : 0 }}>
                 <div style={{ fontSize: 9, color: "#555", textTransform: "uppercase", letterSpacing: 1.5 }}>{s.label}</div>
@@ -629,10 +666,16 @@ function App() {
               <option value="low">🟢 Low</option>
             </select>
             <select value={sentimentFilter} onChange={e => setSentimentFilter(e.target.value)} style={{ background: "#14141F", border: "1px solid #2A2A35", borderRadius: 6, padding: "5px 8px", color: "#AAA", fontSize: 11, fontFamily: "inherit", outline: "none" }}>
-              <option value="all">All Sentiment</option>
+              <option value="all">All Tone</option>
               <option value="positive">📈 Positive</option>
               <option value="neutral">➡️ Neutral</option>
               <option value="negative">📉 Negative</option>
+            </select>
+            <select value={impactFilter} onChange={e => setImpactFilter(e.target.value)} style={{ background: "#14141F", border: "1px solid #2A2A35", borderRadius: 6, padding: "5px 8px", color: "#AAA", fontSize: 11, fontFamily: "inherit", outline: "none" }}>
+              <option value="all">All Impact</option>
+              <option value="bullish">📈 Bullish</option>
+              <option value="neutral">➡️ Neutral</option>
+              <option value="bearish">📉 Bearish</option>
             </select>
             <button className="btn" onClick={() => { fetch(API_BASE + "/api/alerts", { method: "DELETE" }).catch(() => {}); setAlerts([]); }} style={{ marginLeft: "auto", background: "transparent", color: "#555", padding: "5px 10px", fontSize: 11, border: "none" }}>Clear All</button>
           </div>
@@ -729,20 +772,58 @@ function App() {
                       </div>
                     )}
 
-                    <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
-                      <span style={{ fontSize: 10, padding: "2px 8px", borderRadius: 3, color: sentColor, background: sentColor + "15", border: "1px solid " + sentColor + "33", fontWeight: 600 }}>{sent.toUpperCase()} {scoreStr}</span>
-                      {a.ai_sentiment && a.word_sentiment && a.ai_sentiment !== a.word_sentiment && (
-                        <span style={{ fontSize: 8, padding: "1px 6px", borderRadius: 3, background: "#FF950015", color: "#FF9500", border: "1px solid #FF950033" }}>⚡ AI: {a.ai_sentiment} / Words: {a.word_sentiment}</span>
+                    <div style={{ display: "flex", gap: 5, alignItems: "center", flexWrap: "wrap" }}>
+                      {/* Market impact — primary badge */}
+                      {(() => {
+                        const impact = a.market_impact || "neutral";
+                        const impactColors = { bullish: "#34C759", bearish: "#FF3B30", neutral: "#8E8E93" };
+                        const impactColor = impactColors[impact] || "#8E8E93";
+                        return <span style={{ fontSize: 10, padding: "2px 8px", borderRadius: 3, color: impactColor, background: impactColor + "15", border: "1px solid " + impactColor + "33", fontWeight: 600 }}>{impact === "bullish" ? "📈 BULLISH" : impact === "bearish" ? "📉 BEARISH" : "➡️ NEUTRAL"}</span>;
+                      })()}
+
+                      {/* Article tone — secondary */}
+                      <span style={{ fontSize: 9, padding: "1px 6px", borderRadius: 3, color: sentColor, background: sentColor + "10", border: "1px solid " + sentColor + "22" }}>tone: {sent}</span>
+
+                      {/* Mixed signals flag */}
+                      {a.mixed_signals && <span style={{ fontSize: 8, padding: "1px 5px", borderRadius: 3, background: "#FF950015", color: "#FF9500", border: "1px solid #FF950022" }}>⚡ mixed</span>}
+
+                      {/* Ensemble method */}
+                      {a.classification_method && a.classification_method !== "lexicon_only" && (
+                        <span style={{ fontSize: 8, color: "#555" }}>{a.classification_method}</span>
                       )}
-                      {a.confidence != null && <span style={{ fontSize: 9, color: "#555" }}>{Math.round(a.confidence * 100)}% conf</span>}
-                      {a.positive_signals && a.positive_signals.length > 0 && <span style={{ fontSize: 9, color: "#34C759" }}>+{a.positive_signals.join(", +")}</span>}
-                      {a.negative_signals && a.negative_signals.length > 0 && <span style={{ fontSize: 9, color: "#FF3B30" }}>−{a.negative_signals.join(", −")}</span>}
+
+                      {/* AI vs word disagreement */}
+                      {a.ai_sentiment && a.word_sentiment && a.ai_sentiment !== a.word_sentiment && a.word_sentiment !== "neutral" && (
+                        <span style={{ fontSize: 8, padding: "1px 5px", borderRadius: 3, background: "#FF950010", color: "#FF9500" }}>⚡ AI:{a.ai_sentiment}/Words:{a.word_sentiment}</span>
+                      )}
+
+                      {/* Confidence */}
+                      {a.confidence != null && <span style={{ fontSize: 9, color: "#555" }}>{Math.round(a.confidence * 100)}%</span>}
+
+                      {/* Event type / scope / horizon chips */}
+                      {a.event_type && a.event_type !== "other" && <span style={{ fontSize: 8, color: "#444", background: "#14141F", padding: "1px 5px", borderRadius: 2 }}>{a.event_type}</span>}
+                      {a.scope && a.scope !== "broad_market" && <span style={{ fontSize: 8, color: "#444", background: "#14141F", padding: "1px 5px", borderRadius: 2 }}>{a.scope}</span>}
+                      {a.time_horizon && a.time_horizon !== "unclear" && <span style={{ fontSize: 8, color: "#444", background: "#14141F", padding: "1px 5px", borderRadius: 2 }}>{a.time_horizon}</span>}
+
+                      {/* Signal words */}
+                      {a.positive_signals && a.positive_signals.length > 0 && <span style={{ fontSize: 8, color: "#34C759" }}>+{a.positive_signals.slice(0,4).join(", +")}</span>}
+                      {a.negative_signals && a.negative_signals.length > 0 && <span style={{ fontSize: 8, color: "#FF3B30" }}>−{a.negative_signals.slice(0,4).join(", −")}</span>}
+
                       <span style={{ fontSize: 10, background: "#1A1A25", padding: "2px 8px", borderRadius: 3, color: src.color, border: "1px solid " + src.color + "33" }}>{a.source_name || src.name}</span>
                       <span style={{ fontSize: 10, background: "#5448C820", padding: "2px 8px", borderRadius: 3, color: "#8B80F0", border: "1px solid #5448C833" }}>{a.keyword}</span>
                       {a.url && <a href={a.url} target="_blank" rel="noopener noreferrer" className="src-link">↗ View Source</a>}
+
+                      {/* Correction buttons */}
+                      {!a.user_corrected && (
+                        <span style={{ display: "inline-flex", gap: 2, marginLeft: 4 }}>
+                          <button className="btn" onClick={e => { e.stopPropagation(); correctSentiment(a.url, "positive"); }} title="Mark as positive" style={{ fontSize: 10, padding: "1px 4px", background: "none", color: "#34C759", opacity: 0.5 }}>👍</button>
+                          <button className="btn" onClick={e => { e.stopPropagation(); correctSentiment(a.url, "neutral"); }} title="Mark as neutral" style={{ fontSize: 10, padding: "1px 4px", background: "none", color: "#8E8E93", opacity: 0.5 }}>➡️</button>
+                          <button className="btn" onClick={e => { e.stopPropagation(); correctSentiment(a.url, "negative"); }} title="Mark as negative" style={{ fontSize: 10, padding: "1px 4px", background: "none", color: "#FF3B30", opacity: 0.5 }}>👎</button>
+                        </span>
+                      )}
+                      {a.user_corrected && <span style={{ fontSize: 8, color: "#34C759" }}>✓ corrected</span>}
                       <span style={{ fontSize: 10, color: "#444", marginLeft: "auto" }}>{timeAgo(a.timestamp)}</span>
                       {a.published_at ? <span style={{ fontSize: 9, color: "#555" }}>📅 {a.published_at}</span> : <span style={{ fontSize: 9, color: "#333" }}>⏱ no pub date</span>}
-                      <span style={{ fontSize: 9, color: "#333" }}>{new Date(a.timestamp).toLocaleTimeString()}</span>
                     </div>
                   </div>
                 </div>
@@ -880,6 +961,133 @@ function App() {
               ))}
               {marketNews.length === 0 && <div style={{ color: "#333", fontSize: 11, padding: 20, textAlign: "center" }}>Loading market news...</div>}
             </div>
+          </div>
+          )}
+
+          {/* ═══ ACCURACY / ANALYTICS DASHBOARD ═══ */}
+          {mainView === "analytics" && (
+          <div style={{ flex: 1, overflowY: "auto", padding: 20 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+              <div style={{ fontSize: 10, fontWeight: 600, color: "#666", letterSpacing: 2, textTransform: "uppercase" }}>Classification Accuracy Dashboard</div>
+              <div style={{ display: "flex", gap: 8 }}>
+                <button className="btn" onClick={() => { fetch(API_BASE + "/api/data/accuracy").then(r => r.json()).then(d => { setAccuracyData(d); showToast("✓ Dashboard refreshed"); }).catch(() => {}); }} style={{ background: "#14141F", color: "#AAA", padding: "6px 12px", borderRadius: 6, fontSize: 11 }}>⟳ Refresh</button>
+                <button className="btn" onClick={applyRecalibration} style={{ background: "#5448C8", color: "#fff", padding: "6px 12px", borderRadius: 6, fontSize: 11 }}>🔧 Auto-Recalibrate Weights</button>
+              </div>
+            </div>
+
+            {!accuracyData && <div style={{ color: "#555", padding: 40, textAlign: "center" }}>Loading accuracy data... Make some sentiment corrections first to see results.</div>}
+
+            {accuracyData && (<>
+              {/* Global stats */}
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 10, marginBottom: 24 }}>
+                {[
+                  { label: "AI vs Words Disagreements", value: accuracyData.disagreement_outcomes?.total_disagreements_corrected || 0, color: "#FF9500" },
+                  { label: "AI Was Right", value: accuracyData.disagreement_outcomes?.ai_was_right || 0, color: "#34C759" },
+                  { label: "Words Were Right", value: accuracyData.disagreement_outcomes?.words_were_right || 0, color: "#5448C8" },
+                  { label: "Total Corrections", value: accuracyData.correction_stats_global?.sample_size || 0, color: "#8E8E93" },
+                ].map((s, i) => (
+                  <div key={i} style={{ background: "#0F0F18", borderRadius: 8, padding: 14, border: "1px solid #1A1A25" }}>
+                    <div style={{ fontSize: 9, color: "#555", textTransform: "uppercase", letterSpacing: 1 }}>{s.label}</div>
+                    <div style={{ fontSize: 24, fontWeight: 700, color: s.color, fontFamily: "'Space Grotesk',sans-serif" }}>{s.value}</div>
+                  </div>
+                ))}
+              </div>
+
+              {/* Confidence Calibration */}
+              {accuracyData.confidence_calibration && accuracyData.confidence_calibration.length > 0 && (
+                <div style={{ marginBottom: 24 }}>
+                  <div style={{ fontSize: 10, fontWeight: 600, color: "#666", letterSpacing: 2, marginBottom: 10, textTransform: "uppercase" }}>Confidence Calibration</div>
+                  <div style={{ fontSize: 9, color: "#555", marginBottom: 8 }}>When the system says X% confidence, is it actually correct X% of the time?</div>
+                  <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(140px, 1fr))", gap: 8 }}>
+                    {accuracyData.confidence_calibration.map((b, i) => (
+                      <div key={i} style={{ background: "#0F0F18", borderRadius: 6, padding: 10, border: "1px solid #1A1A25" }}>
+                        <div style={{ fontSize: 10, fontWeight: 600, color: "#E8E8ED", marginBottom: 4 }}>{b.range}</div>
+                        <div style={{ fontSize: 9, color: "#555" }}>Articles: {b.total_articles}</div>
+                        <div style={{ fontSize: 9, color: "#555" }}>Corrections: {b.corrections}</div>
+                        <div style={{ fontSize: 11, color: b.overconfident ? "#FF3B30" : "#34C759", fontWeight: 600 }}>
+                          Actual: {(b.actual_accuracy * 100).toFixed(0)}%
+                        </div>
+                        {b.overconfident && <div style={{ fontSize: 8, color: "#FF9500" }}>⚠ overconfident</div>}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Signal Word Misfires */}
+              {accuracyData.signal_word_misfires && (
+                <div style={{ marginBottom: 24 }}>
+                  <div style={{ fontSize: 10, fontWeight: 600, color: "#666", letterSpacing: 2, marginBottom: 10, textTransform: "uppercase" }}>Signal Word Misfires ({accuracyData.signal_word_misfires.total_corrections_analyzed} corrections analyzed)</div>
+                  {accuracyData.signal_word_misfires.adjustments.length > 0 ? (
+                    <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                      {accuracyData.signal_word_misfires.adjustments.map((adj, i) => (
+                        <div key={i} style={{ background: "#0F0F18", borderRadius: 6, padding: 10, border: "1px solid #1A1A25", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                          <div>
+                            <span style={{ fontSize: 11, color: adj.current_type === "positive" ? "#34C759" : "#FF3B30", fontWeight: 600 }}>"{adj.word}"</span>
+                            <span style={{ fontSize: 9, color: "#555", marginLeft: 8 }}>misfired {adj.misfire_count}x as {adj.current_type}</span>
+                          </div>
+                          <span style={{ fontSize: 9, color: "#FF9500" }}>⚠ recommend weight reduction</span>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <div style={{ fontSize: 11, color: "#555", padding: 10 }}>No misfiring words detected yet. Keep correcting alerts to build data.</div>
+                  )}
+                </div>
+              )}
+
+              {/* Source Accuracy */}
+              {accuracyData.source_accuracy && Object.keys(accuracyData.source_accuracy).length > 0 && (
+                <div style={{ marginBottom: 24 }}>
+                  <div style={{ fontSize: 10, fontWeight: 600, color: "#666", letterSpacing: 2, marginBottom: 10, textTransform: "uppercase" }}>Source Error Rates</div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                    {Object.entries(accuracyData.source_accuracy).map(([id, s]) => (
+                      <div key={id} style={{ background: "#0F0F18", borderRadius: 6, padding: 10, border: "1px solid #1A1A25", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                        <div>
+                          <span style={{ fontSize: 11, color: "#E8E8ED", fontWeight: 500 }}>{s.name}</span>
+                          <span style={{ fontSize: 9, color: "#555", marginLeft: 8 }}>{s.total_articles} articles</span>
+                        </div>
+                        <div style={{ textAlign: "right" }}>
+                          <span style={{ fontSize: 11, color: s.error_rate > 0.2 ? "#FF3B30" : s.error_rate > 0.1 ? "#FF9500" : "#34C759", fontWeight: 600 }}>
+                            {(s.accuracy * 100).toFixed(0)}% accurate
+                          </span>
+                          <span style={{ fontSize: 9, color: "#555", marginLeft: 6 }}>{s.corrections} corrections</span>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Disagreement Examples */}
+              {accuracyData.disagreement_outcomes?.examples && accuracyData.disagreement_outcomes.examples.length > 0 && (
+                <div style={{ marginBottom: 24 }}>
+                  <div style={{ fontSize: 10, fontWeight: 600, color: "#666", letterSpacing: 2, marginBottom: 10, textTransform: "uppercase" }}>Recent Disagreement Examples</div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                    {accuracyData.disagreement_outcomes.examples.map((ex, i) => (
+                      <div key={i} style={{ background: "#0F0F18", borderRadius: 6, padding: 10, border: "1px solid #1A1A25", fontSize: 10 }}>
+                        <span style={{ color: "#555" }}>AI said </span>
+                        <span style={{ color: ex.correct_was === ex.ai_said ? "#34C759" : "#FF3B30", fontWeight: 600 }}>{ex.ai_said}</span>
+                        <span style={{ color: "#555" }}> · Words said </span>
+                        <span style={{ color: ex.correct_was === ex.words_said ? "#34C759" : "#FF3B30", fontWeight: 600 }}>{ex.words_said}</span>
+                        <span style={{ color: "#555" }}> · Correct was </span>
+                        <span style={{ color: "#E8E8ED", fontWeight: 600 }}>{ex.correct_was}</span>
+                        <span style={{ color: "#444", marginLeft: 8 }}>({ex.source} / {ex.keyword})</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Instructions */}
+              <div style={{ background: "#0F0F18", borderRadius: 8, padding: 16, border: "1px solid #1A1A25", fontSize: 11, color: "#555", lineHeight: 1.6 }}>
+                <div style={{ fontSize: 10, fontWeight: 600, color: "#666", letterSpacing: 1, marginBottom: 8, textTransform: "uppercase" }}>How to improve accuracy</div>
+                1. Use the 👍 ➡️ 👎 buttons on alerts to correct wrong classifications<br/>
+                2. After 10+ corrections, this dashboard starts showing patterns<br/>
+                3. Click "Auto-Recalibrate Weights" to reduce weights on misfiring signal words<br/>
+                4. Over time, the ensemble learns which method (AI vs words) is more reliable for each source and keyword
+              </div>
+            </>)}
           </div>
           )}
 

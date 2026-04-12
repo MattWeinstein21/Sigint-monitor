@@ -215,6 +215,80 @@ def extract_entities(text):
     return list(found)
 
 
+# ─── Ticker Linking ──────────────────────────────────────────────────────────
+
+TICKER_EVENT_MAP = {
+    "tariff": ["SPY", "QQQ", "DIA", "AAPL", "TSLA", "AMZN"],
+    "trade war": ["SPY", "QQQ", "DIA", "AAPL", "TSLA", "AMZN"],
+    "sanctions": ["SPY", "XOM", "CVX", "GLD"],
+    "fed": ["SPY", "TLT", "GLD", "DIA"], "federal reserve": ["SPY", "TLT", "GLD"],
+    "interest rate": ["SPY", "TLT", "GLD", "XLF"], "rate hike": ["SPY", "TLT", "XLF"],
+    "inflation": ["SPY", "TLT", "GLD", "TIP"], "cpi": ["SPY", "TLT", "GLD"],
+    "oil": ["XOM", "CVX", "USO", "XLE"], "opec": ["XOM", "CVX", "USO", "XLE"],
+    "natural gas": ["XLE", "LNG"], "energy": ["XLE", "XOM", "CVX"],
+    "semiconductor": ["NVDA", "AMD", "SMH", "INTC", "TSM"], "chips": ["NVDA", "AMD", "SMH"],
+    "bitcoin": ["BTC", "COIN", "MARA", "MSTR"], "ethereum": ["ETH", "COIN"],
+    "crypto": ["BTC", "ETH", "COIN", "MARA"], "stablecoin": ["BTC", "COIN"],
+    "fda": ["XLV", "XBI"], "pharma": ["XLV", "XBI"], "biotech": ["XBI"],
+    "bank": ["XLF", "JPM", "GS", "BAC"], "housing": ["XHB", "ITB"],
+    "treasury": ["TLT", "SHY", "IEF"], "debt ceiling": ["SPY", "TLT"],
+    "executive order": ["SPY", "QQQ"], "regulation": ["SPY", "QQQ"],
+    "ipo": ["SPY"], "earnings": ["SPY", "QQQ"],
+    "apple": ["AAPL"], "nvidia": ["NVDA"], "tesla": ["TSLA"], "google": ["GOOGL"],
+    "microsoft": ["MSFT"], "amazon": ["AMZN"], "meta": ["META"],
+    "jpmorgan": ["JPM"], "goldman": ["GS"], "boeing": ["BA"],
+}
+
+# Common entity-to-ticker mapping
+ENTITY_TICKER_MAP = {
+    "Apple": "AAPL", "Google": "GOOGL", "Microsoft": "MSFT", "Nvidia": "NVDA",
+    "Meta": "META", "Amazon": "AMZN", "Tesla": "TSLA", "JPMorgan": "JPM",
+    "Goldman Sachs": "GS", "Donald Trump": None, "Joe Biden": None,
+    "Jerome Powell": None, "Elon Musk": "TSLA", "Jeff Bezos": "AMZN",
+    "China": None, "Russia": None, "Iran": None, "EU": None,
+}
+
+
+def link_tickers_to_alert(title, text, keyword, entities):
+    """Link an alert to potentially affected tickers. Deterministic mapping."""
+    affected = set()
+    combined_text = f"{title} {text}".lower()
+
+    # Keyword-based mapping
+    for kw, tickers in TICKER_EVENT_MAP.items():
+        if kw in keyword.lower() or kw in combined_text[:500]:
+            for t in tickers:
+                affected.add(t)
+
+    # Entity-based mapping
+    for entity in entities:
+        ticker = ENTITY_TICKER_MAP.get(entity)
+        if ticker:
+            affected.add(ticker)
+
+    # Filter to watchlist if it exists
+    try:
+        wl_path = Path("watchlist.json")
+        if wl_path.exists():
+            wl = json.loads(wl_path.read_text())
+            wl_symbols = set()
+            for item in wl:
+                if isinstance(item, dict):
+                    wl_symbols.add(item.get("symbol", "").upper())
+                elif isinstance(item, str):
+                    wl_symbols.add(item.upper())
+            if wl_symbols:
+                # Return intersection with watchlist, plus always include broad indices
+                broad = {"SPY", "QQQ", "DIA", "BTC", "ETH"}
+                watchlist_matches = affected & wl_symbols
+                broad_matches = affected & broad
+                return list(watchlist_matches | broad_matches)[:8]
+    except Exception:
+        pass
+
+    return list(affected)[:8]
+
+
 # ─── Data Logging Functions ───────────────────────────────────────────────────
 
 def log_article(alert_data, article_text=""):
@@ -630,6 +704,9 @@ DEFAULT_CONFIG = {
     "ollama_model": "llama3",
     "newsapi_key": "",
     "twitter_bearer_token": "",
+    "fred_api_key": "",
+    "alpha_vantage_key": "",
+    "etherscan_key": "",
     "truthsocial_enabled": True,
     "rss_enabled": True,
     "whitehouse_enabled": True,
@@ -864,6 +941,22 @@ class AlertStore:
         dedupe_basis = url.strip() if url else f"{source_id}:{title.strip().lower()}"
         return hashlib.md5(dedupe_basis.encode()).hexdigest()
 
+    def _is_semantic_duplicate(self, title):
+        """Check if a title is too similar to a recent alert (Jaccard similarity)."""
+        title_words = set(re.sub(r'[^\w\s]', '', title.lower()).split())
+        if len(title_words) < 3:
+            return False, None
+        for alert in self.alerts[:60]:
+            existing_words = set(re.sub(r'[^\w\s]', '', alert["title"].lower()).split())
+            if len(existing_words) < 3:
+                continue
+            intersection = title_words & existing_words
+            union = title_words | existing_words
+            similarity = len(intersection) / len(union)
+            if similarity > 0.65:
+                return True, alert["id"]
+        return False, None
+
     def _ai_worker(self):
         """Background worker that processes AI enrichment jobs."""
         while True:
@@ -969,6 +1062,11 @@ class AlertStore:
                     alert["time_horizon"] = llm_result.get("time_horizon", "unclear")
                     alert["mixed_signals"] = llm_result.get("mixed_signals", False) or alert.get("mixed_signals", False)
 
+                    # Store event extraction if provided
+                    event = llm_result.get("event")
+                    if event and isinstance(event, dict):
+                        alert["event"] = event
+
                     # Severity from confidence + impact
                     if llm_impact in ("bullish", "bearish") and final_conf > 0.6:
                         alert["severity"] = "high"
@@ -995,6 +1093,20 @@ class AlertStore:
                 return False
             self.seen_hashes.add(h)
 
+            # Semantic duplicate check — merge if similar title exists
+            is_dup, dup_id = self._is_semantic_duplicate(title)
+            if is_dup and dup_id:
+                for a in self.alerts:
+                    if a["id"] == dup_id:
+                        also = a.get("also_reported_by", [])
+                        if source_name not in also and source_name != a.get("source_name"):
+                            also.append(source_name)
+                            a["also_reported_by"] = also
+                            a["report_count"] = a.get("report_count", 1) + 1
+                        break
+                log.debug(f"Semantic dup merged: '{title[:50]}' → existing alert {dup_id}")
+                return False
+
         # Fetch article text
         article_text, fetched = fetch_article_text(url)
         analysis_text = article_text if fetched else f"{title}. {snippet}"
@@ -1020,6 +1132,10 @@ class AlertStore:
             except Exception:
                 pub_str = str(published_at)
 
+        # Ticker linking — deterministic mapping to user's watchlist
+        affected_tickers = link_tickers_to_alert(title, analysis_text, keyword,
+                                                  extract_entities(analysis_text))
+
         with self.lock:
             alert_id = int(time.time() * 1000)
             alert = {
@@ -1030,7 +1146,7 @@ class AlertStore:
                 "url": url.strip(),
                 "snippet": (snippet or "").strip(),
                 "keyword": keyword.strip().lower(),
-                # New multi-dimensional classification
+                # Multi-dimensional classification
                 "article_tone": word_result["article_tone"],
                 "market_impact": word_result["market_impact"],
                 "sentiment": word_result["article_tone"],  # backward compat
@@ -1042,6 +1158,13 @@ class AlertStore:
                 "scope": "broad_market",
                 "time_horizon": "unclear",
                 "classification_method": "lexicon_only",
+                # Event extraction (populated by AI)
+                "event": None,
+                # Ticker linking
+                "affected_tickers": affected_tickers,
+                # Duplicate tracking
+                "report_count": 1,
+                "also_reported_by": [],
                 # AI fields — populated async
                 "summary": fallback_summary,
                 "ai_summary": False,
@@ -1061,9 +1184,10 @@ class AlertStore:
 
             log_article(alert, article_text)
 
+            tickers_str = f" [{','.join(affected_tickers)}]" if affected_tickers else ""
             emoji_map = {"positive": "📈", "negative": "📉", "neutral": "➡️"}
             emoji = emoji_map.get(word_result["article_tone"], "➡️")
-            log.info(f"{emoji} [{source_id}] tone={word_result['article_tone']} conf={word_result['confidence']} keyword='{keyword}' → {title[:65]} [AI queued]")
+            log.info(f"{emoji} [{source_id}] tone={word_result['article_tone']} conf={word_result['confidence']}{tickers_str} keyword='{keyword}' → {title[:60]} [AI queued]")
 
         # Queue AI enrichment
         if self.ollama_url:
@@ -1395,27 +1519,47 @@ def get_active_signals():
 
 # ─── Ollama Integration (Redesigned) ──────────────────────────────────────────
 
-OLLAMA_PROMPT = """You are a financial news classifier. Analyze the article below and return ONLY a JSON object. No extra text before or after the JSON.
+OLLAMA_PROMPT = """You are a financial news classifier for a trading alert system.
+
+TASK: Analyze the article and return a JSON classification. Think step by step:
+1. What happened? (the event)
+2. Who is affected? (entities, sectors)
+3. How does the article frame it? (tone)
+4. What does this mean for markets? (impact)
+5. How certain is this? (confidence)
 
 DEFINITIONS:
-- article_tone: The writing's emotional direction. "positive" = optimistic/celebratory. "negative" = alarming/critical. "neutral" = factual/balanced. If unsure, use "neutral".
-- market_impact: Likely effect on financial markets. "bullish" = prices likely rise. "bearish" = prices likely fall. "neutral" = no clear effect. If unsure, use "neutral".
+- article_tone: "positive" = optimistic/celebratory writing. "negative" = alarming/critical. "neutral" = factual reporting. Default to neutral.
+- market_impact: "bullish" = likely prices rise. "bearish" = likely prices fall. "neutral" = unclear or no effect. Default to neutral.
+- confidence: 0.0-1.0. Use 0.3-0.5 for ambiguous. Use 0.7+ only when the event is clear and confirmed.
 - event_type: One of: policy, legal, macro, earnings, geopolitics, crypto, social_post, rumor, other
 - scope: "single_company" if one company, "sector" if an industry, "broad_market" if economy-wide
 - time_horizon: "immediate" = this week, "short_term" = weeks, "long_term" = months+, "unclear"
 
 RULES:
-1. Base classification ONLY on the article text. Do not infer from source reputation.
-2. Article tone and market impact CAN differ. Neutral reporting about rate hikes = neutral tone, bearish impact.
-3. If mixed positive and negative elements, set mixed_signals true. Choose dominant direction or neutral if balanced.
-4. Prefer "neutral" when evidence is ambiguous.
-5. Summary: 2-3 sentences on what happened and why it matters for markets.
+1. Tone and impact CAN differ. Neutral reporting of bad news = neutral tone, bearish impact.
+2. Do NOT hallucinate tickers, numbers, or dates not in the article.
+3. Do NOT copy the headline verbatim as the summary. Synthesize.
+4. If speculative language ("may/could/reportedly"), lower confidence by 0.2.
+5. If both positive and negative elements, set mixed_signals: true.
+6. Prefer neutral over guessing.
 
-Respond with ONLY this JSON:
-{{"article_tone":"positive|neutral|negative","market_impact":"bullish|neutral|bearish","confidence":0.0,"event_type":"string","scope":"string","time_horizon":"string","mixed_signals":false,"summary":"string"}}
+EXAMPLES:
+
+Article: "The Federal Reserve held interest rates steady at 5.25-5.50% on Wednesday, as expected by markets."
+Output: {{"article_tone":"neutral","market_impact":"neutral","confidence":0.85,"event_type":"macro","scope":"broad_market","time_horizon":"immediate","mixed_signals":false,"summary":"The Fed held rates steady as expected. No surprise for markets — already priced in.","event":{{"action":"rate_hold","actor":"Federal Reserve","target":"US economy","magnitude":"rates unchanged at 5.25-5.50%","is_confirmed":true}}}}
+
+Article: "Markets rallied sharply after Trump posted on Truth Social that he would pause tariffs on China for 90 days, sending the S&P 500 up 3.2%."
+Output: {{"article_tone":"positive","market_impact":"bullish","confidence":0.82,"event_type":"policy","scope":"broad_market","time_horizon":"short_term","mixed_signals":false,"summary":"Trump announced a 90-day pause on China tariffs, triggering a broad rally with S&P 500 up 3.2%. Impact may be short-term given the limited pause duration.","event":{{"action":"tariff_pause","actor":"Donald Trump","target":"China","magnitude":"90-day pause","is_confirmed":true}}}}
+
+Article: "Oil prices edged higher despite OPEC announcing increased production quotas, as traders weighed ongoing tensions in the Strait of Hormuz."
+Output: {{"article_tone":"neutral","market_impact":"bullish","confidence":0.55,"event_type":"geopolitics","scope":"sector","time_horizon":"short_term","mixed_signals":true,"summary":"Oil rose despite OPEC increasing output, as geopolitical risk in the Strait of Hormuz outweighed supply concerns. Conflicting forces suggest continued volatility.","event":{{"action":"production_increase","actor":"OPEC","target":"oil markets","magnitude":"increased quotas","is_confirmed":true}}}}
 
 {trend_context}ARTICLE:
-{article_text}"""
+{article_text}
+
+Respond with ONLY valid JSON (no other text):
+{{"article_tone":"string","market_impact":"string","confidence":0.0,"event_type":"string","scope":"string","time_horizon":"string","mixed_signals":false,"summary":"string","event":{{"action":"string","actor":"string","target":"string","magnitude":"string","is_confirmed":true}}}}"""
 
 
 def parse_llm_response(raw_response):
@@ -1427,15 +1571,24 @@ def parse_llm_response(raw_response):
         text = re.sub(r"^```(?:json)?\s*", "", text)
         text = re.sub(r"\s*```$", "", text)
 
-    # Find JSON object
-    json_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', text, re.DOTALL)
-    if not json_match:
+    # Find JSON object — handle nested braces for event object
+    # Greedy match from first { to last }
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
         return None, "no_json_found"
 
+    json_str = text[start:end+1]
+
     try:
-        parsed = json.loads(json_match.group())
+        parsed = json.loads(json_str)
     except json.JSONDecodeError:
-        return None, "json_parse_error"
+        # Try to fix common issues
+        json_str = json_str.replace("'", '"').replace("True", "true").replace("False", "false")
+        try:
+            parsed = json.loads(json_str)
+        except json.JSONDecodeError:
+            return None, "json_parse_error"
 
     # Validate required fields
     required = {"article_tone", "market_impact", "confidence", "summary"}
@@ -1463,13 +1616,37 @@ def parse_llm_response(raw_response):
     parsed.setdefault("time_horizon", "unclear")
     parsed.setdefault("mixed_signals", False)
 
+    # Validate event object if present
+    event = parsed.get("event")
+    if event and isinstance(event, dict):
+        event.setdefault("action", "")
+        event.setdefault("actor", "")
+        event.setdefault("target", "")
+        event.setdefault("magnitude", "")
+        event.setdefault("is_confirmed", False)
+    else:
+        parsed["event"] = None
+
     return parsed, "ok"
+
+
+def get_macro_context():
+    """Build macro context string from Fear & Greed and cached FRED data for AI prompts."""
+    parts = []
+    try:
+        fg_resp = requests.get("https://api.alternative.me/fng/?limit=1", timeout=5)
+        if fg_resp.status_code == 200:
+            fg = fg_resp.json().get("data", [{}])[0]
+            parts.append(f"Market Sentiment: Fear & Greed Index = {fg.get('value', '?')} ({fg.get('value_classification', '?')})")
+    except Exception:
+        pass
+    return " | ".join(parts) if parts else ""
 
 
 def ollama_analyze(text, ollama_url, model="llama3", keyword=""):
     """
     Call Ollama with JSON-schema prompt. Returns (parsed_dict, raw_response, success).
-    Includes retry on parse failure.
+    Includes retry on parse failure and macro context injection.
     """
     if not ollama_url:
         return None, "", False
@@ -1479,6 +1656,11 @@ def ollama_analyze(text, ollama_url, model="llama3", keyword=""):
         ctx = build_trend_context(keyword=keyword, limit=5)
         if ctx:
             trend_ctx = f"RECENT CONTEXT:\n{ctx}\n\n"
+
+    # Add macro sentiment context
+    macro = get_macro_context()
+    if macro:
+        trend_ctx += f"MACRO CONTEXT: {macro}\n\n"
 
     for attempt in range(3):
         try:
@@ -3024,12 +3206,12 @@ def data_sectors():
 
 @app.route("/api/data/correct", methods=["POST"])
 def correct_sentiment():
-    """User corrects a sentiment call. Logged for future AI training."""
+    """User corrects a sentiment call or marks as duplicate. Logged for future AI training."""
     data = request.get_json(silent=True) or {}
     url = data.get("url", "")
     corrected = data.get("corrected_sentiment", "")
-    if not url or corrected not in ("positive", "negative", "neutral"):
-        return jsonify({"error": "Provide url and corrected_sentiment (positive/negative/neutral)"}), 400
+    if not url or corrected not in ("positive", "negative", "neutral", "duplicate"):
+        return jsonify({"error": "Provide url and corrected_sentiment (positive/negative/neutral/duplicate)"}), 400
 
     # Find the alert to get context
     title = ""
@@ -3043,9 +3225,13 @@ def correct_sentiment():
                 original = a.get("sentiment", "")
                 source_id = a.get("source", "")
                 keyword = a.get("keyword", "")
-                # Update the live alert
-                a["sentiment"] = corrected
-                a["user_corrected"] = True
+                if corrected == "duplicate":
+                    a["user_corrected"] = True
+                    a["is_duplicate"] = True
+                else:
+                    a["sentiment"] = corrected
+                    a["article_tone"] = corrected
+                    a["user_corrected"] = True
                 break
 
     log_sentiment_correction(url, title, original, corrected, source_id, keyword)
@@ -3148,6 +3334,250 @@ def apply_recalibration():
                          json.dumps(applied))
 
     return jsonify({"status": "applied", "adjustments": applied, "sets": sets})
+
+
+# ─── External Data APIs ───────────────────────────────────────────────────────
+# Integrations that improve context for AI analysis and user experience.
+
+# FRED (Federal Reserve Economic Data) — 800K+ economic time series
+# Free key from https://fred.stlouisfed.org/docs/api/api_key.html
+FRED_BASE = "https://api.stlouisfed.org/fred"
+
+@app.route("/api/economy/fred/<series_id>")
+def fred_series(series_id):
+    """Fetch FRED economic data. Useful series: GDP, UNRATE, CPIAUCSL, DFF, T10Y2Y, FEDFUNDS"""
+    config = load_config()
+    api_key = config.get("fred_api_key", "")
+    if not api_key:
+        return jsonify({"error": "Add fred_api_key to config.json. Get one free at fred.stlouisfed.org"}), 400
+    try:
+        params = {
+            "series_id": series_id.upper(),
+            "api_key": api_key,
+            "file_type": "json",
+            "sort_order": "desc",
+            "limit": request.args.get("limit", 30, type=int),
+        }
+        resp = requests.get(f"{FRED_BASE}/series/observations", params=params, timeout=10)
+        if resp.status_code != 200:
+            return jsonify({"error": f"FRED returned {resp.status_code}"}), 500
+        data = resp.json()
+        observations = [{"date": o["date"], "value": float(o["value"]) if o["value"] != "." else None}
+                        for o in data.get("observations", []) if o.get("value")]
+        # Also get series info
+        info_resp = requests.get(f"{FRED_BASE}/series", params={
+            "series_id": series_id.upper(), "api_key": api_key, "file_type": "json"
+        }, timeout=10)
+        info = {}
+        if info_resp.status_code == 200:
+            serieses = info_resp.json().get("seriess", [])
+            if serieses:
+                info = {"title": serieses[0].get("title", ""), "units": serieses[0].get("units", ""),
+                        "frequency": serieses[0].get("frequency", "")}
+        return jsonify({"series_id": series_id.upper(), "info": info, "observations": observations})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/economy/fred-dashboard")
+def fred_dashboard():
+    """Get key economic indicators in one call."""
+    config = load_config()
+    api_key = config.get("fred_api_key", "")
+    if not api_key:
+        return jsonify({"error": "Add fred_api_key to config.json"}), 400
+    indicators = {
+        "FEDFUNDS": "Fed Funds Rate",
+        "DFF": "Effective Fed Funds Rate",
+        "T10Y2Y": "10Y-2Y Yield Spread",
+        "CPIAUCSL": "CPI (Inflation)",
+        "UNRATE": "Unemployment Rate",
+        "GDP": "GDP",
+        "VIXCLS": "VIX (Volatility)",
+    }
+    results = {}
+    for sid, label in indicators.items():
+        try:
+            resp = requests.get(f"{FRED_BASE}/series/observations", params={
+                "series_id": sid, "api_key": api_key, "file_type": "json",
+                "sort_order": "desc", "limit": 2
+            }, timeout=8)
+            if resp.status_code == 200:
+                obs = resp.json().get("observations", [])
+                if obs:
+                    current = obs[0]
+                    prev = obs[1] if len(obs) > 1 else obs[0]
+                    try:
+                        val = float(current["value"])
+                        prev_val = float(prev["value"])
+                        change = val - prev_val
+                    except (ValueError, KeyError):
+                        val, prev_val, change = None, None, None
+                    results[sid] = {"label": label, "value": val, "prev": prev_val,
+                                    "change": round(change, 3) if change is not None else None,
+                                    "date": current["date"]}
+        except Exception:
+            pass
+    return jsonify({"indicators": results})
+
+
+# Alpha Vantage — stock data with free key (25 req/day)
+# Free key from https://www.alphavantage.co/support/#api-key
+@app.route("/api/market/alpha-vantage/<symbol>")
+def alpha_vantage_quote(symbol):
+    """Get stock overview from Alpha Vantage (richer data than Yahoo for fundamentals)."""
+    config = load_config()
+    api_key = config.get("alpha_vantage_key", "")
+    if not api_key:
+        return jsonify({"error": "Add alpha_vantage_key to config.json"}), 400
+    try:
+        resp = requests.get("https://www.alphavantage.co/query", params={
+            "function": "OVERVIEW", "symbol": symbol.upper(), "apikey": api_key
+        }, timeout=10)
+        if resp.status_code != 200:
+            return jsonify({"error": f"Alpha Vantage returned {resp.status_code}"}), 500
+        data = resp.json()
+        if "Symbol" not in data:
+            return jsonify({"error": f"No data for {symbol}"}), 404
+        return jsonify({
+            "symbol": data.get("Symbol"), "name": data.get("Name"),
+            "sector": data.get("Sector"), "industry": data.get("Industry"),
+            "market_cap": data.get("MarketCapitalization"),
+            "pe_ratio": data.get("PERatio"), "eps": data.get("EPS"),
+            "dividend_yield": data.get("DividendYield"),
+            "52_week_high": data.get("52WeekHigh"),
+            "52_week_low": data.get("52WeekLow"),
+            "50_day_avg": data.get("50DayMovingAverage"),
+            "200_day_avg": data.get("200DayMovingAverage"),
+            "beta": data.get("Beta"),
+            "description": data.get("Description", "")[:300],
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# Binance — public orderbook, trades, ticker (no key needed)
+@app.route("/api/crypto/binance/<symbol>")
+def binance_ticker(symbol):
+    """Get 24h ticker data from Binance for a crypto pair."""
+    try:
+        pair = symbol.upper() + "USDT"
+        resp = requests.get(f"https://api.binance.com/api/v3/ticker/24hr",
+                            params={"symbol": pair}, timeout=10)
+        if resp.status_code != 200:
+            return jsonify({"error": f"Binance: pair {pair} not found"}), 404
+        d = resp.json()
+        return jsonify({
+            "symbol": symbol.upper(), "pair": pair,
+            "price": round(float(d.get("lastPrice", 0)), 4),
+            "change_24h": round(float(d.get("priceChange", 0)), 4),
+            "change_pct_24h": round(float(d.get("priceChangePercent", 0)), 2),
+            "high_24h": round(float(d.get("highPrice", 0)), 4),
+            "low_24h": round(float(d.get("lowPrice", 0)), 4),
+            "volume_24h": round(float(d.get("volume", 0)), 2),
+            "quote_volume_24h": round(float(d.get("quoteVolume", 0)), 2),
+            "trades_24h": int(d.get("count", 0)),
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# Etherscan — Ethereum gas prices + token data (free key)
+@app.route("/api/crypto/eth-gas")
+def eth_gas():
+    """Get current Ethereum gas prices from Etherscan."""
+    config = load_config()
+    api_key = config.get("etherscan_key", "")
+    if not api_key:
+        return jsonify({"error": "Add etherscan_key to config.json"}), 400
+    try:
+        resp = requests.get("https://api.etherscan.io/api", params={
+            "module": "gastracker", "action": "gasoracle", "apikey": api_key
+        }, timeout=10)
+        if resp.status_code == 200:
+            r = resp.json().get("result", {})
+            return jsonify({
+                "low_gwei": r.get("SafeGasPrice"),
+                "avg_gwei": r.get("ProposeGasPrice"),
+                "high_gwei": r.get("FastGasPrice"),
+                "base_fee": r.get("suggestBaseFee"),
+            })
+        return jsonify({"error": "Etherscan unavailable"}), 500
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/crypto/eth-price")
+def eth_price():
+    """Get ETH price from Etherscan."""
+    config = load_config()
+    api_key = config.get("etherscan_key", "")
+    if not api_key:
+        return jsonify({"error": "Add etherscan_key to config.json"}), 400
+    try:
+        resp = requests.get("https://api.etherscan.io/api", params={
+            "module": "stats", "action": "ethprice", "apikey": api_key
+        }, timeout=10)
+        if resp.status_code == 200:
+            r = resp.json().get("result", {})
+            return jsonify({
+                "eth_usd": round(float(r.get("ethusd", 0)), 2),
+                "eth_btc": r.get("ethbtc"),
+                "timestamp": r.get("ethusd_timestamp"),
+            })
+        return jsonify({"error": "Etherscan unavailable"}), 500
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# Hacker News — top tech/startup stories (no key needed)
+@app.route("/api/news/hackernews")
+def hackernews_top():
+    """Get top Hacker News stories — useful for tech/startup/AI news."""
+    try:
+        limit = request.args.get("limit", 15, type=int)
+        resp = requests.get("https://hacker-news.firebaseio.com/v0/topstories.json", timeout=10)
+        if resp.status_code != 200:
+            return jsonify({"error": "HN API unavailable"}), 500
+        story_ids = resp.json()[:min(limit, 30)]
+        stories = []
+        for sid in story_ids:
+            sr = requests.get(f"https://hacker-news.firebaseio.com/v0/item/{sid}.json", timeout=5)
+            if sr.status_code == 200:
+                s = sr.json()
+                if s and s.get("type") == "story" and s.get("url"):
+                    stories.append({
+                        "title": s.get("title", ""),
+                        "url": s.get("url", ""),
+                        "score": s.get("score", 0),
+                        "comments": s.get("descendants", 0),
+                        "by": s.get("by", ""),
+                        "time": datetime.fromtimestamp(s.get("time", 0), tz=timezone.utc).isoformat(),
+                    })
+        return jsonify({"stories": stories})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# Fear & Greed Index — market sentiment gauge (no key needed)
+@app.route("/api/market/fear-greed")
+def fear_greed_index():
+    """Get CNN Fear & Greed Index — useful context for AI analysis."""
+    try:
+        resp = requests.get("https://api.alternative.me/fng/?limit=7", timeout=10)
+        if resp.status_code == 200:
+            data = resp.json().get("data", [])
+            results = []
+            for d in data:
+                results.append({
+                    "value": int(d.get("value", 50)),
+                    "label": d.get("value_classification", "Neutral"),
+                    "timestamp": datetime.fromtimestamp(int(d.get("timestamp", 0)), tz=timezone.utc).isoformat(),
+                })
+            return jsonify({"fear_greed": results})
+        return jsonify({"error": "Fear & Greed API unavailable"}), 500
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 _monitor_started = False

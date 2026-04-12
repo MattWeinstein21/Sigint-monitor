@@ -669,7 +669,8 @@ function App() {
                           <span style={{ fontSize: 8, transition: "transform 0.2s", transform: isExpanded ? "rotate(90deg)" : "rotate(0deg)", display: "inline-block" }}>▶</span>
                           {isExpanded ? "Hide Summary" : "Show Summary"}
                           {a.ai_summary && <span style={{ fontSize: 8, background: "#5448C820", color: "#8B80F0", padding: "1px 4px", borderRadius: 3 }}>🤖 AI</span>}
-                          {!a.ai_summary && a.article_fetched && <span style={{ fontSize: 8, color: "#444" }}>◉ full text</span>}
+                          {a.ai_processing && !a.ai_summary && <span className="thinking" style={{ fontSize: 8, color: "#FF9500", marginLeft: 2 }}>🤖 Analyzing</span>}
+                          {!a.ai_summary && !a.ai_processing && a.article_fetched && <span style={{ fontSize: 8, color: "#444" }}>◉ text only</span>}
                         </button>
                         {isExpanded && (
                           <div style={{ marginTop: 2 }}>

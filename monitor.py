@@ -41,6 +41,11 @@ log = logging.getLogger("sigint")
 
 # ─── Data Store (SQLite) ─────────────────────────────────────────────────────
 # Foundation for article storage, trend analysis, and AI learning.
+# Schema designed to enable:
+# - Debugging: see what was fetched, how it was scored, where AI disagreed
+# - Trend analysis: track keyword/sector frequency over time
+# - AI learning: feed historical context into Ollama for better responses
+# - Feedback loop: user corrections improve future analysis
 
 DATA_STORE_PATH = Path("sigint_data.db")
 
@@ -49,9 +54,12 @@ def init_data_store():
     """Initialize the SQLite database with required tables."""
     conn = sqlite3.connect(str(DATA_STORE_PATH))
     c = conn.cursor()
+
+    # Core article storage
     c.execute("""CREATE TABLE IF NOT EXISTS articles (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         timestamp TEXT NOT NULL,
+        published_at TEXT,
         source_id TEXT,
         source_name TEXT,
         title TEXT,
@@ -65,81 +73,282 @@ def init_data_store():
         word_sentiment TEXT,
         confidence REAL,
         severity TEXT,
-        published_at TEXT,
         positive_signals TEXT,
         negative_signals TEXT,
         article_fetched INTEGER DEFAULT 0,
-        ai_summary INTEGER DEFAULT 0
+        ai_summary INTEGER DEFAULT 0,
+        -- Extended fields for AI learning
+        sectors TEXT DEFAULT '',
+        entities TEXT DEFAULT '',
+        user_corrected_sentiment TEXT DEFAULT '',
+        ai_analysis_raw TEXT DEFAULT '',
+        fetch_duration_ms INTEGER DEFAULT 0
     )""")
+
+    # Chat conversation log
     c.execute("""CREATE TABLE IF NOT EXISTS chat_logs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         timestamp TEXT NOT NULL,
         alert_id INTEGER,
         article_title TEXT,
+        article_url TEXT DEFAULT '',
         question TEXT,
-        answer TEXT
+        answer TEXT,
+        source_id TEXT DEFAULT '',
+        keyword TEXT DEFAULT ''
     )""")
-    c.execute("""CREATE INDEX IF NOT EXISTS idx_articles_timestamp ON articles(timestamp)""")
-    c.execute("""CREATE INDEX IF NOT EXISTS idx_articles_source ON articles(source_id)""")
-    c.execute("""CREATE INDEX IF NOT EXISTS idx_articles_sentiment ON articles(sentiment)""")
-    c.execute("""CREATE INDEX IF NOT EXISTS idx_articles_keyword ON articles(keyword)""")
+
+    # Sentiment correction feedback — user tells us the AI got it wrong
+    c.execute("""CREATE TABLE IF NOT EXISTS sentiment_corrections (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp TEXT NOT NULL,
+        article_url TEXT,
+        article_title TEXT,
+        original_sentiment TEXT,
+        corrected_sentiment TEXT,
+        source_id TEXT,
+        keyword TEXT
+    )""")
+
+    # System event log for debugging
+    c.execute("""CREATE TABLE IF NOT EXISTS system_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp TEXT NOT NULL,
+        event_type TEXT,
+        message TEXT,
+        details TEXT DEFAULT ''
+    )""")
+
+    # Indexes for fast queries
+    c.execute("CREATE INDEX IF NOT EXISTS idx_articles_timestamp ON articles(timestamp)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_articles_source ON articles(source_id)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_articles_sentiment ON articles(sentiment)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_articles_keyword ON articles(keyword)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_articles_sectors ON articles(sectors)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_articles_published ON articles(published_at)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_chat_alert ON chat_logs(alert_id)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_corrections_url ON sentiment_corrections(article_url)")
+
+    # Add columns if they don't exist (for upgrades from older schema)
+    for col, coltype in [("sectors", "TEXT DEFAULT ''"), ("entities", "TEXT DEFAULT ''"),
+                          ("user_corrected_sentiment", "TEXT DEFAULT ''"),
+                          ("ai_analysis_raw", "TEXT DEFAULT ''"),
+                          ("fetch_duration_ms", "INTEGER DEFAULT 0")]:
+        try:
+            c.execute(f"ALTER TABLE articles ADD COLUMN {col} {coltype}")
+        except Exception:
+            pass  # Column already exists
+    for col, coltype in [("article_url", "TEXT DEFAULT ''"), ("source_id", "TEXT DEFAULT ''"), ("keyword", "TEXT DEFAULT ''")]:
+        try:
+            c.execute(f"ALTER TABLE chat_logs ADD COLUMN {col} {coltype}")
+        except Exception:
+            pass
+
     conn.commit()
     conn.close()
     log.info(f"Data store initialized: {DATA_STORE_PATH}")
 
 
+# ─── Entity & Sector Extraction ──────────────────────────────────────────────
+
+SECTOR_KEYWORDS = {
+    "tech": ["apple", "google", "microsoft", "nvidia", "meta", "amazon", "ai ", "artificial intelligence",
+             "semiconductor", "chip", "software", "cloud", "data center", "saas", "cybersecurity"],
+    "finance": ["bank", "fed ", "federal reserve", "interest rate", "treasury", "wall street", "s&p",
+                "nasdaq", "dow jones", "goldman", "jpmorgan", "morgan stanley", "credit", "loan"],
+    "energy": ["oil", "opec", "natural gas", "lng", "pipeline", "drilling", "renewable", "solar",
+               "wind energy", "nuclear", "exxon", "chevron", "bp ", "shell"],
+    "crypto": ["bitcoin", "ethereum", "crypto", "blockchain", "defi", "nft", "stablecoin",
+               "coinbase", "binance", "altcoin", "mining"],
+    "healthcare": ["fda", "pharma", "biotech", "drug", "vaccine", "clinical trial", "hospital",
+                   "healthcare", "pfizer", "moderna", "johnson & johnson", "medical"],
+    "defense": ["military", "defense", "pentagon", "lockheed", "raytheon", "boeing", "nato",
+                "troops", "missile", "nuclear weapon"],
+    "real_estate": ["housing", "mortgage", "real estate", "reit", "property", "rent", "foreclosure"],
+    "consumer": ["retail", "walmart", "target", "consumer spending", "inflation", "cpi"],
+    "trade": ["tariff", "trade war", "import", "export", "sanctions", "embargo", "customs"],
+}
+
+ENTITY_PATTERNS = [
+    # Companies (detect common tickers and names)
+    (r"\b(AAPL|Apple Inc)\b", "Apple"),
+    (r"\b(GOOGL?|Alphabet|Google)\b", "Google"),
+    (r"\b(MSFT|Microsoft)\b", "Microsoft"),
+    (r"\b(NVDA|Nvidia|NVIDIA)\b", "Nvidia"),
+    (r"\b(META|Meta Platforms|Facebook)\b", "Meta"),
+    (r"\b(AMZN|Amazon)\b", "Amazon"),
+    (r"\b(TSLA|Tesla)\b", "Tesla"),
+    (r"\b(JPM|JPMorgan|JP Morgan)\b", "JPMorgan"),
+    (r"\b(GS|Goldman Sachs)\b", "Goldman Sachs"),
+    # People
+    (r"\bTrump\b", "Donald Trump"),
+    (r"\bBiden\b", "Joe Biden"),
+    (r"\bPowell\b", "Jerome Powell"),
+    (r"\bYellen\b", "Janet Yellen"),
+    (r"\bMusk\b", "Elon Musk"),
+    (r"\bBezos\b", "Jeff Bezos"),
+    # Countries
+    (r"\bChina\b", "China"), (r"\bRussia\b", "Russia"), (r"\bIran\b", "Iran"),
+    (r"\bUkraine\b", "Ukraine"), (r"\bNorth Korea\b", "North Korea"),
+    (r"\bEuropean Union\b|\bEU\b", "EU"),
+]
+
+
+def extract_sectors(text):
+    """Identify which sectors an article relates to."""
+    text_lower = text.lower()
+    matched = []
+    for sector, keywords in SECTOR_KEYWORDS.items():
+        for kw in keywords:
+            if kw.lower() in text_lower:
+                matched.append(sector)
+                break
+    return list(set(matched))
+
+
+def extract_entities(text):
+    """Extract known entities (companies, people, countries) from text."""
+    found = set()
+    for pattern, entity in ENTITY_PATTERNS:
+        if re.search(pattern, text, re.IGNORECASE):
+            found.add(entity)
+    return list(found)
+
+
+# ─── Data Logging Functions ───────────────────────────────────────────────────
+
 def log_article(alert_data, article_text=""):
     """Log an article and its analysis to the data store."""
     try:
+        # Extract sectors and entities
+        full_text = article_text or alert_data.get("title", "")
+        sectors = extract_sectors(full_text)
+        entities = extract_entities(full_text)
+
         conn = sqlite3.connect(str(DATA_STORE_PATH))
         c = conn.cursor()
-        c.execute("""INSERT OR IGNORE INTO articles
-            (timestamp, source_id, source_name, title, url, keyword,
+        c.execute("""INSERT OR REPLACE INTO articles
+            (timestamp, published_at, source_id, source_name, title, url, keyword,
              article_text, summary, sentiment, sentiment_score,
              ai_sentiment, word_sentiment, confidence, severity,
-             published_at, positive_signals, negative_signals,
-             article_fetched, ai_summary)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+             positive_signals, negative_signals,
+             article_fetched, ai_summary, sectors, entities)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (alert_data.get("timestamp", ""),
+             alert_data.get("published_at", ""),
              alert_data.get("source", ""),
              alert_data.get("source_name", ""),
              alert_data.get("title", ""),
              alert_data.get("url", ""),
              alert_data.get("keyword", ""),
-             article_text[:5000] if article_text else "",
+             article_text[:8000] if article_text else "",
              alert_data.get("summary", ""),
              alert_data.get("sentiment", ""),
              alert_data.get("sentiment_score", 0),
-             alert_data.get("ai_sentiment", ""),
-             alert_data.get("word_sentiment", ""),
+             alert_data.get("ai_sentiment", "") or "",
+             alert_data.get("word_sentiment", "") or "",
              alert_data.get("confidence", 0),
              alert_data.get("severity", ""),
-             alert_data.get("published_at", ""),
              json.dumps(alert_data.get("positive_signals", [])),
              json.dumps(alert_data.get("negative_signals", [])),
              1 if alert_data.get("article_fetched") else 0,
-             1 if alert_data.get("ai_summary") else 0))
+             1 if alert_data.get("ai_summary") else 0,
+             json.dumps(sectors),
+             json.dumps(entities)))
         conn.commit()
         conn.close()
     except Exception as e:
         log.debug(f"Data store log error: {e}")
 
 
-def log_chat(alert_id, article_title, question, answer):
+def log_chat(alert_id, article_title, question, answer, article_url="", source_id="", keyword=""):
     """Log a chat interaction to the data store."""
     try:
         conn = sqlite3.connect(str(DATA_STORE_PATH))
         c = conn.cursor()
-        c.execute("INSERT INTO chat_logs (timestamp, alert_id, article_title, question, answer) VALUES (?,?,?,?,?)",
-                  (datetime.now(timezone.utc).isoformat(), alert_id, article_title, question, answer))
+        c.execute("""INSERT INTO chat_logs
+            (timestamp, alert_id, article_title, article_url, question, answer, source_id, keyword)
+            VALUES (?,?,?,?,?,?,?,?)""",
+            (datetime.now(timezone.utc).isoformat(), alert_id, article_title,
+             article_url, question, answer, source_id, keyword))
         conn.commit()
         conn.close()
     except Exception as e:
         log.debug(f"Chat log error: {e}")
 
 
+def log_system_event(event_type, message, details=""):
+    """Log a system event for debugging."""
+    try:
+        conn = sqlite3.connect(str(DATA_STORE_PATH))
+        c = conn.cursor()
+        c.execute("INSERT INTO system_logs (timestamp, event_type, message, details) VALUES (?,?,?,?)",
+                  (datetime.now(timezone.utc).isoformat(), event_type, message, details))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log.debug(f"System log error: {e}")
+
+
+def log_sentiment_correction(url, title, original, corrected, source_id="", keyword=""):
+    """Log a user sentiment correction for future AI training."""
+    try:
+        conn = sqlite3.connect(str(DATA_STORE_PATH))
+        c = conn.cursor()
+        c.execute("""INSERT INTO sentiment_corrections
+            (timestamp, article_url, article_title, original_sentiment, corrected_sentiment, source_id, keyword)
+            VALUES (?,?,?,?,?,?,?)""",
+            (datetime.now(timezone.utc).isoformat(), url, title, original, corrected, source_id, keyword))
+        # Also update the article record
+        c.execute("UPDATE articles SET user_corrected_sentiment = ? WHERE url = ?", (corrected, url))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log.debug(f"Correction log error: {e}")
+
+
+def get_related_articles(keyword="", sector="", limit=5):
+    """
+    Fetch recent related articles from the data store.
+    Used to build context for Ollama so it can reference past coverage.
+    """
+    try:
+        conn = sqlite3.connect(str(DATA_STORE_PATH))
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        if keyword:
+            c.execute("SELECT title, summary, sentiment, published_at, source_name FROM articles WHERE keyword = ? ORDER BY id DESC LIMIT ?",
+                      (keyword.lower(), limit))
+        elif sector:
+            c.execute("SELECT title, summary, sentiment, published_at, source_name FROM articles WHERE sectors LIKE ? ORDER BY id DESC LIMIT ?",
+                      (f"%{sector}%", limit))
+        else:
+            c.execute("SELECT title, summary, sentiment, published_at, source_name FROM articles ORDER BY id DESC LIMIT ?", (limit,))
+        rows = [dict(r) for r in c.fetchall()]
+        conn.close()
+        return rows
+    except Exception:
+        return []
+
+
+def build_trend_context(keyword="", sector="", limit=10):
+    """
+    Build a text summary of recent trends for a keyword/sector.
+    This gets injected into Ollama prompts for better contextual analysis.
+    """
+    articles = get_related_articles(keyword=keyword, sector=sector, limit=limit)
+    if not articles:
+        return ""
+    lines = [f"Recent coverage on '{keyword or sector}':"]
+    for a in articles:
+        sent = a.get("sentiment", "neutral")
+        lines.append(f"- [{sent}] {a.get('title', '')} ({a.get('source_name', '')}, {a.get('published_at', '')})")
+    return "\n".join(lines)
+
+
 # Initialize on import
 init_data_store()
+log_system_event("startup", "SIGINT monitor initialized")
 
 
 CONFIG_PATH = Path("config.json")
@@ -378,7 +587,7 @@ def parse_account_url(url):
 
 
 class AlertStore:
-    """Thread-safe in-memory alert store with deduplication."""
+    """Thread-safe in-memory alert store with deduplication and async AI enrichment."""
 
     def __init__(self, max_alerts=500):
         self.alerts = []
@@ -387,10 +596,90 @@ class AlertStore:
         self.lock = threading.Lock()
         self.ollama_url = ""
         self.ollama_model = "llama3"
+        self._ai_queue = []
+        self._ai_lock = threading.Lock()
+        # Start the AI worker thread
+        self._ai_thread = threading.Thread(target=self._ai_worker, daemon=True)
+        self._ai_thread.start()
 
     def _hash(self, source_id, title, url):
         dedupe_basis = url.strip() if url else f"{source_id}:{title.strip().lower()}"
         return hashlib.md5(dedupe_basis.encode()).hexdigest()
+
+    def _ai_worker(self):
+        """Background worker that processes AI enrichment jobs."""
+        while True:
+            job = None
+            with self._ai_lock:
+                if self._ai_queue:
+                    job = self._ai_queue.pop(0)
+            if job:
+                try:
+                    self._enrich_with_ai(job)
+                except Exception as e:
+                    log.warning(f"AI enrichment error: {e}")
+            else:
+                time.sleep(2)
+
+    def _enrich_with_ai(self, job):
+        """Run Ollama analysis and update the alert in place."""
+        alert_id = job["alert_id"]
+        analysis_text = job["analysis_text"]
+        source_id = job["source_id"]
+        keyword = job["keyword"]
+
+        if not self.ollama_url:
+            return
+
+        ai_summary, ai_sentiment, success = ollama_analyze(
+            analysis_text, self.ollama_url, self.ollama_model, keyword=keyword
+        )
+
+        if not success:
+            log.debug(f"AI enrichment failed for alert {alert_id}")
+            return
+
+        with self.lock:
+            for alert in self.alerts:
+                if alert["id"] == alert_id:
+                    # Update summary
+                    if ai_summary:
+                        alert["summary"] = ai_summary
+                        alert["ai_summary"] = True
+
+                    # Update sentiment with AI judgment
+                    if ai_sentiment:
+                        alert["ai_sentiment"] = ai_sentiment
+                        word_sent = alert.get("word_sentiment", "neutral")
+
+                        if ai_sentiment == word_sent:
+                            # Agreement — boost confidence
+                            alert["confidence"] = min(1.0, alert.get("confidence", 0.5) + 0.3)
+                        elif word_sent == "neutral":
+                            # Words were inconclusive, trust AI
+                            alert["sentiment"] = ai_sentiment
+                            alert["confidence"] = 0.7
+                            # Flip score direction
+                            score = abs(alert.get("sentiment_score", 0))
+                            alert["sentiment_score"] = score if ai_sentiment == "positive" else -score if ai_sentiment == "negative" else 0
+                        else:
+                            # Disagreement — trust AI, lower confidence
+                            alert["sentiment"] = ai_sentiment
+                            alert["confidence"] = 0.5
+                            score = abs(alert.get("sentiment_score", 0))
+                            alert["sentiment_score"] = score if ai_sentiment == "positive" else -score if ai_sentiment == "negative" else 0
+
+                        # Recalculate severity
+                        abs_score = abs(alert.get("sentiment_score", 0))
+                        alert["severity"] = "high" if abs_score >= 5 else "medium" if abs_score >= 2 else "low"
+
+                    # Update data store
+                    log_article(alert, analysis_text)
+
+                    emoji = {"positive": "📈", "negative": "📉", "neutral": "➡️"}.get(alert["sentiment"], "➡️")
+                    disagree = " ⚡" if ai_sentiment and alert.get("word_sentiment") and ai_sentiment != alert["word_sentiment"] else ""
+                    log.info(f"🤖{emoji}{disagree} AI enriched [{source_id}] {alert['sentiment']}({alert['sentiment_score']:+.1f}) → {alert['title'][:60]}")
+                    break
 
     def add(self, source_id, source_name, title, url, snippet, keyword, severity="medium", published_at=None):
         if not title or not is_valid_source_url(url):
@@ -401,18 +690,22 @@ class AlertStore:
                 return False
             self.seen_hashes.add(h)
 
-        # Fetch article text for deeper analysis (outside lock to avoid blocking)
+        # Fetch article text (this is fast, ~1-2s)
         article_text, fetched = fetch_article_text(url)
         analysis_text = article_text if fetched else f"{title}. {snippet}"
 
-        # Run sentiment analysis
-        sentiment = analyze_sentiment(
+        # Run ONLY word-based sentiment (instant, no network call)
+        word_result = analyze_sentiment_words_only(
             analysis_text,
             source_id=source_id,
             matched_keywords=[keyword],
-            ollama_url=self.ollama_url,
-            ollama_model=self.ollama_model,
         )
+
+        # Generate fallback summary (first 2 sentences)
+        sentences = re.split(r'(?<=[.!?])\s+', analysis_text[:600])
+        fallback_summary = " ".join(sentences[:2]).strip()
+        if len(fallback_summary) > 250:
+            fallback_summary = fallback_summary[:247] + "..."
 
         # Format published_at for display
         pub_str = ""
@@ -423,24 +716,26 @@ class AlertStore:
                 pub_str = str(published_at)
 
         with self.lock:
+            alert_id = int(time.time() * 1000)
             alert = {
-                "id": int(time.time() * 1000),
+                "id": alert_id,
                 "source": source_id,
                 "source_name": source_name,
                 "title": title.strip(),
                 "url": url.strip(),
                 "snippet": (snippet or "").strip(),
                 "keyword": keyword.strip().lower(),
-                "severity": sentiment["severity"],
-                "sentiment": sentiment["sentiment"],
-                "sentiment_score": sentiment["score"],
-                "confidence": sentiment["confidence"],
-                "summary": sentiment["summary"],
-                "ai_summary": sentiment.get("ai_summary", False),
-                "ai_sentiment": sentiment.get("ai_sentiment"),
-                "word_sentiment": sentiment.get("word_sentiment"),
-                "positive_signals": sentiment["positive_signals"],
-                "negative_signals": sentiment["negative_signals"],
+                "severity": word_result["severity"],
+                "sentiment": word_result["sentiment"],
+                "sentiment_score": word_result["score"],
+                "confidence": word_result["confidence"],
+                "summary": fallback_summary,
+                "ai_summary": False,
+                "ai_sentiment": None,
+                "ai_processing": True,  # Flag: AI is still working
+                "word_sentiment": word_result["sentiment"],
+                "positive_signals": word_result["positive_signals"],
+                "negative_signals": word_result["negative_signals"],
                 "article_fetched": fetched,
                 "published_at": pub_str,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -449,14 +744,30 @@ class AlertStore:
             if len(self.alerts) > self.max_alerts:
                 self.alerts = self.alerts[: self.max_alerts]
 
-            # Log to data store
+            # Log immediately with word-based analysis
             log_article(alert, article_text)
 
-            emoji = {"positive": "📈", "negative": "📉", "neutral": "➡️"}.get(sentiment["sentiment"], "➡️")
-            ai_tag = " 🤖" if sentiment.get("ai_summary") else ""
-            disagree = " ⚡" if sentiment.get("ai_sentiment") and sentiment.get("word_sentiment") and sentiment["ai_sentiment"] != sentiment["word_sentiment"] else ""
-            log.info(f"{emoji}{ai_tag}{disagree} [{source_id}] {sentiment['sentiment']}({sentiment['score']:+.1f}) keyword='{keyword}' → {title[:70]}")
-            return True
+            emoji = {"positive": "📈", "negative": "📉", "neutral": "➡️"}.get(word_result["sentiment"], "➡️")
+            log.info(f"{emoji} [{source_id}] {word_result['sentiment']}({word_result['score']:+.1f}) keyword='{keyword}' → {title[:70]} [AI queued]")
+
+        # Queue AI enrichment in background
+        if self.ollama_url:
+            with self._ai_lock:
+                self._ai_queue.append({
+                    "alert_id": alert_id,
+                    "analysis_text": analysis_text,
+                    "source_id": source_id,
+                    "keyword": keyword,
+                })
+        else:
+            # No Ollama — mark as done
+            with self.lock:
+                for a in self.alerts:
+                    if a["id"] == alert_id:
+                        a["ai_processing"] = False
+                        break
+
+        return True
 
     def get_all(self, since=None, limit=None):
         with self.lock:
@@ -777,22 +1088,28 @@ def get_active_signals():
 
 # ─── Ollama Integration ───────────────────────────────────────────────────────
 
-def ollama_analyze(text, ollama_url, model="llama3"):
+def ollama_analyze(text, ollama_url, model="llama3", keyword=""):
     """
     Send article text to Ollama for AI-powered summary AND sentiment judgment.
+    Includes historical trend context from the data store when available.
     Returns (summary, ai_sentiment, success).
-    ai_sentiment is "positive", "negative", or "neutral".
     """
     if not ollama_url:
         return "", "", False
     try:
+        # Build trend context from stored articles
+        trend_ctx = build_trend_context(keyword=keyword, limit=5) if keyword else ""
+
         prompt = (
             "You are a financial market analyst. Analyze the following article.\n\n"
             "Respond in EXACTLY this format (no extra text):\n"
             "SENTIMENT: positive OR negative OR neutral\n"
             "SUMMARY: 2-3 sentence summary focusing on market impact, affected sectors/companies, and what traders should know.\n\n"
-            f"Article:\n{text[:2500]}"
         )
+        if trend_ctx:
+            prompt += f"Historical context:\n{trend_ctx}\n\n"
+        prompt += f"Article:\n{text[:2500]}"
+
         resp = requests.post(
             f"{ollama_url.rstrip('/')}/api/generate",
             json={"model": model, "prompt": prompt, "stream": False},
@@ -907,12 +1224,10 @@ def fetch_article_text(url, timeout=12):
         return "", False
 
 
-def analyze_sentiment(text, source_id="", matched_keywords=None, ollama_url="", ollama_model="llama3"):
+def analyze_sentiment_words_only(text, source_id="", matched_keywords=None):
     """
-    Hybrid sentiment analysis:
-    1. Word-based scoring (instant, always runs)
-    2. Ollama AI judgment (when available, overrides word-based if they disagree)
-    Returns combined result with both scores visible.
+    Word-based sentiment analysis only (instant, no network calls).
+    Used for immediate alert posting. AI enrichment happens async.
     """
     text_lower = text.lower()
     matched_keywords = matched_keywords or []
@@ -937,7 +1252,7 @@ def analyze_sentiment(text, source_id="", matched_keywords=None, ollama_url="", 
             neg_score += weight * len(found)
             neg_signals.append(word)
 
-    # Check for negation patterns that flip sentiment
+    # Negation detection
     negation_patterns = [
         (r"not\s+(rising|gaining|improving|growing)", "neg_flip"),
         (r"no\s+(deal|agreement|progress|recovery)", "neg_flip"),
@@ -945,7 +1260,6 @@ def analyze_sentiment(text, source_id="", matched_keywords=None, ollama_url="", 
         (r"unlikely\s+to\s+(cut|ease|approve|pass)", "neg_flip"),
         (r"(avoid|prevent|avert)(ed|s|ing)?\s+(crash|crisis|recession|default)", "pos_flip"),
         (r"(ease|calm|cool)(ed|s|ing)?\s+(fears?|concerns?|tensions?|worries)", "pos_flip"),
-        (r"despite\s+(concerns?|fears?|worries|criticism)", "pos_context"),
     ]
     for pat, flip_type in negation_patterns:
         if re.search(pat, text_lower):
@@ -967,76 +1281,27 @@ def analyze_sentiment(text, source_id="", matched_keywords=None, ollama_url="", 
 
     src_weight = SOURCE_WEIGHTS.get(source_id, 0.5)
     raw = (pos_score - neg_score) * amplifier * combo_mult * src_weight
-    word_score = max(-10.0, min(10.0, raw))
+    score = max(-10.0, min(10.0, raw))
 
-    if word_score > 1.5:
-        word_sentiment = "positive"
-    elif word_score < -1.5:
-        word_sentiment = "negative"
+    if score > 1.5:
+        sentiment = "positive"
+    elif score < -1.5:
+        sentiment = "negative"
     else:
-        word_sentiment = "neutral"
+        sentiment = "neutral"
 
-    # Confidence from word analysis
     total_signals = len(pos_signals) + len(neg_signals)
     text_len = max(len(text.split()), 1)
-    word_confidence = min(1.0, (total_signals / text_len) * 10 + (abs(word_score) / 10) * 0.5)
+    confidence = min(1.0, (total_signals / text_len) * 10 + (abs(score) / 10) * 0.5)
 
-    # Get Ollama analysis (summary + sentiment)
-    ai_summary, ai_sentiment, used_ollama = ollama_analyze(text, ollama_url, ollama_model)
-
-    # Fallback summary if Ollama didn't provide one
-    if not ai_summary:
-        sentences = re.split(r'(?<=[.!?])\s+', text[:600])
-        ai_summary = " ".join(sentences[:2]).strip()
-        if len(ai_summary) > 250:
-            ai_summary = ai_summary[:247] + "..."
-
-    # Hybrid decision: combine word-based and AI sentiment
-    if used_ollama and ai_sentiment:
-        if ai_sentiment == word_sentiment:
-            # Both agree — high confidence
-            final_sentiment = ai_sentiment
-            final_confidence = min(1.0, word_confidence + 0.3)
-        elif word_sentiment == "neutral":
-            # Words inconclusive, trust AI
-            final_sentiment = ai_sentiment
-            final_confidence = 0.7
-        elif ai_sentiment == "neutral":
-            # AI unsure, use words
-            final_sentiment = word_sentiment
-            final_confidence = word_confidence
-        else:
-            # Disagreement — trust AI over words (AI understands context better)
-            final_sentiment = ai_sentiment
-            final_confidence = 0.5  # Lower confidence due to disagreement
-    else:
-        final_sentiment = word_sentiment
-        final_confidence = round(word_confidence, 2)
-
-    # Map final sentiment to a score for display
-    if final_sentiment != word_sentiment:
-        # Remap score direction to match AI judgment
-        final_score = abs(word_score) if final_sentiment == "positive" else -abs(word_score) if final_sentiment == "negative" else 0
-    else:
-        final_score = word_score
-
-    abs_score = abs(final_score)
-    if abs_score >= 5:
-        severity = "high"
-    elif abs_score >= 2:
-        severity = "medium"
-    else:
-        severity = "low"
+    abs_score = abs(score)
+    severity = "high" if abs_score >= 5 else "medium" if abs_score >= 2 else "low"
 
     return {
-        "sentiment": final_sentiment,
-        "score": round(final_score, 2),
-        "confidence": round(final_confidence, 2),
+        "sentiment": sentiment,
+        "score": round(score, 2),
+        "confidence": round(confidence, 2),
         "severity": severity,
-        "summary": ai_summary,
-        "ai_summary": used_ollama,
-        "ai_sentiment": ai_sentiment if used_ollama else None,
-        "word_sentiment": word_sentiment,
         "positive_signals": pos_signals[:5],
         "negative_signals": neg_signals[:5],
     }
@@ -1753,14 +2018,21 @@ def ollama_chat():
         )
         if resp.status_code == 200:
             answer = resp.json().get("response", "").strip()
-            # Log chat to data store
+            # Log chat to data store with full context
             article_title = ""
+            article_url = ""
+            source_id_chat = ""
+            keyword_chat = ""
             with store.lock:
                 for a in store.alerts:
                     if a["id"] == alert_id:
                         article_title = a.get("title", "")
+                        article_url = a.get("url", "")
+                        source_id_chat = a.get("source", "")
+                        keyword_chat = a.get("keyword", "")
                         break
-            log_chat(alert_id, article_title, question, answer)
+            log_chat(alert_id, article_title, question, answer,
+                     article_url=article_url, source_id=source_id_chat, keyword=keyword_chat)
             return jsonify({"answer": answer})
         return jsonify({"error": f"Ollama returned {resp.status_code}"}), 500
     except Exception as e:
@@ -2199,27 +2471,121 @@ def data_stats():
         fetched = c.fetchone()[0]
         c.execute("SELECT COUNT(*) FROM articles WHERE ai_summary = 1")
         ai_analyzed = c.fetchone()[0]
-        # Accuracy tracking: where AI and word-based disagreed
         c.execute("SELECT COUNT(*) FROM articles WHERE ai_sentiment != '' AND ai_sentiment IS NOT NULL AND word_sentiment != '' AND ai_sentiment != word_sentiment")
         disagreements = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM sentiment_corrections")
+        corrections = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM system_logs")
+        sys_logs = c.fetchone()[0]
         conn.close()
         return jsonify({
             "total_articles": total,
             "articles_fetched": fetched,
             "ai_analyzed": ai_analyzed,
             "sentiment_disagreements": disagreements,
+            "user_corrections": corrections,
             "by_sentiment": by_sentiment,
             "by_source": by_source,
             "by_keyword": by_keyword,
             "total_chats": chats,
+            "system_log_entries": sys_logs,
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/data/trends")
+def data_trends():
+    """Get trend data — sentiment over time for a keyword or sector."""
+    keyword = request.args.get("keyword", "")
+    sector = request.args.get("sector", "")
+    days = request.args.get("days", 7, type=int)
+    try:
+        conn = sqlite3.connect(str(DATA_STORE_PATH))
+        c = conn.cursor()
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+        if keyword:
+            c.execute("SELECT timestamp, sentiment, sentiment_score, title FROM articles WHERE keyword = ? AND timestamp > ? ORDER BY timestamp",
+                      (keyword.lower(), cutoff))
+        elif sector:
+            c.execute("SELECT timestamp, sentiment, sentiment_score, title FROM articles WHERE sectors LIKE ? AND timestamp > ? ORDER BY timestamp",
+                      (f"%{sector}%", cutoff))
+        else:
+            c.execute("SELECT timestamp, sentiment, sentiment_score, title FROM articles WHERE timestamp > ? ORDER BY timestamp", (cutoff,))
+
+        rows = [{"timestamp": r[0], "sentiment": r[1], "score": r[2], "title": r[3]} for r in c.fetchall()]
+        # Aggregate
+        pos = sum(1 for r in rows if r["sentiment"] == "positive")
+        neg = sum(1 for r in rows if r["sentiment"] == "negative")
+        neu = sum(1 for r in rows if r["sentiment"] == "neutral")
+        avg_score = sum(r["score"] for r in rows) / max(len(rows), 1)
+        conn.close()
+        return jsonify({
+            "query": keyword or sector or "all",
+            "days": days,
+            "total": len(rows),
+            "positive": pos, "negative": neg, "neutral": neu,
+            "avg_score": round(avg_score, 2),
+            "articles": rows[-50:],  # Last 50 for charting
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/data/sectors")
+def data_sectors():
+    """Get sector breakdown from stored articles."""
+    try:
+        conn = sqlite3.connect(str(DATA_STORE_PATH))
+        c = conn.cursor()
+        c.execute("SELECT sectors FROM articles WHERE sectors != '' AND sectors != '[]'")
+        sector_counts = {}
+        for row in c.fetchall():
+            try:
+                for s in json.loads(row[0]):
+                    sector_counts[s] = sector_counts.get(s, 0) + 1
+            except Exception:
+                pass
+        conn.close()
+        return jsonify({"sectors": sector_counts})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/data/correct", methods=["POST"])
+def correct_sentiment():
+    """User corrects a sentiment call. Logged for future AI training."""
+    data = request.get_json(silent=True) or {}
+    url = data.get("url", "")
+    corrected = data.get("corrected_sentiment", "")
+    if not url or corrected not in ("positive", "negative", "neutral"):
+        return jsonify({"error": "Provide url and corrected_sentiment (positive/negative/neutral)"}), 400
+
+    # Find the alert to get context
+    title = ""
+    original = ""
+    source_id = ""
+    keyword = ""
+    with store.lock:
+        for a in store.alerts:
+            if a.get("url") == url:
+                title = a.get("title", "")
+                original = a.get("sentiment", "")
+                source_id = a.get("source", "")
+                keyword = a.get("keyword", "")
+                # Update the live alert
+                a["sentiment"] = corrected
+                a["user_corrected"] = True
+                break
+
+    log_sentiment_correction(url, title, original, corrected, source_id, keyword)
+    return jsonify({"status": "corrected", "original": original, "corrected": corrected})
+
+
 @app.route("/api/data/recent")
 def data_recent():
-    """Get recent articles from the data store with full text for debugging."""
+    """Get recent articles from the data store."""
     limit = request.args.get("limit", 20, type=int)
     try:
         conn = sqlite3.connect(str(DATA_STORE_PATH))
@@ -2244,6 +2610,22 @@ def data_export():
         rows = [dict(r) for r in c.fetchall()]
         conn.close()
         return jsonify({"articles": rows, "count": len(rows)})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/data/system-logs")
+def system_logs():
+    """Get recent system logs for debugging."""
+    limit = request.args.get("limit", 50, type=int)
+    try:
+        conn = sqlite3.connect(str(DATA_STORE_PATH))
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute("SELECT * FROM system_logs ORDER BY id DESC LIMIT ?", (min(limit, 200),))
+        rows = [dict(r) for r in c.fetchall()]
+        conn.close()
+        return jsonify({"logs": rows})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 

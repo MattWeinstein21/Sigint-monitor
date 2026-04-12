@@ -106,6 +106,9 @@ def init_data_store():
         article_title TEXT,
         original_sentiment TEXT,
         corrected_sentiment TEXT,
+        original_impact TEXT DEFAULT '',
+        corrected_impact TEXT DEFAULT '',
+        user_context TEXT DEFAULT '',
         source_id TEXT,
         keyword TEXT
     )""")
@@ -141,6 +144,11 @@ def init_data_store():
     for col, coltype in [("article_url", "TEXT DEFAULT ''"), ("source_id", "TEXT DEFAULT ''"), ("keyword", "TEXT DEFAULT ''")]:
         try:
             c.execute(f"ALTER TABLE chat_logs ADD COLUMN {col} {coltype}")
+        except Exception:
+            pass
+    for col, coltype in [("original_impact", "TEXT DEFAULT ''"), ("corrected_impact", "TEXT DEFAULT ''"), ("user_context", "TEXT DEFAULT ''")]:
+        try:
+            c.execute(f"ALTER TABLE sentiment_corrections ADD COLUMN {col} {coltype}")
         except Exception:
             pass
 
@@ -364,16 +372,18 @@ def log_system_event(event_type, message, details=""):
         log.debug(f"System log error: {e}")
 
 
-def log_sentiment_correction(url, title, original, corrected, source_id="", keyword=""):
-    """Log a user sentiment correction for future AI training."""
+def log_sentiment_correction(url, title, original, corrected, source_id="", keyword="",
+                              original_impact="", corrected_impact="", user_context=""):
+    """Log a user sentiment correction with optional impact correction and context."""
     try:
         conn = sqlite3.connect(str(DATA_STORE_PATH))
         c = conn.cursor()
         c.execute("""INSERT INTO sentiment_corrections
-            (timestamp, article_url, article_title, original_sentiment, corrected_sentiment, source_id, keyword)
-            VALUES (?,?,?,?,?,?,?)""",
-            (datetime.now(timezone.utc).isoformat(), url, title, original, corrected, source_id, keyword))
-        # Also update the article record
+            (timestamp, article_url, article_title, original_sentiment, corrected_sentiment,
+             original_impact, corrected_impact, user_context, source_id, keyword)
+            VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            (datetime.now(timezone.utc).isoformat(), url, title, original, corrected,
+             original_impact, corrected_impact, user_context, source_id, keyword))
         c.execute("UPDATE articles SET user_corrected_sentiment = ? WHERE url = ?", (corrected, url))
         conn.commit()
         conn.close()
@@ -2700,6 +2710,43 @@ WATCHLIST_PATH = Path("watchlist.json")
 DEFAULT_WATCHLIST = [{"symbol": "NVDA", "type": "stock"}]
 DEFAULT_INDICES = ["^GSPC", "^IXIC", "^DJI", "SPY"]
 
+# All available indices the user can choose from
+AVAILABLE_INDICES = {
+    "^GSPC": "S&P 500",
+    "^IXIC": "NASDAQ",
+    "^DJI": "Dow Jones",
+    "SPY": "SPY ETF",
+    "^RUT": "Russell 2000",
+    "^VIX": "VIX (Volatility)",
+    "^TNX": "10-Year Treasury",
+    "^TYX": "30-Year Treasury",
+    "GC=F": "Gold Futures",
+    "SI=F": "Silver Futures",
+    "CL=F": "Crude Oil WTI",
+    "NG=F": "Natural Gas",
+    "BTC-USD": "Bitcoin",
+    "ETH-USD": "Ethereum",
+    "^FTSE": "FTSE 100",
+    "^N225": "Nikkei 225",
+    "^HSI": "Hang Seng",
+    "DX-Y.NYB": "US Dollar Index",
+}
+
+INDICES_CONFIG_PATH = Path("indices_config.json")
+
+
+def load_indices_config():
+    if not INDICES_CONFIG_PATH.exists():
+        INDICES_CONFIG_PATH.write_text(json.dumps(DEFAULT_INDICES))
+    try:
+        return json.loads(INDICES_CONFIG_PATH.read_text())
+    except Exception:
+        return DEFAULT_INDICES
+
+
+def save_indices_config(indices):
+    INDICES_CONFIG_PATH.write_text(json.dumps(indices))
+
 # Common crypto ID mapping (coingecko uses slugs)
 CRYPTO_MAP = {
     "BTC": "bitcoin", "ETH": "ethereum", "SOL": "solana", "XRP": "ripple",
@@ -2771,6 +2818,9 @@ def fetch_yahoo_quote(symbol, range_str="1d", interval="5m"):
         timestamps = result[0].get("timestamp", [])
         indicators = result[0].get("indicators", {}).get("quote", [{}])[0]
         closes = indicators.get("close", [])
+        opens = indicators.get("open", [])
+        highs = indicators.get("high", [])
+        lows = indicators.get("low", [])
         volumes = indicators.get("volume", [])
 
         chart_data = []
@@ -2778,6 +2828,9 @@ def fetch_yahoo_quote(symbol, range_str="1d", interval="5m"):
             if i < len(closes) and closes[i] is not None:
                 chart_data.append({
                     "time": datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(),
+                    "open": round(opens[i], 2) if i < len(opens) and opens[i] is not None else round(closes[i], 2),
+                    "high": round(highs[i], 2) if i < len(highs) and highs[i] is not None else round(closes[i], 2),
+                    "low": round(lows[i], 2) if i < len(lows) and lows[i] is not None else round(closes[i], 2),
                     "close": round(closes[i], 2),
                     "volume": volumes[i] if i < len(volumes) else 0,
                 })
@@ -2893,15 +2946,40 @@ def resolve_crypto_id(symbol):
 
 @app.route("/api/market/indices")
 def get_indices():
-    """Get major index data."""
+    """Get user-configured index data."""
     range_str = request.args.get("range", "1d")
     interval = request.args.get("interval", "5m")
+    selected = load_indices_config()
     results = {}
-    for sym in DEFAULT_INDICES:
+    for sym in selected:
         data = fetch_yahoo_quote(sym, range_str, interval)
         if data:
             results[sym] = data
     return jsonify({"indices": results})
+
+
+@app.route("/api/market/indices/config")
+def get_indices_config():
+    """Get available indices and which ones are selected."""
+    return jsonify({
+        "available": AVAILABLE_INDICES,
+        "selected": load_indices_config(),
+    })
+
+
+@app.route("/api/market/indices/config", methods=["POST"])
+def update_indices_config():
+    """Update which indices are shown. Expects {"selected": ["^GSPC", "^IXIC", ...]}"""
+    data = request.get_json(silent=True) or {}
+    selected = data.get("selected")
+    if not selected or not isinstance(selected, list):
+        return jsonify({"error": "Provide selected as a list of symbols"}), 400
+    # Validate — only allow known symbols
+    valid = [s for s in selected if s in AVAILABLE_INDICES]
+    if not valid:
+        valid = DEFAULT_INDICES
+    save_indices_config(valid)
+    return jsonify({"selected": valid, "available": AVAILABLE_INDICES})
 
 
 @app.route("/api/market/quote/<symbol>")
@@ -3206,36 +3284,64 @@ def data_sectors():
 
 @app.route("/api/data/correct", methods=["POST"])
 def correct_sentiment():
-    """User corrects a sentiment call or marks as duplicate. Logged for future AI training."""
+    """
+    User corrects an alert's classification. Accepts:
+    - corrected_impact: bullish | neutral | bearish | duplicate (required)
+    - context: user's explanation of why (optional, for AI training)
+    """
     data = request.get_json(silent=True) or {}
     url = data.get("url", "")
-    corrected = data.get("corrected_sentiment", "")
-    if not url or corrected not in ("positive", "negative", "neutral", "duplicate"):
-        return jsonify({"error": "Provide url and corrected_sentiment (positive/negative/neutral/duplicate)"}), 400
+    corrected_impact = data.get("corrected_impact", "")
+    user_context = data.get("context", "").strip()
 
-    # Find the alert to get context
+    if not url or corrected_impact not in ("bullish", "neutral", "bearish", "duplicate"):
+        return jsonify({"error": "Provide url and corrected_impact (bullish/neutral/bearish/duplicate)"}), 400
+
+    # Map impact to tone for backward compat
+    impact_to_tone = {"bullish": "positive", "bearish": "negative", "neutral": "neutral", "duplicate": "neutral"}
+    corrected_tone = impact_to_tone.get(corrected_impact, "neutral")
+
     title = ""
-    original = ""
+    original_tone = ""
+    original_impact = ""
     source_id = ""
     keyword = ""
     with store.lock:
         for a in store.alerts:
             if a.get("url") == url:
                 title = a.get("title", "")
-                original = a.get("sentiment", "")
+                original_tone = a.get("article_tone", a.get("sentiment", ""))
+                original_impact = a.get("market_impact", "")
                 source_id = a.get("source", "")
                 keyword = a.get("keyword", "")
-                if corrected == "duplicate":
+                if corrected_impact == "duplicate":
                     a["user_corrected"] = True
                     a["is_duplicate"] = True
                 else:
-                    a["sentiment"] = corrected
-                    a["article_tone"] = corrected
+                    a["market_impact"] = corrected_impact
+                    a["article_tone"] = corrected_tone
+                    a["sentiment"] = corrected_tone
                     a["user_corrected"] = True
                 break
 
-    log_sentiment_correction(url, title, original, corrected, source_id, keyword)
-    return jsonify({"status": "corrected", "original": original, "corrected": corrected})
+    log_sentiment_correction(url, title, original_tone, corrected_tone,
+                              source_id=source_id, keyword=keyword,
+                              original_impact=original_impact,
+                              corrected_impact=corrected_impact,
+                              user_context=user_context)
+
+    # Log context as a system event if provided (useful for AI training)
+    if user_context:
+        log_system_event("user_correction_context",
+                         f"Corrected {original_impact}→{corrected_impact}: {title[:80]}",
+                         user_context)
+
+    return jsonify({
+        "status": "corrected",
+        "original_impact": original_impact,
+        "corrected_impact": corrected_impact,
+        "context_logged": bool(user_context),
+    })
 
 
 @app.route("/api/data/recent")

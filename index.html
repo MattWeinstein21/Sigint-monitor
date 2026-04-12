@@ -80,9 +80,35 @@ function App(){
   var[mn,sMn]=s([]);var[sn,sSn]=s([]);var[mns,sMns]=s({});
   var[fg,sFg]=s(null);var[fd,sFd]=s(null);var[hn,sHn]=s([]);var[bt,sBt]=s(null);
   var[tk,sTk]=s(0);
+  // Correction modal
+  var[corrUrl,sCorrUrl]=s(null);
+  var[corrCtx,sCorrCtx]=s("");
+  // Indices config
+  var[idxCfg,sIdxCfg]=s(null);
+  var[showIdxPick,sShowIdxPick]=s(false);
+  // Stock detail popup
+  var[detailSym,sDetailSym]=s(null);
+  var[chartType,sChartType]=s("line");
 
   var tt=function(m){sToast(m);setTimeout(function(){sToast("")},3000)};
   var te=function(id){sExp(function(p){var n=new Set(p);if(n.has(id))n.delete(id);else n.add(id);return n})};
+
+  var submitCorrection=function(impact){
+    if(!corrUrl)return;
+    fetch(API+"/api/data/correct",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({url:corrUrl,corrected_impact:impact,context:corrCtx})}).then(function(r){return r.json()}).then(function(d){
+      if(d.status==="corrected"){
+        tt("Corrected: "+d.original_impact+" → "+d.corrected_impact);
+        sAl(function(p){return p.map(function(x){
+          if(x.url!==corrUrl)return x;
+          var up=Object.assign({},x,{user_corrected:true});
+          if(impact==="duplicate"){up.is_duplicate=true}
+          else{up.market_impact=impact;var tm={bullish:"positive",bearish:"negative",neutral:"neutral"};up.article_tone=tm[impact]||"neutral";up.sentiment=up.article_tone}
+          return up;
+        })});
+        sCorrUrl(null);sCorrCtx("");
+      }
+    }).catch(function(){tt("Failed")});
+  };
 
   // Init
   u(function(){
@@ -97,7 +123,7 @@ function App(){
   // Tick
   u(function(){var iv=setInterval(function(){sTk(function(t){return t+1})},10000);return function(){clearInterval(iv)}},[]);
   // Market
-  u(function(){if(mv!=="market")return;var ld=function(){var iv2=rng==="1d"?"5m":rng==="5d"?"15m":"1d";F("/api/market/indices?range="+rng+"&interval="+iv2).then(function(d){if(d.indices)sIdx(d.indices)}).catch(function(){});F("/api/market/watchlist").then(function(d){if(d.watchlist)sWl(d.watchlist);if(d.quotes)sWq(d.quotes)}).catch(function(){});F("/api/market/news").then(function(d){if(d.articles)sMn(d.articles)}).catch(function(){});F("/api/market/news-sources").then(function(d){if(d.sources)sMns(d.sources)}).catch(function(){})};ld();var iv=setInterval(ld,60000);return function(){clearInterval(iv)}},[mv,rng]);
+  u(function(){if(mv!=="market")return;var ld=function(){var iv2=rng==="1d"?"5m":rng==="5d"?"15m":"1d";F("/api/market/indices?range="+rng+"&interval="+iv2).then(function(d){if(d.indices)sIdx(d.indices)}).catch(function(){});F("/api/market/watchlist").then(function(d){if(d.watchlist)sWl(d.watchlist);if(d.quotes)sWq(d.quotes)}).catch(function(){});F("/api/market/news").then(function(d){if(d.articles)sMn(d.articles)}).catch(function(){});F("/api/market/news-sources").then(function(d){if(d.sources)sMns(d.sources)}).catch(function(){});F("/api/market/indices/config").then(function(d){if(d.available)sIdxCfg(d)}).catch(function(){})};ld();var iv=setInterval(ld,60000);return function(){clearInterval(iv)}},[mv,rng]);
   // Analytics
   u(function(){if(mv!=="analytics")return;F("/api/data/accuracy").then(function(d){sAcd(d)}).catch(function(){})},[mv]);
   // Economy
@@ -114,6 +140,81 @@ function App(){
 
   return <div style={{minHeight:"100vh"}}>
     {toast&&<div style={{position:"fixed",top:20,right:20,zIndex:100,background:"#1A2A1A",color:"#34C759",padding:"10px 18px",borderRadius:8,fontSize:12,border:"1px solid #34C75933",animation:"slideIn 0.3s ease-out"}}>{toast}</div>}
+
+      {/* Correction Modal */}
+      {corrUrl&&<div style={{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.7)",zIndex:200,display:"flex",alignItems:"center",justifyContent:"center"}} onClick={function(){sCorrUrl(null);sCorrCtx("")}}>
+        <div style={{background:"#14141F",borderRadius:12,padding:24,border:"1px solid #2A2A35",width:380,maxWidth:"90vw"}} onClick={function(e){e.stopPropagation()}}>
+          <div style={{fontSize:12,fontWeight:600,color:"#E8E8ED",marginBottom:16}}>Correct Classification</div>
+          <div style={{fontSize:10,color:"#555",marginBottom:12}}>What is the correct market impact?</div>
+          <div style={{display:"flex",gap:8,marginBottom:16}}>
+            <button className="b" onClick={function(){submitCorrection("bullish")}} style={{flex:1,padding:"10px",borderRadius:8,background:"#34C75915",color:"#34C759",border:"1px solid #34C75933",fontSize:12,fontWeight:600}}>📈 Bullish</button>
+            <button className="b" onClick={function(){submitCorrection("neutral")}} style={{flex:1,padding:"10px",borderRadius:8,background:"#8E8E9315",color:"#8E8E93",border:"1px solid #8E8E9333",fontSize:12,fontWeight:600}}>➡️ Neutral</button>
+            <button className="b" onClick={function(){submitCorrection("bearish")}} style={{flex:1,padding:"10px",borderRadius:8,background:"#FF3B3015",color:"#FF3B30",border:"1px solid #FF3B3033",fontSize:12,fontWeight:600}}>📉 Bearish</button>
+          </div>
+          <button className="b" onClick={function(){submitCorrection("duplicate")}} style={{width:"100%",padding:"8px",borderRadius:6,background:"#FF950010",color:"#FF9500",border:"1px solid #FF950033",fontSize:11,marginBottom:16}}>🔄 Mark as Duplicate</button>
+          <div style={{fontSize:10,color:"#555",marginBottom:6}}>Why? (optional — helps AI learn)</div>
+          <textarea value={corrCtx} onChange={function(e){sCorrCtx(e.target.value)}} placeholder={"e.g. Oil price surge is bearish for equities due to inflation pressure..."} rows={3} style={{width:"100%",background:"#0A0A0F",border:"1px solid #2A2A35",borderRadius:6,padding:"8px",color:"#E8E8ED",fontSize:11,outline:"none",resize:"vertical",fontFamily:"inherit"}}/>
+          <button className="b" onClick={function(){sCorrUrl(null);sCorrCtx("")}} style={{marginTop:12,width:"100%",padding:"8px",borderRadius:6,background:"transparent",color:"#555",border:"1px solid #2A2A35",fontSize:11}}>Cancel</button>
+        </div>
+      </div>}
+
+      {/* Stock Detail Popup */}
+      {detailSym&&wq[detailSym]&&<div style={{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.7)",zIndex:200,display:"flex",alignItems:"center",justifyContent:"center"}} onClick={function(){sDetailSym(null)}}>
+        <div style={{background:"#14141F",borderRadius:12,padding:24,border:"1px solid #2A2A35",width:600,maxWidth:"95vw",maxHeight:"85vh",overflowY:"auto"}} onClick={function(e){e.stopPropagation()}}>
+          {function(){
+            var q=wq[detailSym];if(!q)return null;var up=q.change>=0;
+            var cd=q.chart||[];
+            // Build SVG chart
+            var cw=550,ch2=220;
+            var chartSvg="";
+            if(cd.length>1){
+              var mn2=999999,mx2=0;
+              cd.forEach(function(d){var hi=d.high||d.close;var lo=d.low||d.close;if(hi>mx2)mx2=hi;if(lo<mn2)mn2=lo});
+              var rn=mx2-mn2||1;
+              if(chartType==="candle"){
+                var bw=Math.max(1,Math.floor(cw/cd.length)-1);
+                chartSvg=cd.map(function(d,i){
+                  var x=Math.floor((i/(cd.length-1))*cw);
+                  var o=d.open||d.close;var c2=d.close;var hi=d.high||Math.max(o,c2);var lo=d.low||Math.min(o,c2);
+                  var yhi=ch2-((hi-mn2)/rn)*ch2;var ylo=ch2-((lo-mn2)/rn)*ch2;
+                  var yo=ch2-((o-mn2)/rn)*ch2;var yc=ch2-((c2-mn2)/rn)*ch2;
+                  var col=c2>=o?"#34C759":"#FF3B30";
+                  var bodyTop=Math.min(yo,yc);var bodyH=Math.max(Math.abs(yc-yo),1);
+                  return '<line x1="'+x+'" y1="'+yhi+'" x2="'+x+'" y2="'+ylo+'" stroke="'+col+'" stroke-width="1"/><rect x="'+(x-bw/2)+'" y="'+bodyTop+'" width="'+bw+'" height="'+bodyH+'" fill="'+col+'"/>';
+                }).join("");
+              }else{
+                var pts=cd.map(function(d,i){return Math.floor((i/(cd.length-1))*cw)+","+Math.floor(ch2-((d.close-mn2)/rn)*ch2)}).join(" ");
+                chartSvg='<polyline points="'+pts+'" fill="none" stroke="'+(up?"#34C759":"#FF3B30")+'" stroke-width="1.5"/>';
+              }
+            }
+            return <div>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}>
+                <div><span style={{fontSize:20,fontWeight:700,color:"#E8E8ED"}}>{detailSym}</span><span style={{fontSize:12,color:"#555",marginLeft:8}}>{q.name}</span></div>
+                <button className="b" onClick={function(){sDetailSym(null)}} style={{fontSize:14,color:"#555",background:"none",padding:"4px 8px"}}>✕</button>
+              </div>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",marginBottom:16}}>
+                <span style={{fontSize:28,fontWeight:700,color:"#E8E8ED",fontFamily:"'Space Grotesk',sans-serif"}}>{"$"+(q.price||0).toLocaleString()}</span>
+                <span style={{fontSize:14,color:up?"#34C759":"#FF3B30",fontWeight:600}}>{up?"▲":"▼"} {q.change} ({q.change_pct}%)</span>
+              </div>
+              <div style={{display:"flex",gap:6,marginBottom:12}}>
+                <button className="b" onClick={function(){sChartType("line")}} style={{padding:"4px 12px",borderRadius:4,fontSize:10,background:chartType==="line"?"#5448C8":"#0A0A0F",color:chartType==="line"?"#fff":"#AAA"}}>Line</button>
+                <button className="b" onClick={function(){sChartType("candle")}} style={{padding:"4px 12px",borderRadius:4,fontSize:10,background:chartType==="candle"?"#5448C8":"#0A0A0F",color:chartType==="candle"?"#fff":"#AAA"}}>Candlestick</button>
+                <div style={{marginLeft:"auto",display:"flex",gap:4}}>
+                  {[["1d","1D"],["5d","5D"],["1mo","1M"],["3mo","3M"],["6mo","6M"],["1y","1Y"]].map(function(p){return <button key={p[0]} className="b" onClick={function(){sRng(p[0]);var item=wl.find(function(w){return w.symbol===detailSym});var atype=item?item.type:"stock";var iv2=p[0]==="1d"?"5m":p[0]==="5d"?"15m":"1d";F("/api/market/quote/"+detailSym+"?type="+atype+"&range="+p[0]+"&interval="+iv2).then(function(d){if(d.quote)sWq(function(pr){var n=Object.assign({},pr);n[detailSym]=d.quote;return n})}).catch(function(){})}} style={{padding:"3px 8px",borderRadius:3,fontSize:9,background:rng===p[0]?"#5448C8":"#0A0A0F",color:rng===p[0]?"#fff":"#555"}}>{p[1]}</button>})}
+                </div>
+              </div>
+              <div style={{background:"#0A0A0F",borderRadius:8,padding:8,marginBottom:16}} dangerouslySetInnerHTML={{__html:'<svg viewBox="0 0 '+cw+' '+ch2+'" width="100%" height="'+ch2+'">'+chartSvg+'</svg>'}}/>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:10}}>
+                {[["Day High","$"+q.day_high],["Day Low","$"+q.day_low],["Prev Close","$"+q.prev_close],["Volume",(q.volume||0).toLocaleString()],["52w High","$"+q.fifty_two_wk_high],["52w Low","$"+q.fifty_two_wk_low],["Exchange",q.exchange||""],["Mkt Cap",q.market_cap?(q.market_cap>1e12?(q.market_cap/1e12).toFixed(1)+"T":q.market_cap>1e9?(q.market_cap/1e9).toFixed(1)+"B":(q.market_cap/1e6).toFixed(0)+"M"):"N/A"],["Type",q.type||"stock"]].map(function(p2){return <div key={p2[0]} style={{fontSize:10}}><span style={{color:"#555"}}>{p2[0]}: </span><span style={{color:"#AAA"}}>{p2[1]}</span></div>})}
+              </div>
+              {sn.length>0&&<div style={{marginTop:16,borderTop:"1px solid #1A1A25",paddingTop:12}}>
+                <div style={{fontSize:10,fontWeight:600,color:"#666",letterSpacing:1,textTransform:"uppercase",marginBottom:8}}>Related News</div>
+                {sn.slice(0,8).map(function(n,i){return <a key={i} href={n.url} target="_blank" rel="noopener noreferrer" style={{display:"block",fontSize:11,color:"#AAA",textDecoration:"none",padding:"4px 0",lineHeight:1.4}}>{n.title} <span style={{fontSize:8,color:"#555"}}>{n.source} · {n.published_at}</span></a>})}
+              </div>}
+            </div>;
+          }()}
+        </div>
+      </div>}
 
     {/* HEADER */}
     <div style={{borderBottom:"1px solid #1A1A25",padding:"14px 24px",display:"flex",alignItems:"center",justifyContent:"space-between",position:"sticky",top:0,background:"#0A0A0F",zIndex:10}}>
@@ -251,12 +352,8 @@ function App(){
                   <span style={{fontSize:10,background:"#1A1A25",padding:"2px 6px",borderRadius:3,color:sr.color}}>{a.source_name||sr.name}</span>
                   <span style={{fontSize:10,background:"#5448C820",padding:"2px 6px",borderRadius:3,color:"#8B80F0"}}>{a.keyword}</span>
                   {a.url&&<a href={a.url} target="_blank" rel="noopener noreferrer" className="sl">↗</a>}
-                  {!a.user_corrected&&<span style={{display:"inline-flex",gap:2,marginLeft:4}}>
-                    <button className="b" onClick={function(e){e.stopPropagation();fetch(API+"/api/data/correct",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({url:a.url,corrected_sentiment:"positive"})}).then(function(r){return r.json()}).then(function(d){if(d.status==="corrected"){tt("Corrected");sAl(function(p){return p.map(function(x){return x.url===a.url?Object.assign({},x,{user_corrected:true}):x})})}}).catch(function(){})}} style={{fontSize:10,padding:"1px 3px",background:"none",color:"#34C759",opacity:0.5}}>👍</button>
-                    <button className="b" onClick={function(e){e.stopPropagation();fetch(API+"/api/data/correct",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({url:a.url,corrected_sentiment:"negative"})}).then(function(r){return r.json()}).then(function(d){if(d.status==="corrected"){tt("Corrected");sAl(function(p){return p.map(function(x){return x.url===a.url?Object.assign({},x,{user_corrected:true}):x})})}}).catch(function(){})}} style={{fontSize:10,padding:"1px 3px",background:"none",color:"#FF3B30",opacity:0.5}}>👎</button>
-                    <button className="b" onClick={function(e){e.stopPropagation();fetch(API+"/api/data/correct",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({url:a.url,corrected_sentiment:"duplicate"})}).then(function(r){return r.json()}).then(function(d){if(d.status==="corrected"){tt("Marked dup");sAl(function(p){return p.map(function(x){return x.url===a.url?Object.assign({},x,{user_corrected:true,is_duplicate:true}):x})})}}).catch(function(){})}} style={{fontSize:10,padding:"1px 3px",background:"none",color:"#FF9500",opacity:0.5}}>🔄</button>
-                  </span>}
-                  {a.user_corrected&&<span style={{fontSize:8,color:a.is_duplicate?"#FF9500":"#34C759"}}>{a.is_duplicate?"🔄 dup":"✓"}</span>}
+                  {!a.user_corrected&&<button className="b" onClick={function(e){e.stopPropagation();sCorrUrl(a.url);sCorrCtx("")}} style={{fontSize:9,padding:"2px 6px",background:"#14141F",color:"#AAA",border:"1px solid #2A2A35",borderRadius:3,marginLeft:4}}>✎ Correct</button>}
+                  {a.user_corrected&&<span style={{fontSize:8,color:a.is_duplicate?"#FF9500":"#34C759"}}>{a.is_duplicate?"🔄 dup":"✓ corrected"}</span>}
                   <span style={{fontSize:10,color:"#444",marginLeft:"auto"}}>{ago(a.timestamp)}</span>
                   {a.published_at&&<span style={{fontSize:9,color:"#555"}}>📅 {a.published_at}</span>}
                 </div>
@@ -267,7 +364,16 @@ function App(){
 
         {/* ═══ MARKETS ═══ */}
         {mv==="market"&&<div style={{flex:1,overflowY:"auto",padding:20}}>
-          <div style={{fontSize:10,fontWeight:600,color:"#666",letterSpacing:2,marginBottom:12,textTransform:"uppercase"}}>Indices</div>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
+            <div style={{fontSize:10,fontWeight:600,color:"#666",letterSpacing:2,textTransform:"uppercase"}}>Indices</div>
+            <button className="b" onClick={function(){sShowIdxPick(!showIdxPick)}} style={{fontSize:10,color:"#555",background:"none",padding:"2px 6px"}}>⚙ customize</button>
+          </div>
+          {showIdxPick&&idxCfg&&<div style={{background:"#0F0F18",borderRadius:8,padding:12,border:"1px solid #1A1A25",marginBottom:12}}>
+            <div style={{fontSize:9,color:"#666",marginBottom:8,textTransform:"uppercase"}}>Select indices to display</div>
+            <div style={{display:"flex",flexWrap:"wrap",gap:6}}>
+              {Object.keys(idxCfg.available||{}).map(function(sym){var isOn=(idxCfg.selected||[]).indexOf(sym)!==-1;return <button key={sym} className="b" onClick={function(){var cur=idxCfg.selected||[];var nxt=isOn?cur.filter(function(x){return x!==sym}):cur.concat([sym]);if(nxt.length===0)return;fetch(API+"/api/market/indices/config",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({selected:nxt})}).then(function(r){return r.json()}).then(function(d){if(d.selected)sIdxCfg(Object.assign({},idxCfg,{selected:d.selected}));tt("Indices updated")}).catch(function(){})}} style={{padding:"4px 8px",borderRadius:4,fontSize:9,background:isOn?"#1A2A1A":"#14141F",color:isOn?"#34C759":"#555",border:"1px solid "+(isOn?"#34C75933":"#2A2A35")}}>{(idxCfg.available||{})[sym]||sym}</button>})}
+            </div>
+          </div>}
           <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(200px,1fr))",gap:10,marginBottom:24}}>
             {Object.keys(idx).map(function(sym){var q=idx[sym];var up=q.change>=0;return <div key={sym} style={{background:"#0F0F18",borderRadius:8,padding:14,border:"1px solid #1A1A25"}}><div style={{display:"flex",justifyContent:"space-between",marginBottom:6}}><span style={{fontSize:11,fontWeight:600,color:"#E8E8ED"}}>{q.name||sym}</span></div><div style={{fontSize:20,fontWeight:700,color:"#E8E8ED",fontFamily:"'Space Grotesk',sans-serif"}}>{"$"+(q.price||0).toLocaleString()}</div><div style={{fontSize:12,color:up?"#34C759":"#FF3B30",fontWeight:600,marginBottom:8}}>{up?"▲":"▼"} {q.change} ({q.change_pct}%)</div><Sp data={q.chart} width={180} height={40} color={up?"#34C759":"#FF3B30"}/></div>})}
           </div>
@@ -280,7 +386,7 @@ function App(){
           </div>
           {ade&&<div style={{fontSize:10,color:"#FF3B30",marginBottom:10}}>{ade}</div>}
           <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(280px,1fr))",gap:10,marginBottom:24}}>
-            {wl.map(function(item){var sym=item.symbol,q=wq[sym];if(!q)return <div key={sym} style={{background:"#0F0F18",borderRadius:8,padding:14,border:"1px solid #1A1A25",display:"flex",justifyContent:"space-between",alignItems:"center"}}><span style={{color:"#555",fontSize:11}}>{sym} — loading...</span><span className="kt" onClick={function(){fetch(API+"/api/market/watchlist",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({remove:sym})}).then(function(r){return r.json()}).then(function(d){if(d.watchlist)sWl(d.watchlist)}).catch(function(){});sWq(function(p){var n=Object.assign({},p);delete n[sym];return n})}} style={{fontSize:10,color:"#FF3B30",padding:"2px 6px",cursor:"pointer"}}>✕</span></div>;var up=q.change>=0,isSel=sel===sym;return <div key={sym} className="st" onClick={function(){sSel(sel===sym?null:sym);sSn([]);var atype=item.type||"stock";var iv2=rng==="1d"?"5m":rng==="5d"?"15m":"1d";F("/api/market/quote/"+sym+"?type="+atype+"&range="+rng+"&interval="+iv2).then(function(d){if(d.quote)sWq(function(p){var n=Object.assign({},p);n[sym]=d.quote;return n})}).catch(function(){});F("/api/market/news?symbol="+sym).then(function(d){if(d.articles)sSn(d.articles)}).catch(function(){})}} style={{background:isSel?"#14141F":"#0F0F18",borderRadius:8,padding:14,border:isSel?"1px solid #5448C8":"1px solid #1A1A25",cursor:"pointer"}}><div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}><div><span style={{fontSize:14,fontWeight:700,color:"#E8E8ED"}}>{sym}</span><span style={{fontSize:10,color:"#555",marginLeft:6}}>{q.name}</span></div><span className="kt" onClick={function(e){e.stopPropagation();fetch(API+"/api/market/watchlist",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({remove:sym})}).then(function(r){return r.json()}).then(function(d){if(d.watchlist)sWl(d.watchlist)}).catch(function(){});sWq(function(p){var n=Object.assign({},p);delete n[sym];return n})}} style={{fontSize:10,color:"#555"}}>✕</span></div><div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",marginBottom:8}}><span style={{fontSize:20,fontWeight:700,color:"#E8E8ED",fontFamily:"'Space Grotesk',sans-serif"}}>{"$"+(q.price||0).toLocaleString()}</span><span style={{fontSize:12,color:up?"#34C759":"#FF3B30",fontWeight:600}}>{up?"▲":"▼"} {q.change} ({q.change_pct}%)</span></div><Sp data={q.chart} width={250} height={50} color={up?"#34C759":"#FF3B30"}/>{isSel&&sn.length>0&&<div style={{marginTop:10,borderTop:"1px solid #1A1A25",paddingTop:8}}><div style={{fontSize:9,color:"#666",marginBottom:6,textTransform:"uppercase"}}>News</div>{sn.slice(0,5).map(function(n,i){return <a key={i} href={n.url} target="_blank" rel="noopener noreferrer" style={{display:"block",fontSize:10,color:"#AAA",textDecoration:"none",padding:"3px 0",lineHeight:1.4}}>{n.title} <span style={{fontSize:8,color:"#555"}}>{n.source}</span></a>})}</div>}</div>})}
+            {wl.map(function(item){var sym=item.symbol,q=wq[sym];if(!q)return <div key={sym} style={{background:"#0F0F18",borderRadius:8,padding:14,border:"1px solid #1A1A25",display:"flex",justifyContent:"space-between",alignItems:"center"}}><span style={{color:"#555",fontSize:11}}>{sym} — loading...</span><span className="kt" onClick={function(){fetch(API+"/api/market/watchlist",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({remove:sym})}).then(function(r){return r.json()}).then(function(d){if(d.watchlist)sWl(d.watchlist)}).catch(function(){});sWq(function(p){var n=Object.assign({},p);delete n[sym];return n})}} style={{fontSize:10,color:"#FF3B30",padding:"2px 6px",cursor:"pointer"}}>✕</span></div>;var up=q.change>=0;return <div key={sym} className="st" onClick={function(){sDetailSym(sym);sSn([]);var atype=item.type||"stock";var iv2=rng==="1d"?"5m":rng==="5d"?"15m":"1d";F("/api/market/quote/"+sym+"?type="+atype+"&range="+rng+"&interval="+iv2).then(function(d){if(d.quote)sWq(function(p){var n=Object.assign({},p);n[sym]=d.quote;return n})}).catch(function(){});F("/api/market/news?symbol="+sym).then(function(d){if(d.articles)sSn(d.articles)}).catch(function(){})}} style={{background:"#0F0F18",borderRadius:8,padding:14,border:"1px solid #1A1A25",cursor:"pointer"}}><div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}><div><span style={{fontSize:14,fontWeight:700,color:"#E8E8ED"}}>{q.type==="crypto"?"₿ ":""}{sym}</span><span style={{fontSize:10,color:"#555",marginLeft:6}}>{q.name}</span></div><span className="kt" onClick={function(e){e.stopPropagation();fetch(API+"/api/market/watchlist",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({remove:sym})}).then(function(r){return r.json()}).then(function(d){if(d.watchlist)sWl(d.watchlist)}).catch(function(){});sWq(function(p){var n=Object.assign({},p);delete n[sym];return n})}} style={{fontSize:10,color:"#555"}}>✕</span></div><div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",marginBottom:8}}><span style={{fontSize:20,fontWeight:700,color:"#E8E8ED",fontFamily:"'Space Grotesk',sans-serif"}}>{"$"+(q.price||0).toLocaleString()}</span><span style={{fontSize:12,color:up?"#34C759":"#FF3B30",fontWeight:600}}>{up?"▲":"▼"} {q.change} ({q.change_pct}%)</span></div><Sp data={q.chart} width={250} height={50} color={up?"#34C759":"#FF3B30"}/></div>})}
           </div>
           <div style={{fontSize:10,fontWeight:600,color:"#666",letterSpacing:2,marginBottom:10,textTransform:"uppercase"}}>Market News</div>
           <div style={{display:"flex",gap:4,flexWrap:"wrap",marginBottom:8}}>{Object.keys(mns).map(function(id){var s2=mns[id];return <button key={id} className="b" onClick={function(){fetch(API+"/api/market/news-sources",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({toggle:id})}).then(function(r){return r.json()}).then(function(d){if(d.sources)sMns(d.sources)}).catch(function(){})}} style={{fontSize:8,padding:"2px 6px",borderRadius:3,background:s2.enabled?"#1A2A1A":"#14141F",color:s2.enabled?"#34C759":"#555"}}>{s2.name}</button>})}</div>
@@ -342,7 +448,7 @@ function App(){
               <div style={{fontSize:10,fontWeight:600,color:"#666",letterSpacing:2,marginBottom:10,textTransform:"uppercase"}}>Misfires</div>
               {(acd.signal_word_misfires.adjustments||[]).length>0?(acd.signal_word_misfires.adjustments||[]).map(function(adj,i){return <div key={i} style={{background:"#0F0F18",borderRadius:6,padding:10,border:"1px solid #1A1A25",marginBottom:6,display:"flex",justifyContent:"space-between"}}><span style={{color:adj.current_type==="positive"?"#34C759":"#FF3B30"}}>"{adj.word}" x{adj.misfire_count}</span><span style={{fontSize:9,color:"#FF9500"}}>⚠</span></div>}):<div style={{fontSize:11,color:"#555"}}>None yet</div>}
             </div>}
-            <div style={{background:"#0F0F18",borderRadius:8,padding:16,border:"1px solid #1A1A25",fontSize:11,color:"#555",lineHeight:1.6}}>Use 👍👎 on alerts to build correction data. After 10+ corrections, patterns appear here. Click Recalibrate to auto-fix misfiring word weights.</div>
+            <div style={{background:"#0F0F18",borderRadius:8,padding:16,border:"1px solid #1A1A25",fontSize:11,color:"#555",lineHeight:1.6}}>Click "✎ Correct" on any alert to fix wrong classifications. Choose bullish/neutral/bearish and optionally explain why. After 10+ corrections, patterns appear here. Click Recalibrate to auto-fix misfiring word weights.</div>
           </div>}
         </div>}
 

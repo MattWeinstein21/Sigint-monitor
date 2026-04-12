@@ -21,6 +21,9 @@
   .src-link{color:#5A8FD4;text-decoration:none;font-size:10px;font-family:inherit;transition:color .15s;display:inline-flex;align-items:center;gap:3px;padding:2px 7px;border-radius:3px;background:#5A8FD412;border:1px solid #5A8FD422}
   .src-link:hover{color:#A0C8FF;background:#5A8FD425;text-decoration:none}
   select{appearance:none;-webkit-appearance:none}
+  @keyframes thinkingDots{0%{content:'.'} 33%{content:'..'} 66%{content:'...'}100%{content:'.'}}
+  .thinking::after{content:'.';animation:thinkingDots 1.2s infinite steps(1)}
+  .chat-msg{animation:slideIn .2s ease-out}
 </style>
 </head>
 <body>
@@ -100,9 +103,8 @@ function App() {
   const [selectedStock, setSelectedStock] = useState(null);
   const [selectedRange, setSelectedRange] = useState("1d");
   const [chatQuestion, setChatQuestion] = useState("");
-  const [chatAlertId, setChatAlertId] = useState(null);
-  const [chatAnswer, setChatAnswer] = useState("");
-  const [chatLoading, setChatLoading] = useState(false);
+  const [chatHistories, setChatHistories] = useState({});  // {alertId: [{role:"user",text:"..."},{role:"ai",text:"..."},...]}
+  const [chatLoading, setChatLoading] = useState(null);  // alertId or null
   const [csvSetId, setCsvSetId] = useState("custom");
   const [csvNewLabel, setCsvNewLabel] = useState("");
   const [toast, setToast] = useState("");
@@ -344,10 +346,39 @@ function App() {
   // Ollama chat
   const askFollowUp = (alertId) => {
     if (!chatQuestion.trim()) return;
-    setChatLoading(true); setChatAlertId(alertId); setChatAnswer("");
-    fetch(API_BASE + "/api/chat", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ alert_id: alertId, question: chatQuestion }) })
-      .then(r => r.json()).then(d => { setChatAnswer(d.answer || d.error || "No response"); setChatLoading(false); })
-      .catch(() => { setChatAnswer("Failed to reach Ollama"); setChatLoading(false); });
+    const question = chatQuestion.trim();
+    setChatQuestion("");
+    setChatLoading(alertId);
+
+    // Add user message to history immediately
+    setChatHistories(prev => {
+      const history = prev[alertId] || [];
+      return {...prev, [alertId]: [...history, {role: "user", text: question}]};
+    });
+
+    // Get current history for context
+    const currentHistory = chatHistories[alertId] || [];
+
+    fetch(API_BASE + "/api/chat", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ alert_id: alertId, question, history: currentHistory })
+    })
+      .then(r => r.json())
+      .then(d => {
+        const answer = d.answer || d.error || "No response";
+        setChatHistories(prev => {
+          const history = prev[alertId] || [];
+          return {...prev, [alertId]: [...history, {role: "ai", text: answer}]};
+        });
+        setChatLoading(null);
+      })
+      .catch(() => {
+        setChatHistories(prev => {
+          const history = prev[alertId] || [];
+          return {...prev, [alertId]: [...history, {role: "ai", text: "Failed to reach Ollama"}]};
+        });
+        setChatLoading(null);
+      });
   };
 
   // CSV import
@@ -645,16 +676,54 @@ function App() {
                             <div style={{ fontSize: 11, color: "#BBB", lineHeight: 1.6, padding: "8px 10px", background: "#0F0F18", borderRadius: 6, borderLeft: "2px solid " + sentColor + "66" }}>
                               {a.summary}
                             </div>
-                            {/* Ollama follow-up chat */}
-                            <div style={{ display: "flex", gap: 4, marginTop: 6 }}>
-                              <input value={chatAlertId === a.id ? chatQuestion : ""} onChange={e => { setChatAlertId(a.id); setChatQuestion(e.target.value); }} onKeyDown={e => e.key === "Enter" && askFollowUp(a.id)} placeholder="Ask a follow-up question..." style={{ flex: 1, background: "#14141F", border: "1px solid #2A2A35", borderRadius: 4, padding: "4px 8px", color: "#E8E8ED", fontSize: 10, outline: "none", fontFamily: "inherit" }} />
-                              <button className="btn" onClick={() => askFollowUp(a.id)} disabled={chatLoading} style={{ background: "#5448C8", color: "#fff", padding: "4px 10px", borderRadius: 4, fontSize: 10, opacity: chatLoading ? 0.5 : 1 }}>{chatLoading && chatAlertId === a.id ? "..." : "Ask"}</button>
-                            </div>
-                            {chatAlertId === a.id && chatAnswer && (
-                              <div style={{ fontSize: 10, color: "#AAA", lineHeight: 1.5, padding: "6px 10px", background: "#0A0A14", borderRadius: 4, marginTop: 4, borderLeft: "2px solid #5448C866" }}>
-                                🤖 {chatAnswer}
+
+                            {/* Chat conversation thread */}
+                            <div style={{ marginTop: 8 }}>
+                              {/* Chat history */}
+                              {(chatHistories[a.id] || []).map((msg, i) => (
+                                <div key={i} className="chat-msg" style={{ display: "flex", justifyContent: msg.role === "user" ? "flex-end" : "flex-start", marginBottom: 6 }}>
+                                  <div style={{
+                                    maxWidth: "85%",
+                                    padding: "6px 10px",
+                                    borderRadius: msg.role === "user" ? "8px 8px 2px 8px" : "8px 8px 8px 2px",
+                                    background: msg.role === "user" ? "#5448C8" : "#0A0A14",
+                                    color: msg.role === "user" ? "#fff" : "#AAA",
+                                    fontSize: 10,
+                                    lineHeight: 1.5,
+                                    border: msg.role === "user" ? "none" : "1px solid #1A1A25",
+                                  }}>
+                                    {msg.role === "ai" && <span style={{ fontSize: 8, color: "#8B80F0", marginRight: 4 }}>🤖</span>}
+                                    {msg.text}
+                                  </div>
+                                </div>
+                              ))}
+
+                              {/* Thinking indicator */}
+                              {chatLoading === a.id && (
+                                <div className="chat-msg" style={{ display: "flex", justifyContent: "flex-start", marginBottom: 6 }}>
+                                  <div style={{ padding: "6px 10px", borderRadius: "8px 8px 8px 2px", background: "#0A0A14", border: "1px solid #1A1A25", fontSize: 10, color: "#8B80F0" }}>
+                                    <span style={{ fontSize: 8, marginRight: 4 }}>🤖</span>
+                                    <span className="thinking">Thinking</span>
+                                  </div>
+                                </div>
+                              )}
+
+                              {/* Input */}
+                              <div style={{ display: "flex", gap: 4, marginTop: 4 }}>
+                                <input
+                                  value={chatLoading === a.id ? "" : chatQuestion}
+                                  onChange={e => setChatQuestion(e.target.value)}
+                                  onKeyDown={e => e.key === "Enter" && askFollowUp(a.id)}
+                                  onFocus={() => {}}
+                                  placeholder={chatHistories[a.id]?.length ? "Ask another question..." : "Ask about this article..."}
+                                  disabled={chatLoading === a.id}
+                                  style={{ flex: 1, background: "#14141F", border: "1px solid #2A2A35", borderRadius: 6, padding: "5px 8px", color: "#E8E8ED", fontSize: 10, outline: "none", fontFamily: "inherit", opacity: chatLoading === a.id ? 0.5 : 1 }}
+                                />
+                                <button className="btn" onClick={() => askFollowUp(a.id)} disabled={chatLoading === a.id} style={{ background: "#5448C8", color: "#fff", padding: "5px 10px", borderRadius: 6, fontSize: 10, opacity: chatLoading === a.id ? 0.5 : 1 }}>
+                                  {chatLoading === a.id ? "..." : "Ask"}
+                                </button>
                               </div>
-                            )}
+                            </div>
                           </div>
                         )}
                       </div>

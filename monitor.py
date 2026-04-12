@@ -1473,11 +1473,16 @@ def import_signal_csv():
 def ollama_chat():
     """
     Ask a follow-up question about an article using Ollama.
-    Expects: {"alert_id": 123456, "question": "What sectors are affected?"}
+    Expects: {
+        "alert_id": 123456,
+        "question": "What sectors are affected?",
+        "history": [{"role":"user","text":"..."}, {"role":"ai","text":"..."}]
+    }
     """
     data = request.get_json(silent=True) or {}
     question = data.get("question", "").strip()
     alert_id = data.get("alert_id")
+    history = data.get("history", [])
 
     config = load_config()
     ollama_url = config.get("ollama_url", "")
@@ -1499,13 +1504,21 @@ def ollama_chat():
     if not context:
         context = "No specific article context available."
 
+    # Build conversation history for context
+    conv_text = ""
+    for msg in history[-10:]:  # Last 10 messages to keep prompt manageable
+        role = "User" if msg.get("role") == "user" else "Assistant"
+        conv_text += f"\n{role}: {msg.get('text', '')}"
+
     try:
         prompt = (
             f"You are a financial market analyst. Based on the following article, answer the user's question concisely.\n\n"
-            f"Article Context:\n{context}\n\n"
-            f"User Question: {question}\n\n"
-            f"Answer:"
+            f"Article Context:\n{context}\n"
         )
+        if conv_text:
+            prompt += f"\nPrevious conversation:{conv_text}\n"
+        prompt += f"\nUser: {question}\n\nAssistant:"
+
         resp = requests.post(
             f"{ollama_url.rstrip('/')}/api/generate",
             json={"model": ollama_model, "prompt": prompt, "stream": False},

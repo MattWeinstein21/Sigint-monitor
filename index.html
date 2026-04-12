@@ -112,6 +112,10 @@ function App() {
   const [newSetName, setNewSetName] = useState("");
   const [inlineAddWord, setInlineAddWord] = useState({});
   const [accuracyData, setAccuracyData] = useState(null);
+  const [fgData, setFgData] = useState(null);
+  const [fredData, setFredData] = useState(null);
+  const [hnStories, setHnStories] = useState([]);
+  const [binanceTicker, setBinanceTicker] = useState(null);
   const [, setTick] = useState(0);
 
   const showToast = (msg) => { setToast(msg); setTimeout(() => setToast(""), 3000); };
@@ -415,6 +419,15 @@ function App() {
     if (mainView !== "analytics") return;
     fetch(API_BASE + "/api/data/accuracy")
       .then(r => r.json()).then(d => setAccuracyData(d)).catch(() => {});
+  }, [mainView]);
+
+  // Economy data loading
+  useEffect(() => {
+    if (mainView !== "economy") return;
+    fetch(API_BASE + "/api/market/fear-greed").then(r => r.json()).then(d => { if (d.fear_greed) setFgData(d.fear_greed); }).catch(() => {});
+    fetch(API_BASE + "/api/economy/fred-dashboard").then(r => r.json()).then(d => { if (d.indicators) setFredData(d.indicators); }).catch(() => {});
+    fetch(API_BASE + "/api/news/hackernews?limit=10").then(r => r.json()).then(d => { if (d.stories) setHnStories(d.stories); }).catch(() => {});
+    fetch(API_BASE + "/api/crypto/binance/BTC").then(r => r.json()).then(d => { if (!d.error) setBinanceTicker(d); }).catch(() => {});
   }, [mainView]);
 
   const applyRecalibration = () => {
@@ -1000,87 +1013,71 @@ function App() {
           <div style={{ flex: 1, overflowY: "auto", padding: 20 }}>
             <div style={{ fontSize: 10, fontWeight: 600, color: "#666", letterSpacing: 2, marginBottom: 16, textTransform: "uppercase" }}>Economic Indicators & Market Context</div>
 
-            {/* Fear & Greed + HN + FRED loaded on mount */}
-            {(() => {
-              const [fg, setFg] = useState(null);
-              const [fredData, setFredData] = useState(null);
-              const [hnStories, setHnStories] = useState([]);
-              const [binanceTicker, setBinanceTicker] = useState(null);
-
-              useEffect(() => {
-                fetch(API_BASE + "/api/market/fear-greed").then(r => r.json()).then(d => setFg(d.fear_greed)).catch(() => {});
-                fetch(API_BASE + "/api/economy/fred-dashboard").then(r => r.json()).then(d => setFredData(d.indicators)).catch(() => {});
-                fetch(API_BASE + "/api/news/hackernews?limit=10").then(r => r.json()).then(d => setHnStories(d.stories || [])).catch(() => {});
-                fetch(API_BASE + "/api/crypto/binance/BTC").then(r => r.json()).then(d => { if (!d.error) setBinanceTicker(d); }).catch(() => {});
-              }, []);
-
-              const fgValue = fg && fg[0] ? fg[0].value : null;
-              const fgLabel = fg && fg[0] ? fg[0].label : "";
-              const fgColor = fgValue ? (fgValue >= 70 ? "#34C759" : fgValue >= 45 ? "#FF9500" : "#FF3B30") : "#555";
-
-              return (<>
-                {/* Top row: Fear & Greed + BTC Binance */}
-                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 20 }}>
-                  <div style={{ background: "#0F0F18", borderRadius: 8, padding: 16, border: "1px solid #1A1A25", textAlign: "center" }}>
-                    <div style={{ fontSize: 9, color: "#666", letterSpacing: 1, textTransform: "uppercase", marginBottom: 8 }}>Crypto Fear & Greed Index</div>
-                    {fgValue !== null ? (<>
-                      <div style={{ fontSize: 36, fontWeight: 700, color: fgColor, fontFamily: "'Space Grotesk',sans-serif" }}>{fgValue}</div>
-                      <div style={{ fontSize: 12, color: fgColor, fontWeight: 600 }}>{fgLabel}</div>
-                      {fg && fg.length > 1 && <div style={{ fontSize: 9, color: "#555", marginTop: 4 }}>Yesterday: {fg[1]?.value} ({fg[1]?.label})</div>}
-                    </>) : <div style={{ color: "#555", fontSize: 11 }}>Loading...</div>}
+            {/* Top row: Fear & Greed + BTC Binance */}
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 20 }}>
+              <div style={{ background: "#0F0F18", borderRadius: 8, padding: 16, border: "1px solid #1A1A25", textAlign: "center" }}>
+                <div style={{ fontSize: 9, color: "#666", letterSpacing: 1, textTransform: "uppercase", marginBottom: 8 }}>Crypto Fear & Greed Index</div>
+                {fgData && fgData[0] ? (() => {
+                  const fgValue = fgData[0].value;
+                  const fgLabel = fgData[0].label;
+                  const fgColor = fgValue >= 70 ? "#34C759" : fgValue >= 45 ? "#FF9500" : "#FF3B30";
+                  return (<>
+                    <div style={{ fontSize: 36, fontWeight: 700, color: fgColor, fontFamily: "'Space Grotesk',sans-serif" }}>{fgValue}</div>
+                    <div style={{ fontSize: 12, color: fgColor, fontWeight: 600 }}>{fgLabel}</div>
+                    {fgData.length > 1 && <div style={{ fontSize: 9, color: "#555", marginTop: 4 }}>Yesterday: {fgData[1]?.value} ({fgData[1]?.label})</div>}
+                  </>);
+                })() : <div style={{ color: "#555", fontSize: 11 }}>Loading...</div>}
+              </div>
+              <div style={{ background: "#0F0F18", borderRadius: 8, padding: 16, border: "1px solid #1A1A25", textAlign: "center" }}>
+                <div style={{ fontSize: 9, color: "#666", letterSpacing: 1, textTransform: "uppercase", marginBottom: 8 }}>BTC/USDT (Binance)</div>
+                {binanceTicker ? (<>
+                  <div style={{ fontSize: 28, fontWeight: 700, color: "#E8E8ED", fontFamily: "'Space Grotesk',sans-serif" }}>${binanceTicker.price?.toLocaleString()}</div>
+                  <div style={{ fontSize: 12, color: binanceTicker.change_pct_24h >= 0 ? "#34C759" : "#FF3B30", fontWeight: 600 }}>
+                    {binanceTicker.change_pct_24h >= 0 ? "▲" : "▼"} {binanceTicker.change_pct_24h}%
                   </div>
-                  <div style={{ background: "#0F0F18", borderRadius: 8, padding: 16, border: "1px solid #1A1A25", textAlign: "center" }}>
-                    <div style={{ fontSize: 9, color: "#666", letterSpacing: 1, textTransform: "uppercase", marginBottom: 8 }}>BTC/USDT (Binance)</div>
-                    {binanceTicker ? (<>
-                      <div style={{ fontSize: 28, fontWeight: 700, color: "#E8E8ED", fontFamily: "'Space Grotesk',sans-serif" }}>${binanceTicker.price?.toLocaleString()}</div>
-                      <div style={{ fontSize: 12, color: binanceTicker.change_pct_24h >= 0 ? "#34C759" : "#FF3B30", fontWeight: 600 }}>
-                        {binanceTicker.change_pct_24h >= 0 ? "▲" : "▼"} {binanceTicker.change_pct_24h}%
+                  <div style={{ fontSize: 9, color: "#555", marginTop: 4 }}>Vol: ${Math.round(binanceTicker.quote_volume_24h / 1e9)}B · {binanceTicker.trades_24h?.toLocaleString()} trades</div>
+                </>) : <div style={{ color: "#555", fontSize: 11 }}>Loading...</div>}
+              </div>
+            </div>
+
+            {/* FRED Economic Indicators */}
+            {fredData ? (
+              <div style={{ marginBottom: 20 }}>
+                <div style={{ fontSize: 10, fontWeight: 600, color: "#666", letterSpacing: 2, marginBottom: 10, textTransform: "uppercase" }}>FRED Economic Data</div>
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(180px, 1fr))", gap: 10 }}>
+                  {Object.entries(fredData).map(([id, d]) => (
+                    <div key={id} style={{ background: "#0F0F18", borderRadius: 8, padding: 12, border: "1px solid #1A1A25" }}>
+                      <div style={{ fontSize: 9, color: "#555", marginBottom: 4 }}>{d.label}</div>
+                      <div style={{ fontSize: 20, fontWeight: 700, color: "#E8E8ED", fontFamily: "'Space Grotesk',sans-serif" }}>
+                        {d.value != null ? d.value.toLocaleString() : "N/A"}
                       </div>
-                      <div style={{ fontSize: 9, color: "#555", marginTop: 4 }}>Vol: ${Math.round(binanceTicker.quote_volume_24h / 1e9)}B · {binanceTicker.trades_24h?.toLocaleString()} trades</div>
-                    </>) : <div style={{ color: "#555", fontSize: 11 }}>Loading...</div>}
-                  </div>
-                </div>
-
-                {/* FRED Economic Indicators */}
-                {fredData ? (
-                  <div style={{ marginBottom: 20 }}>
-                    <div style={{ fontSize: 10, fontWeight: 600, color: "#666", letterSpacing: 2, marginBottom: 10, textTransform: "uppercase" }}>FRED Economic Data</div>
-                    <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(180px, 1fr))", gap: 10 }}>
-                      {Object.entries(fredData).map(([id, d]) => (
-                        <div key={id} style={{ background: "#0F0F18", borderRadius: 8, padding: 12, border: "1px solid #1A1A25" }}>
-                          <div style={{ fontSize: 9, color: "#555", marginBottom: 4 }}>{d.label}</div>
-                          <div style={{ fontSize: 20, fontWeight: 700, color: "#E8E8ED", fontFamily: "'Space Grotesk',sans-serif" }}>
-                            {d.value != null ? d.value.toLocaleString() : "N/A"}
-                          </div>
-                          {d.change != null && <div style={{ fontSize: 10, color: d.change >= 0 ? "#34C759" : "#FF3B30" }}>
-                            {d.change >= 0 ? "▲" : "▼"} {d.change}
-                          </div>}
-                          <div style={{ fontSize: 8, color: "#444" }}>{d.date}</div>
-                        </div>
-                      ))}
+                      {d.change != null && <div style={{ fontSize: 10, color: d.change >= 0 ? "#34C759" : "#FF3B30" }}>
+                        {d.change >= 0 ? "▲" : "▼"} {d.change}
+                      </div>}
+                      <div style={{ fontSize: 8, color: "#444" }}>{d.date}</div>
                     </div>
-                  </div>
-                ) : <div style={{ color: "#555", fontSize: 11, marginBottom: 12 }}>Add fred_api_key to config.json for economic indicators (free at fred.stlouisfed.org)</div>}
-
-                {/* Hacker News */}
-                <div>
-                  <div style={{ fontSize: 10, fontWeight: 600, color: "#666", letterSpacing: 2, marginBottom: 10, textTransform: "uppercase" }}>Hacker News — Top Stories</div>
-                  {hnStories.length > 0 ? (
-                    <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-                      {hnStories.map((s, i) => (
-                        <a key={i} href={s.url} target="_blank" rel="noopener noreferrer" style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 10px", background: "#0F0F18", borderRadius: 6, border: "1px solid #1A1A25", textDecoration: "none" }}>
-                          <span style={{ fontSize: 11, color: "#FF9500", fontWeight: 600, minWidth: 30, textAlign: "right" }}>▲{s.score}</span>
-                          <div style={{ flex: 1 }}>
-                            <div style={{ fontSize: 12, color: "#E8E8ED", lineHeight: 1.3 }}>{s.title}</div>
-                            <div style={{ fontSize: 9, color: "#555" }}>{s.comments} comments · {s.by}</div>
-                          </div>
-                        </a>
-                      ))}
-                    </div>
-                  ) : <div style={{ color: "#555", fontSize: 11 }}>Loading...</div>}
+                  ))}
                 </div>
-              </>);
-            })()}
+              </div>
+            ) : <div style={{ color: "#555", fontSize: 11, marginBottom: 12 }}>Add fred_api_key to config.json for economic indicators (free at fred.stlouisfed.org)</div>}
+
+            {/* Hacker News */}
+            <div>
+              <div style={{ fontSize: 10, fontWeight: 600, color: "#666", letterSpacing: 2, marginBottom: 10, textTransform: "uppercase" }}>Hacker News — Top Stories</div>
+              {hnStories.length > 0 ? (
+                <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                  {hnStories.map((s, i) => (
+                    <a key={i} href={s.url} target="_blank" rel="noopener noreferrer" style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 10px", background: "#0F0F18", borderRadius: 6, border: "1px solid #1A1A25", textDecoration: "none" }}>
+                      <span style={{ fontSize: 11, color: "#FF9500", fontWeight: 600, minWidth: 30, textAlign: "right" }}>▲{s.score}</span>
+                      <div style={{ flex: 1 }}>
+                        <div style={{ fontSize: 12, color: "#E8E8ED", lineHeight: 1.3 }}>{s.title}</div>
+                        <div style={{ fontSize: 9, color: "#555" }}>{s.comments} comments · {s.by}</div>
+                      </div>
+                    </a>
+                  ))}
+                </div>
+              ) : <div style={{ color: "#555", fontSize: 11 }}>Loading...</div>}
+            </div>
           </div>
           )}
 

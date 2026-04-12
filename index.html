@@ -96,7 +96,7 @@ function App() {
   const [configTab, setConfigTab] = useState("general");
   const [expandedAlerts, setExpandedAlerts] = useState(new Set());
   const [newSignalSentiment, setNewSignalSentiment] = useState("positive");
-  const [mainView, setMainView] = useState("alerts"); // "alerts" | "market" | "analytics"
+  const [mainView, setMainView] = useState("alerts"); // "alerts" | "market" | "economy" | "analytics"
   const [indices, setIndices] = useState({});
   const [watchlist, setWatchlist] = useState([]);
   const [watchlistQuotes, setWatchlistQuotes] = useState({});
@@ -1017,16 +1017,11 @@ function App() {
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 20 }}>
               <div style={{ background: "#0F0F18", borderRadius: 8, padding: 16, border: "1px solid #1A1A25", textAlign: "center" }}>
                 <div style={{ fontSize: 9, color: "#666", letterSpacing: 1, textTransform: "uppercase", marginBottom: 8 }}>Crypto Fear & Greed Index</div>
-                {fgData && fgData[0] ? (() => {
-                  const fgValue = fgData[0].value;
-                  const fgLabel = fgData[0].label;
-                  const fgColor = fgValue >= 70 ? "#34C759" : fgValue >= 45 ? "#FF9500" : "#FF3B30";
-                  return (<>
-                    <div style={{ fontSize: 36, fontWeight: 700, color: fgColor, fontFamily: "'Space Grotesk',sans-serif" }}>{fgValue}</div>
-                    <div style={{ fontSize: 12, color: fgColor, fontWeight: 600 }}>{fgLabel}</div>
-                    {fgData.length > 1 && <div style={{ fontSize: 9, color: "#555", marginTop: 4 }}>Yesterday: {fgData[1]?.value} ({fgData[1]?.label})</div>}
-                  </>);
-                })() : <div style={{ color: "#555", fontSize: 11 }}>Loading...</div>}
+                {fgData && fgData[0] ? (<>
+                  <div style={{ fontSize: 36, fontWeight: 700, color: fgData[0].value >= 70 ? "#34C759" : fgData[0].value >= 45 ? "#FF9500" : "#FF3B30", fontFamily: "'Space Grotesk',sans-serif" }}>{fgData[0].value}</div>
+                  <div style={{ fontSize: 12, color: fgData[0].value >= 70 ? "#34C759" : fgData[0].value >= 45 ? "#FF9500" : "#FF3B30", fontWeight: 600 }}>{fgData[0].label}</div>
+                  {fgData.length > 1 && <div style={{ fontSize: 9, color: "#555", marginTop: 4 }}>Yesterday: {fgData[1].value} ({fgData[1].label})</div>}
+                </>) : <div style={{ color: "#555", fontSize: 11 }}>Loading...</div>}
               </div>
               <div style={{ background: "#0F0F18", borderRadius: 8, padding: 16, border: "1px solid #1A1A25", textAlign: "center" }}>
                 <div style={{ fontSize: 9, color: "#666", letterSpacing: 1, textTransform: "uppercase", marginBottom: 8 }}>BTC/USDT (Binance)</div>
@@ -1041,7 +1036,7 @@ function App() {
             </div>
 
             {/* FRED Economic Indicators */}
-            {fredData ? (
+            {fredData && Object.keys(fredData).length > 0 ? (
               <div style={{ marginBottom: 20 }}>
                 <div style={{ fontSize: 10, fontWeight: 600, color: "#666", letterSpacing: 2, marginBottom: 10, textTransform: "uppercase" }}>FRED Economic Data</div>
                 <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(180px, 1fr))", gap: 10 }}>
@@ -1059,7 +1054,12 @@ function App() {
                   ))}
                 </div>
               </div>
-            ) : <div style={{ color: "#555", fontSize: 11, marginBottom: 12 }}>Add fred_api_key to config.json for economic indicators (free at fred.stlouisfed.org)</div>}
+            ) : (
+              <div style={{ background: "#0F0F18", borderRadius: 8, padding: 16, border: "1px solid #1A1A25", marginBottom: 20 }}>
+                <div style={{ fontSize: 11, color: "#555" }}>FRED data not available — add <span style={{ color: "#8B80F0" }}>fred_api_key</span> to config.json</div>
+                <div style={{ fontSize: 9, color: "#444", marginTop: 4 }}>Get a free key at fred.stlouisfed.org/docs/api/api_key.html</div>
+              </div>
+            )}
 
             {/* Hacker News */}
             <div>
@@ -1076,7 +1076,7 @@ function App() {
                     </a>
                   ))}
                 </div>
-              ) : <div style={{ color: "#555", fontSize: 11 }}>Loading...</div>}
+              ) : <div style={{ color: "#555", fontSize: 11, padding: 20, textAlign: "center" }}>Loading Hacker News...</div>}
             </div>
           </div>
           )}

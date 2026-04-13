@@ -579,6 +579,21 @@ def get_correction_stats(source_id="", keyword=""):
             result["llm_impact_accuracy"] = (impact_row[0] or 0) / itotal
             result["lexicon_impact_accuracy"] = (impact_row[1] or 0) / itotal
             result["impact_sample_size"] = itotal
+        elif where_parts:
+            # Fallback to global impact stats when filtered sample is too small
+            # (parallel to the tone fallback above)
+            c3 = sqlite3.connect(str(DATA_STORE_PATH)).cursor()
+            c3.execute("""SELECT
+                SUM(CASE WHEN sc.corrected_impact = a.ai_market_impact THEN 1 ELSE 0 END),
+                SUM(CASE WHEN sc.corrected_impact = a.word_market_impact THEN 1 ELSE 0 END),
+                SUM(CASE WHEN sc.corrected_impact != '' THEN 1 ELSE 0 END)
+                FROM sentiment_corrections sc LEFT JOIN articles a ON sc.article_url = a.url""")
+            gimpact = c3.fetchone()
+            c3.connection.close()
+            if gimpact and gimpact[2] and gimpact[2] > 3:
+                result["llm_impact_accuracy"] = (gimpact[0] or 0) / gimpact[2]
+                result["lexicon_impact_accuracy"] = (gimpact[1] or 0) / gimpact[2]
+                result["impact_sample_size"] = gimpact[2]
 
         return result
     except Exception as e:
@@ -1091,6 +1106,9 @@ def parse_account_url(url):
     return None, None
 
 
+MAX_AI_QUEUE = 50  # Max pending AI enrichment jobs; new jobs are dropped when exceeded
+
+
 class AlertStore:
     """Thread-safe in-memory alert store with deduplication and async AI enrichment."""
 
@@ -1409,6 +1427,7 @@ class AlertStore:
                 "ai_sentiment": None,
                 "ai_market_impact": None,
                 "ai_processing": bool(self.ollama_url),
+                "ai_skipped": False,
                 "word_sentiment": word_result["article_tone"],
                 "positive_signals": word_result["positive_signals"],
                 "negative_signals": word_result["negative_signals"],
@@ -1427,19 +1446,35 @@ class AlertStore:
             tickers_str = f" [{','.join(affected_tickers)}]" if affected_tickers else ""
             emoji_map = {"positive": "📈", "negative": "📉", "neutral": "➡️"}
             emoji = emoji_map.get(word_result["article_tone"], "➡️")
-            log.info(f"{emoji} [{source_id}] tone={word_result['article_tone']} conf={word_result['confidence']}{tickers_str} keyword='{keyword}' → {title[:60]} [AI queued]")
+
+        queued_for_ai = False
+        ai_note = ""
 
         # Queue background fetch + AI enrichment (article text fetched async)
         if self.ollama_url:
             with self._ai_lock:
-                self._ai_queue.append({
-                    "alert_id": alert_id,
-                    "url": url,
-                    "snippet_text": quick_text,
-                    "source_id": source_id,
-                    "keyword": keyword,
-                    "needs_fetch": True,
-                })
+                if len(self._ai_queue) >= MAX_AI_QUEUE:
+                    with self.lock:
+                        for a in self.alerts:
+                            if a["id"] == alert_id:
+                                a["ai_processing"] = False
+                                a["ai_skipped"] = True
+                                break
+                    ai_note = " [AI skipped: queue full]"
+                    log.warning(f"AI queue full ({MAX_AI_QUEUE} jobs); skipping enrichment for: {title[:60]}")
+                else:
+                    self._ai_queue.append({
+                        "alert_id": alert_id,
+                        "url": url,
+                        "snippet_text": quick_text,
+                        "source_id": source_id,
+                        "keyword": keyword,
+                        "needs_fetch": True,
+                    })
+                    queued_for_ai = True
+                    ai_note = " [AI queued]"
+
+        log.info(f"{emoji} [{source_id}] tone={word_result['article_tone']} conf={word_result['confidence']}{tickers_str} keyword='{keyword}' → {title[:60]}{ai_note}")
         return True
 
     def get_all(self, since=None, limit=None):
@@ -1729,19 +1764,40 @@ HIGH_IMPACT_COMBOS = [
 
 SIGNAL_SETS_PATH = Path("signal_sets.json")
 
+# Simple in-memory cache for signal sets — invalidated by mtime on reads,
+# and updated immediately on writes to avoid unnecessary disk hits.
+_signal_sets_cache = None
+_signal_sets_mtime = 0.0
+
 
 def load_signal_sets():
-    """Load signal sets from file, or create defaults."""
+    """Load signal sets from file, or create defaults. Uses mtime-based cache."""
+    global _signal_sets_cache, _signal_sets_mtime
     if not SIGNAL_SETS_PATH.exists():
         SIGNAL_SETS_PATH.write_text(json.dumps(DEFAULT_SIGNAL_SETS, indent=2))
     try:
-        return json.loads(SIGNAL_SETS_PATH.read_text())
+        mtime = SIGNAL_SETS_PATH.stat().st_mtime
     except Exception:
-        return DEFAULT_SIGNAL_SETS
+        mtime = 0.0
+    if _signal_sets_cache is not None and mtime == _signal_sets_mtime:
+        return _signal_sets_cache
+    try:
+        result = json.loads(SIGNAL_SETS_PATH.read_text())
+    except Exception:
+        result = DEFAULT_SIGNAL_SETS
+    _signal_sets_cache = result
+    _signal_sets_mtime = mtime
+    return result
 
 
 def save_signal_sets(sets):
+    global _signal_sets_cache, _signal_sets_mtime
     SIGNAL_SETS_PATH.write_text(json.dumps(sets, indent=2))
+    _signal_sets_cache = sets
+    try:
+        _signal_sets_mtime = SIGNAL_SETS_PATH.stat().st_mtime
+    except Exception:
+        _signal_sets_mtime = 0.0
 
 
 def get_active_signals():
@@ -2187,9 +2243,38 @@ def analyze_sentiment_words_only(text, source_id="", matched_keywords=None):
     source_reliability = SOURCE_WEIGHTS.get(source_id, 0.5)
     confidence *= (0.7 + source_reliability * 0.3)
 
+    # Compute market impact independently from tone where possible.
+    # Scan the full text for unambiguously directional market-impact signals.
+    # These patterns indicate a market outcome that may differ from article tone
+    # (e.g., a negatively-written article about a rate cut is still market-bullish).
+    _BULLISH_IMPACT = [
+        "rate cut", "rate cuts", "cuts rates", "easing", "stimulus",
+        "bailout", "quantitative easing", "QE", "dovish",
+        "beat earnings", "beats estimates", "record earnings", "buyback",
+        "merger approved", "acquisition approved", "ipo success",
+        "market rally", "stocks surge", "markets cheer", "risk on",
+    ]
+    _BEARISH_IMPACT = [
+        "rate hike", "rate hikes", "hikes rates", "tightening", "hawkish",
+        "sanctions", "tariff", "tariffs", "default", "bankruptcy",
+        "recession", "stagflation", "layoffs", "mass layoffs",
+        "earnings miss", "misses estimates", "profit warning",
+        "flash crash", "market crash", "stocks plunge", "risk off",
+    ]
+    text_lower = text.lower() if text else ""
+    bull_hits = sum(1 for p in _BULLISH_IMPACT if p.lower() in text_lower)
+    bear_hits = sum(1 for p in _BEARISH_IMPACT if p.lower() in text_lower)
+    if bull_hits > bear_hits:
+        lexicon_impact = "bullish"
+    elif bear_hits > bull_hits:
+        lexicon_impact = "bearish"
+    else:
+        # No clear independent signal — fall back to tone-derived impact
+        lexicon_impact = {"positive": "bullish", "negative": "bearish", "neutral": "neutral"}[tone]
+
     return {
         "article_tone": tone,
-        "market_impact": {"positive": "bullish", "negative": "bearish", "neutral": "neutral"}[tone],
+        "market_impact": lexicon_impact,
         "polarity": round(final_polarity, 3),
         "confidence": round(min(1.0, confidence), 2),
         "severity": severity,
@@ -2427,6 +2512,18 @@ def poll_whitehouse(keywords):
                 continue
             matches = match_keywords(text, keywords)
             for kw, sev in matches:
+                # Freshness / restart-dedup gate: skip URLs already in SQLite
+                # so stale items don't flood back after an in-memory reset.
+                try:
+                    _wh_conn = sqlite3.connect(str(DATA_STORE_PATH))
+                    _wh_row = _wh_conn.execute(
+                        "SELECT 1 FROM articles WHERE url = ? LIMIT 1", (href,)
+                    ).fetchone()
+                    _wh_conn.close()
+                    if _wh_row:
+                        continue
+                except Exception:
+                    pass
                 store.add(
                     source_id="whitehouse",
                     source_name="White House",
@@ -3020,8 +3117,13 @@ def general_chat():
             where_clauses = []
             params = []
             for w in search_words[:5]:
-                where_clauses.append("(LOWER(title) LIKE ? OR keyword LIKE ?)")
-                params.extend([f"%{w}%", f"%{w}%"])
+                # Also search summary and article_text (first 500 chars) for better recall
+                where_clauses.append(
+                    "(LOWER(title) LIKE ? OR keyword LIKE ?"
+                    " OR LOWER(summary) LIKE ?"
+                    " OR LOWER(SUBSTR(article_text,1,500)) LIKE ?)"
+                )
+                params.extend([f"%{w}%", f"%{w}%", f"%{w}%", f"%{w}%"])
             query = f"SELECT {safe_cols} FROM articles WHERE {' OR '.join(where_clauses)} ORDER BY id DESC LIMIT 8"
             c.execute(query, params)
             matched_articles = [dict(r) for r in c.fetchall()]

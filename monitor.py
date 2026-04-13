@@ -2700,6 +2700,144 @@ def ollama_chat():
         return jsonify({"error": f"Ollama error: {str(e)}"}), 500
 
 
+@app.route("/api/chat/general", methods=["POST"])
+def general_chat():
+    """
+    General-purpose AI chat that uses stored articles as context.
+    The AI can reference recent news it has read to give informed responses.
+    Expects: {"question": "...", "history": [...], "tab": "alerts|market|economy|analytics"}
+    """
+    data = request.get_json(silent=True) or {}
+    question = data.get("question", "").strip()
+    history = data.get("history", [])
+    current_tab = data.get("tab", "")
+
+    config = load_config()
+    ollama_url = config.get("ollama_url", "")
+    ollama_model = config.get("ollama_model", "llama3")
+
+    if not ollama_url:
+        return jsonify({"error": "Ollama not configured. Add ollama_url to config.json"}), 400
+    if not question:
+        return jsonify({"error": "No question provided"}), 400
+
+    # ─── Build context from stored data ───
+    context_parts = []
+
+    # 1. Search articles database for relevant content
+    try:
+        conn = sqlite3.connect(str(DATA_STORE_PATH))
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+
+        # Extract key terms from the question for search
+        q_lower = question.lower()
+        search_words = [w for w in q_lower.split() if len(w) > 3 and w not in
+                        ("what", "when", "where", "which", "about", "could", "would",
+                         "should", "think", "your", "that", "this", "have", "from",
+                         "they", "been", "with", "will", "does", "going")]
+
+        # Search for matching articles (title + keyword match)
+        matched_articles = []
+        if search_words:
+            where_clauses = []
+            params = []
+            for w in search_words[:5]:
+                where_clauses.append("(LOWER(title) LIKE ? OR keyword LIKE ?)")
+                params.extend([f"%{w}%", f"%{w}%"])
+            query = f"SELECT title, summary, sentiment, market_impact, source_name, published_at, keyword FROM articles WHERE {' OR '.join(where_clauses)} ORDER BY id DESC LIMIT 8"
+            c.execute(query, params)
+            matched_articles = [dict(r) for r in c.fetchall()]
+
+        # 2. Always include the most recent articles for general awareness
+        c.execute("SELECT title, summary, sentiment, market_impact, source_name, published_at FROM articles ORDER BY id DESC LIMIT 5")
+        recent_articles = [dict(r) for r in c.fetchall()]
+
+        # 3. Get sentiment stats for overall market mood
+        c.execute("SELECT sentiment, COUNT(*) FROM articles WHERE timestamp > datetime('now', '-24 hours') GROUP BY sentiment")
+        sentiment_24h = dict(c.fetchall())
+
+        conn.close()
+    except Exception as e:
+        log.debug(f"General chat context error: {e}")
+        matched_articles = []
+        recent_articles = []
+        sentiment_24h = {}
+
+    # Build the context string
+    if matched_articles:
+        context_parts.append("RELEVANT ARTICLES (matching your question):")
+        for a in matched_articles:
+            impact = a.get("market_impact", "")
+            summary = a.get("summary", "")[:150]
+            context_parts.append(f"- [{impact}] {a.get('title', '')} ({a.get('source_name', '')}, {a.get('published_at', '')})")
+            if summary:
+                context_parts.append(f"  Summary: {summary}")
+
+    if recent_articles:
+        context_parts.append("\nLATEST ARTICLES (most recent):")
+        for a in recent_articles:
+            context_parts.append(f"- [{a.get('market_impact', '')}] {a.get('title', '')} ({a.get('source_name', '')})")
+
+    if sentiment_24h:
+        pos = sentiment_24h.get("positive", 0)
+        neg = sentiment_24h.get("negative", 0)
+        neu = sentiment_24h.get("neutral", 0)
+        context_parts.append(f"\nMARKET MOOD (last 24h): {pos} positive, {neg} negative, {neu} neutral articles")
+
+    # 4. Add live alert snapshot
+    with store.lock:
+        recent_alerts = store.alerts[:5]
+    if recent_alerts:
+        context_parts.append("\nLIVE ALERTS (most recent):")
+        for a in recent_alerts:
+            context_parts.append(f"- [{a.get('market_impact', 'neutral')}] {a.get('title', '')} (conf: {a.get('confidence', 0)}, via {a.get('source_name', '')})")
+
+    # 5. Get macro context
+    macro = get_macro_context()
+    if macro:
+        context_parts.append(f"\n{macro}")
+
+    context_str = "\n".join(context_parts) if context_parts else "No article data available yet."
+
+    # Build conversation history
+    conv_text = ""
+    for msg in history[-10:]:
+        role = "User" if msg.get("role") == "user" else "Assistant"
+        conv_text += f"\n{role}: {msg.get('text', '')}"
+
+    # Build prompt
+    prompt = (
+        "You are a financial market analyst assistant. You have been reading and analyzing news articles "
+        "in real-time. Use the article data below to give informed, specific responses. "
+        "Reference specific articles, trends, and data points when relevant. "
+        "Be concise but thorough. If you don't have relevant data, say so honestly.\n\n"
+        f"YOUR KNOWLEDGE BASE:\n{context_str}\n"
+    )
+    if conv_text:
+        prompt += f"\nPREVIOUS CONVERSATION:{conv_text}\n"
+    prompt += f"\nUser: {question}\n\nAssistant:"
+
+    try:
+        resp = requests.post(
+            f"{ollama_url.rstrip('/')}/api/generate",
+            json={"model": ollama_model, "prompt": prompt, "stream": False},
+            timeout=90,
+        )
+        if resp.status_code == 200:
+            answer = resp.json().get("response", "").strip()
+            # Log the conversation
+            log_chat(0, "general_chat", question, answer)
+            return jsonify({
+                "answer": answer,
+                "context_articles": len(matched_articles),
+                "recent_articles": len(recent_articles),
+            })
+        return jsonify({"error": f"Ollama returned {resp.status_code}"}), 500
+    except Exception as e:
+        return jsonify({"error": f"Ollama error: {str(e)}"}), 500
+
+
 # ─── Market Data API ──────────────────────────────────────────────────────────
 
 YAHOO_QUOTE_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"

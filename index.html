@@ -89,6 +89,11 @@ function App(){
   // Stock detail popup
   var[detailSym,sDetailSym]=s(null);
   var[chartType,sChartType]=s("line");
+  // Floating AI chat
+  var[chatOpen,sChatOpen]=s(false);
+  var[gcMsgs,sGcMsgs]=s([]);
+  var[gcInput,sGcInput]=s("");
+  var[gcLoading,sGcLoading]=s(false);
 
   var tt=function(m){sToast(m);setTimeout(function(){sToast("")},3000)};
   var te=function(id){sExp(function(p){var n=new Set(p);if(n.has(id))n.delete(id);else n.add(id);return n})};
@@ -108,6 +113,24 @@ function App(){
         sCorrUrl(null);sCorrCtx("");
       }
     }).catch(function(){tt("Failed")});
+  };
+
+  // Send general chat message
+  var sendGcMsg=function(){
+    var q=gcInput.trim();
+    if(!q||gcLoading)return;
+    sGcInput("");sGcLoading(true);
+    sGcMsgs(function(p){return p.concat([{role:"user",text:q}])});
+    fetch(API+"/api/chat/general",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({question:q,history:gcMsgs,tab:mv})}).then(function(r){return r.json()}).then(function(d){
+      var answer=d.answer||d.error||"No response";
+      var meta="";
+      if(d.context_articles)meta=" (referenced "+d.context_articles+" articles)";
+      sGcMsgs(function(p){return p.concat([{role:"ai",text:answer,meta:meta}])});
+      sGcLoading(false);
+    }).catch(function(){
+      sGcMsgs(function(p){return p.concat([{role:"ai",text:"Failed to reach Ollama. Check that ollama_url is set in config.json and your GPU server is running."}])});
+      sGcLoading(false);
+    });
   };
 
   // Init
@@ -454,6 +477,60 @@ function App(){
 
       </div>
     </div>
+
+      {/* ═══ FLOATING AI CHAT ═══ */}
+      {/* Chat toggle button */}
+      <div style={{position:"fixed",bottom:24,right:24,zIndex:50}}>
+        {!chatOpen&&<button className="b" onClick={function(){sChatOpen(true)}} style={{width:56,height:56,borderRadius:"50%",background:"#5448C8",color:"#fff",fontSize:24,display:"flex",alignItems:"center",justifyContent:"center",boxShadow:"0 4px 20px rgba(84,72,200,0.4)"}}>🤖</button>}
+      </div>
+
+      {/* Chat panel */}
+      {chatOpen&&<div style={{position:"fixed",bottom:24,right:24,width:420,maxWidth:"calc(100vw - 48px)",height:520,maxHeight:"calc(100vh - 100px)",background:"#0F0F18",borderRadius:16,border:"1px solid #2A2A35",display:"flex",flexDirection:"column",zIndex:50,boxShadow:"0 8px 32px rgba(0,0,0,0.5)"}}>
+        {/* Header */}
+        <div style={{padding:"14px 16px",borderBottom:"1px solid #1A1A25",display:"flex",justifyContent:"space-between",alignItems:"center",flexShrink:0}}>
+          <div>
+            <div style={{fontSize:13,fontWeight:600,color:"#E8E8ED"}}>🤖 SIGINT AI</div>
+            <div style={{fontSize:9,color:"#555"}}>Ask about markets, news, trends — powered by your articles</div>
+          </div>
+          <div style={{display:"flex",gap:6}}>
+            <button className="b" onClick={function(){sGcMsgs([]);tt("Chat cleared")}} style={{fontSize:9,color:"#555",background:"none",padding:"4px 6px"}}>Clear</button>
+            <button className="b" onClick={function(){sChatOpen(false)}} style={{fontSize:16,color:"#555",background:"none",padding:"2px 6px"}}>✕</button>
+          </div>
+        </div>
+
+        {/* Messages */}
+        <div style={{flex:1,overflowY:"auto",padding:"12px 16px",display:"flex",flexDirection:"column",gap:10}}>
+          {gcMsgs.length===0&&<div style={{textAlign:"center",padding:"40px 20px",color:"#333"}}>
+            <div style={{fontSize:28,marginBottom:12}}>🤖</div>
+            <div style={{fontSize:12,color:"#555",marginBottom:16}}>Ask me about current events, market trends, or any news I have been monitoring.</div>
+            <div style={{display:"flex",flexDirection:"column",gap:6}}>
+              {["What are the key headlines today?","What is the market sentiment right now?","Summarize the latest news on tariffs","Any bearish signals I should watch?"].map(function(q,i){
+                return <button key={i} className="b" onClick={function(){sGcInput(q)}} style={{padding:"8px 12px",background:"#14141F",color:"#AAA",borderRadius:6,fontSize:10,textAlign:"left",border:"1px solid #1A1A25"}}>{q}</button>;
+              })}
+            </div>
+          </div>}
+
+          {gcMsgs.map(function(m,i){
+            return <div key={i} className="cm" style={{display:"flex",justifyContent:m.role==="user"?"flex-end":"flex-start"}}>
+              <div style={{maxWidth:"85%",padding:"8px 12px",borderRadius:m.role==="user"?"12px 12px 2px 12px":"12px 12px 12px 2px",background:m.role==="user"?"#5448C8":"#14141F",color:m.role==="user"?"#fff":"#CCC",fontSize:11,lineHeight:1.6,border:m.role==="user"?"none":"1px solid #1A1A25",whiteSpace:"pre-wrap"}}>
+                {m.role==="ai"&&<div style={{fontSize:8,color:"#8B80F0",marginBottom:4,fontWeight:600}}>SIGINT AI{m.meta||""}</div>}
+                {m.text}
+              </div>
+            </div>;
+          })}
+
+          {gcLoading&&<div className="cm" style={{display:"flex"}}><div style={{padding:"8px 12px",borderRadius:"12px 12px 12px 2px",background:"#14141F",border:"1px solid #1A1A25",fontSize:11,color:"#8B80F0"}}><span className="thk">Thinking</span></div></div>}
+        </div>
+
+        {/* Input */}
+        <div style={{padding:"12px 16px",borderTop:"1px solid #1A1A25",flexShrink:0}}>
+          <div style={{display:"flex",gap:8}}>
+            <input value={gcInput} onChange={function(e){sGcInput(e.target.value)}} onKeyDown={function(e){if(e.key==="Enter"&&!e.shiftKey)sendGcMsg()}} placeholder="Ask about news, markets, trends..." disabled={gcLoading} style={{flex:1,background:"#0A0A0F",border:"1px solid #2A2A35",borderRadius:8,padding:"10px 12px",color:"#E8E8ED",fontSize:11,outline:"none",opacity:gcLoading?0.5:1}}/>
+            <button className="b" onClick={sendGcMsg} disabled={gcLoading} style={{background:"#5448C8",color:"#fff",padding:"10px 16px",borderRadius:8,fontSize:12,opacity:gcLoading?0.5:1}}>Send</button>
+          </div>
+        </div>
+      </div>}
+
   </div>;
 }
 

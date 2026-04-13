@@ -140,7 +140,8 @@ def init_data_store():
                           ("market_impact", "TEXT DEFAULT ''"),
                           ("word_market_impact", "TEXT DEFAULT ''"),
                           ("ai_market_impact", "TEXT DEFAULT ''"),
-                          ("published_at_utc", "TEXT DEFAULT ''")]:
+                          ("published_at_utc", "TEXT DEFAULT ''"),
+                          ("user_corrected_impact", "TEXT DEFAULT ''")]:
         try:
             c.execute(f"ALTER TABLE articles ADD COLUMN {col} {coltype}")
         except Exception:
@@ -436,6 +437,13 @@ def log_sentiment_correction(url, title, original, corrected, source_id="", keyw
             (datetime.now(timezone.utc).isoformat(), url, title, original, corrected,
              original_impact, corrected_impact, user_context, source_id, keyword))
         c.execute("UPDATE articles SET user_corrected_sentiment = ? WHERE url = ?", (corrected, url))
+        # Persist corrected impact so trend context uses it
+        if corrected_impact and corrected_impact != "duplicate":
+            try:
+                c.execute("UPDATE articles SET user_corrected_impact = ? WHERE url = ?",
+                          (corrected_impact, url))
+            except Exception:
+                pass  # Column may not exist in old DBs
         conn.commit()
         conn.close()
     except Exception as e:
@@ -452,6 +460,12 @@ def get_related_articles(keyword="", sector="", limit=5):
         conn.row_factory = sqlite3.Row
         c = conn.cursor()
         cols = "title, summary, sentiment, market_impact, published_at, source_name, user_corrected_sentiment"
+        # Safely add user_corrected_impact if column exists
+        try:
+            c.execute("SELECT user_corrected_impact FROM articles LIMIT 1")
+            cols += ", user_corrected_impact"
+        except Exception:
+            pass  # Column doesn't exist in old DBs
         if keyword:
             c.execute(f"SELECT {cols} FROM articles WHERE keyword = ? ORDER BY id DESC LIMIT ?",
                       (keyword.lower(), limit))
@@ -470,18 +484,19 @@ def get_related_articles(keyword="", sector="", limit=5):
 def build_trend_context(keyword="", sector="", limit=10):
     """
     Build a text summary of recent trends for a keyword/sector.
-    Prefers user-corrected labels when available. Shows impact + tone.
+    Prefers user-corrected impact and tone when available.
     """
     articles = get_related_articles(keyword=keyword, sector=sector, limit=limit)
     if not articles:
         return ""
     lines = [f"Recent coverage on '{keyword or sector}':"]
     for a in articles:
-        # Prefer corrected labels
-        corrected = a.get("user_corrected_sentiment", "")
-        tone = corrected if corrected else a.get("sentiment", "neutral")
-        impact = a.get("market_impact", "neutral")
-        corrected_tag = " (user-corrected)" if corrected else ""
+        # Prefer corrected labels for both impact and tone
+        corrected_tone = a.get("user_corrected_sentiment", "")
+        corrected_impact = a.get("user_corrected_impact", "")
+        tone = corrected_tone if corrected_tone else a.get("sentiment", "neutral")
+        impact = corrected_impact if corrected_impact else a.get("market_impact", "neutral")
+        corrected_tag = " (user-corrected)" if (corrected_tone or corrected_impact) else ""
         lines.append(f"- [impact:{impact} tone:{tone}{corrected_tag}] {a.get('title', '')} ({a.get('source_name', '')}, {a.get('published_at', '')})")
     return "\n".join(lines)
 
@@ -727,13 +742,13 @@ def calibrate_confidence():
 def get_disagreement_outcomes():
     """
     When AI and word-based disagreed, who was right?
-    Uses corrections data to track this.
+    Tracks both tone and impact disagreements from corrections data.
     """
     try:
         conn = sqlite3.connect(str(DATA_STORE_PATH))
         c = conn.cursor()
 
-        # Find articles where AI and words disagreed AND user later corrected
+        # ─── Tone disagreements ───
         c.execute("""
             SELECT
                 a.ai_sentiment, a.word_sentiment, sc.corrected_sentiment,
@@ -766,9 +781,7 @@ def get_disagreement_outcomes():
                     "correct_was": corrected, "source": source, "keyword": keyword
                 })
 
-        conn.close()
-
-        return {
+        tone_result = {
             "total_disagreements_corrected": total,
             "ai_was_right": ai_wins,
             "words_were_right": words_wins,
@@ -778,9 +791,66 @@ def get_disagreement_outcomes():
             "examples": examples,
         }
 
+        # ─── Impact disagreements ───
+        impact_result = {"total": 0, "ai_was_right": 0, "words_were_right": 0,
+                         "neither_right": 0, "examples": []}
+        try:
+            c.execute("""
+                SELECT
+                    a.ai_market_impact, a.word_market_impact, sc.corrected_impact,
+                    a.source_id, a.keyword
+                FROM sentiment_corrections sc
+                JOIN articles a ON sc.article_url = a.url
+                WHERE a.ai_market_impact != '' AND a.ai_market_impact IS NOT NULL
+                  AND a.word_market_impact != '' AND a.word_market_impact IS NOT NULL
+                  AND a.ai_market_impact != a.word_market_impact
+                  AND sc.corrected_impact != '' AND sc.corrected_impact IS NOT NULL
+            """)
+
+            iai_wins = 0
+            iwords_wins = 0
+            ineither = 0
+            itotal = 0
+            iexamples = []
+
+            for row in c.fetchall():
+                itotal += 1
+                ai_imp, word_imp, corrected_imp, source, keyword = row
+                if corrected_imp == ai_imp:
+                    iai_wins += 1
+                elif corrected_imp == word_imp:
+                    iwords_wins += 1
+                else:
+                    ineither += 1
+                if len(iexamples) < 10:
+                    iexamples.append({
+                        "ai_said": ai_imp, "words_said": word_imp,
+                        "correct_was": corrected_imp, "source": source, "keyword": keyword
+                    })
+
+            impact_result = {
+                "total": itotal,
+                "ai_was_right": iai_wins,
+                "words_were_right": iwords_wins,
+                "neither_right": ineither,
+                "ai_accuracy": round(iai_wins / max(itotal, 1), 3),
+                "word_accuracy": round(iwords_wins / max(itotal, 1), 3),
+                "examples": iexamples,
+            }
+        except Exception:
+            pass  # Columns may not exist in old DBs
+
+        conn.close()
+
+        # Merge: tone_result is the backward-compatible top level,
+        # impact_result is added as a nested key
+        tone_result["impact_disagreements"] = impact_result
+        return tone_result
+
     except Exception as e:
         log.debug(f"Disagreement outcomes error: {e}")
-        return {"total_disagreements_corrected": 0, "ai_was_right": 0, "words_were_right": 0}
+        return {"total_disagreements_corrected": 0, "ai_was_right": 0, "words_were_right": 0,
+                "impact_disagreements": {"total": 0, "ai_was_right": 0, "words_were_right": 0}}
 
 
 CONFIG_PATH = Path("config.json")
@@ -1190,21 +1260,32 @@ class AlertStore:
                             method = "llm_override"
 
                     # ─── Impact ensemble (separate from tone) ───
+                    # Confidence starts from the tone-derived value; impact modifies it
                     if lexicon_impact == llm_impact:
                         final_impact = llm_impact
+                        # Agreement on impact boosts confidence
+                        final_conf = min(1.0, final_conf * 1.1)
+                        impact_method = "impact_agree"
                     elif lexicon_impact == "neutral":
                         final_impact = llm_impact
+                        impact_method = "impact_llm_dominant"
                     elif llm_impact == "neutral":
                         final_impact = lexicon_impact if lex_conf > 0.5 else "neutral"
+                        impact_method = "impact_lex_dominant"
                     else:
-                        # Direct disagreement on impact — use impact-specific correction stats
+                        # Direct disagreement on impact — use impact-specific learned accuracy
                         stats = get_correction_stats(source_id, keyword)
                         if stats["impact_sample_size"] > 3 and stats["llm_impact_accuracy"] > stats["lexicon_impact_accuracy"] + 0.1:
                             final_impact = llm_impact
+                            impact_method = "impact_llm_learned"
                         elif stats["impact_sample_size"] > 3 and stats["lexicon_impact_accuracy"] > stats["llm_impact_accuracy"] + 0.1:
                             final_impact = lexicon_impact
+                            impact_method = "impact_lex_learned"
                         else:
                             final_impact = llm_impact  # default LLM
+                            impact_method = "impact_llm_default"
+                        # Disagreement on impact reduces confidence
+                        final_conf *= 0.8
 
                     # Source reliability affects confidence only
                     final_conf *= (0.7 + source_reliability * 0.3)
@@ -1278,13 +1359,13 @@ class AlertStore:
         # Fallback summary from snippet
         fallback_summary = (snippet or title)[:250]
 
-        # Format published_at for display, store UTC separately
+        # Store published_at as UTC; frontend handles display timezone
         pub_str = ""
         pub_utc = ""
         if published_at:
             try:
                 pub_utc = published_at.astimezone(timezone.utc).isoformat()
-                pub_str = published_at.astimezone(timezone(timedelta(hours=-5))).strftime("%b %d, %I:%M %p EST")
+                pub_str = published_at.astimezone(timezone.utc).strftime("%b %d, %I:%M %p UTC")
             except Exception:
                 pub_str = str(published_at)
 
@@ -2125,13 +2206,12 @@ def cleaned_entry_text(*parts):
 
 # ─── Article Freshness Checking ───────────────────────────────────────────────
 
-# EST timezone offset (UTC-5), EDT (UTC-4)
-EST = timezone(timedelta(hours=-5))
+# All internal timestamps use UTC; display formatting is done at render time
 
 
-def now_est():
-    """Current time in EST."""
-    return datetime.now(EST)
+def now_utc():
+    """Current time in UTC."""
+    return datetime.now(timezone.utc)
 
 
 def parse_entry_date(entry):
@@ -2923,27 +3003,31 @@ def general_chat():
 
         # Search for matching articles (title + keyword match)
         matched_articles = []
+        # Determine available columns safely
+        safe_cols = "title, summary, sentiment, source_name, published_at, keyword"
+        try:
+            c.execute("SELECT market_impact FROM articles LIMIT 1")
+            safe_cols += ", market_impact"
+        except Exception:
+            pass
+        try:
+            c.execute("SELECT user_corrected_impact FROM articles LIMIT 1")
+            safe_cols += ", user_corrected_impact"
+        except Exception:
+            pass
+
         if search_words:
             where_clauses = []
             params = []
             for w in search_words[:5]:
                 where_clauses.append("(LOWER(title) LIKE ? OR keyword LIKE ?)")
                 params.extend([f"%{w}%", f"%{w}%"])
-            query = f"SELECT title, summary, sentiment, source_name, published_at, keyword FROM articles WHERE {' OR '.join(where_clauses)} ORDER BY id DESC LIMIT 8"
+            query = f"SELECT {safe_cols} FROM articles WHERE {' OR '.join(where_clauses)} ORDER BY id DESC LIMIT 8"
             c.execute(query, params)
             matched_articles = [dict(r) for r in c.fetchall()]
-            # Try to add market_impact if column exists
-            try:
-                for i, art in enumerate(matched_articles):
-                    c.execute("SELECT market_impact FROM articles WHERE title = ? LIMIT 1", (art.get("title", ""),))
-                    row2 = c.fetchone()
-                    if row2:
-                        matched_articles[i]["market_impact"] = row2[0] or ""
-            except Exception:
-                pass  # Column may not exist in old DBs
 
         # 2. Always include the most recent articles for general awareness
-        c.execute("SELECT title, summary, sentiment, source_name, published_at FROM articles ORDER BY id DESC LIMIT 5")
+        c.execute(f"SELECT {safe_cols} FROM articles ORDER BY id DESC LIMIT 5")
         recent_articles = [dict(r) for r in c.fetchall()]
 
         # 3. Get sentiment stats for overall market mood
@@ -2961,7 +3045,8 @@ def general_chat():
     if matched_articles:
         context_parts.append("RELEVANT ARTICLES (matching your question):")
         for a in matched_articles:
-            impact = a.get("market_impact", "")
+            # Prefer user-corrected impact
+            impact = a.get("user_corrected_impact", "") or a.get("market_impact", "")
             summary = a.get("summary", "")[:150]
             context_parts.append(f"- [{impact}] {a.get('title', '')} ({a.get('source_name', '')}, {a.get('published_at', '')})")
             if summary:
@@ -2970,7 +3055,8 @@ def general_chat():
     if recent_articles:
         context_parts.append("\nLATEST ARTICLES (most recent):")
         for a in recent_articles:
-            context_parts.append(f"- [{a.get('market_impact', '')}] {a.get('title', '')} ({a.get('source_name', '')})")
+            impact = a.get("user_corrected_impact", "") or a.get("market_impact", "")
+            context_parts.append(f"- [{impact}] {a.get('title', '')} ({a.get('source_name', '')})")
 
     if sentiment_24h:
         pos = sentiment_24h.get("positive", 0)
@@ -3459,7 +3545,7 @@ def get_market_news():
                 pub_str = ""
                 if entry_date:
                     try:
-                        pub_str = entry_date.astimezone(timezone(timedelta(hours=-5))).strftime("%b %d, %I:%M %p EST")
+                        pub_str = entry_date.astimezone(timezone.utc).strftime("%b %d, %I:%M %p UTC")
                     except Exception:
                         pass
                 articles.append({

@@ -49,40 +49,6 @@ log = logging.getLogger("sigint")
 
 DATA_STORE_PATH = Path("sigint_data.db")
 
-# Lightweight in-memory TTL cache for expensive API-backed endpoints.
-# Keeps tab switches responsive without changing the persistence model.
-_API_CACHE = {}
-_API_CACHE_LOCK = threading.Lock()
-
-
-def cache_get(key, ttl_seconds):
-    now = time.time()
-    with _API_CACHE_LOCK:
-        hit = _API_CACHE.get(key)
-        if hit and (now - hit["ts"]) < ttl_seconds:
-            return hit["value"]
-    return None
-
-
-def cache_set(key, value):
-    with _API_CACHE_LOCK:
-        _API_CACHE[key] = {"ts": time.time(), "value": value}
-    return value
-
-
-def cache_invalidate(prefix):
-    with _API_CACHE_LOCK:
-        for key in list(_API_CACHE.keys()):
-            if key.startswith(prefix):
-                _API_CACHE.pop(key, None)
-
-
-def quote_cache_ttl(range_str, interval=""):
-    if range_str in ("1d", "5d") or interval in ("1m", "2m", "5m", "15m"):
-        return 15
-    return 60
-
-
 
 def init_data_store():
     """Initialize the SQLite database with required tables."""
@@ -613,21 +579,6 @@ def get_correction_stats(source_id="", keyword=""):
             result["llm_impact_accuracy"] = (impact_row[0] or 0) / itotal
             result["lexicon_impact_accuracy"] = (impact_row[1] or 0) / itotal
             result["impact_sample_size"] = itotal
-        elif where_parts:
-            # Fallback to global impact stats when filtered sample is too small
-            # (parallel to the tone fallback above)
-            c3 = sqlite3.connect(str(DATA_STORE_PATH)).cursor()
-            c3.execute("""SELECT
-                SUM(CASE WHEN sc.corrected_impact = a.ai_market_impact THEN 1 ELSE 0 END),
-                SUM(CASE WHEN sc.corrected_impact = a.word_market_impact THEN 1 ELSE 0 END),
-                SUM(CASE WHEN sc.corrected_impact != '' THEN 1 ELSE 0 END)
-                FROM sentiment_corrections sc LEFT JOIN articles a ON sc.article_url = a.url""")
-            gimpact = c3.fetchone()
-            c3.connection.close()
-            if gimpact and gimpact[2] and gimpact[2] > 3:
-                result["llm_impact_accuracy"] = (gimpact[0] or 0) / gimpact[2]
-                result["lexicon_impact_accuracy"] = (gimpact[1] or 0) / gimpact[2]
-                result["impact_sample_size"] = gimpact[2]
 
         return result
     except Exception as e:
@@ -921,6 +872,10 @@ DEFAULT_CONFIG = {
     "max_article_age_hours": 4,
     "ollama_url": "",
     "ollama_model": "llama3",
+    "ollama_chat_url": "",
+    "ollama_chat_model": "",
+    "ollama_analysis_url": "",
+    "ollama_analysis_model": "",
     "newsapi_key": "",
     "twitter_bearer_token": "",
     "fred_api_key": "",
@@ -941,6 +896,38 @@ def load_config():
 
 def save_config(config):
     CONFIG_PATH.write_text(json.dumps(config, indent=2))
+
+
+# ─── Ollama Lane Configuration ──────────────────────────────────────────────
+# Two logical lanes: "chat" (interactive, low latency) and "analysis" (background, structured output)
+# Each lane can point to a different Ollama host and/or model.
+# Falls back to the shared ollama_url/ollama_model if lane-specific keys are empty.
+
+# Per-lane generation settings
+OLLAMA_CHAT_TIMEOUT = 30        # Chat should respond fast or fail fast
+OLLAMA_CHAT_NUM_PREDICT = 512   # Cap chat response length for speed
+OLLAMA_CHAT_TEMPERATURE = 0.3   # Low creativity for factual chat
+
+OLLAMA_ANALYSIS_TIMEOUT = 60    # Analysis can take longer
+OLLAMA_ANALYSIS_NUM_PREDICT = 1024  # Structured JSON needs more room
+OLLAMA_ANALYSIS_TEMPERATURE = 0.1   # Very low for consistent JSON output
+
+
+def get_ollama_lane(config, lane="chat"):
+    """Resolve Ollama URL and model for a given lane.
+    Lane is 'chat' or 'analysis'. Falls back to shared config if lane-specific keys are empty."""
+    if lane == "chat":
+        url = config.get("ollama_chat_url", "") or config.get("ollama_url", "")
+        model = config.get("ollama_chat_model", "") or config.get("ollama_model", "llama3")
+    else:
+        url = config.get("ollama_analysis_url", "") or config.get("ollama_url", "")
+        model = config.get("ollama_analysis_model", "") or config.get("ollama_model", "llama3")
+    return url, model
+
+
+# Active chat counter — background enrichment yields when chat is active
+_chat_active = 0
+_chat_active_lock = threading.Lock()
 
 
 RSS_SOURCES = {
@@ -1140,9 +1127,6 @@ def parse_account_url(url):
     return None, None
 
 
-MAX_AI_QUEUE = 50  # Max pending AI enrichment jobs; new jobs are dropped when exceeded
-
-
 class AlertStore:
     """Thread-safe in-memory alert store with deduplication and async AI enrichment."""
 
@@ -1151,6 +1135,7 @@ class AlertStore:
         self.seen_hashes = set()
         self.max_alerts = max_alerts
         self.lock = threading.Lock()
+        # Analysis lane config (set from config.json on each monitor_loop cycle)
         self.ollama_url = ""
         self.ollama_model = "llama3"
         self._ai_queue = []
@@ -1180,8 +1165,16 @@ class AlertStore:
         return False, None
 
     def _ai_worker(self):
-        """Background worker that processes AI enrichment jobs."""
+        """Background worker that processes AI enrichment jobs.
+        Yields to active chat requests to keep interactive chat responsive."""
         while True:
+            # Yield to active chat — don't start a new Ollama generation while chat is in progress
+            with _chat_active_lock:
+                chat_busy = _chat_active > 0
+            if chat_busy:
+                time.sleep(1)
+                continue
+
             job = None
             with self._ai_lock:
                 if self._ai_queue:
@@ -1461,7 +1454,6 @@ class AlertStore:
                 "ai_sentiment": None,
                 "ai_market_impact": None,
                 "ai_processing": bool(self.ollama_url),
-                "ai_skipped": False,
                 "word_sentiment": word_result["article_tone"],
                 "positive_signals": word_result["positive_signals"],
                 "negative_signals": word_result["negative_signals"],
@@ -1480,35 +1472,19 @@ class AlertStore:
             tickers_str = f" [{','.join(affected_tickers)}]" if affected_tickers else ""
             emoji_map = {"positive": "📈", "negative": "📉", "neutral": "➡️"}
             emoji = emoji_map.get(word_result["article_tone"], "➡️")
-
-        queued_for_ai = False
-        ai_note = ""
+            log.info(f"{emoji} [{source_id}] tone={word_result['article_tone']} conf={word_result['confidence']}{tickers_str} keyword='{keyword}' → {title[:60]} [AI queued]")
 
         # Queue background fetch + AI enrichment (article text fetched async)
         if self.ollama_url:
             with self._ai_lock:
-                if len(self._ai_queue) >= MAX_AI_QUEUE:
-                    with self.lock:
-                        for a in self.alerts:
-                            if a["id"] == alert_id:
-                                a["ai_processing"] = False
-                                a["ai_skipped"] = True
-                                break
-                    ai_note = " [AI skipped: queue full]"
-                    log.warning(f"AI queue full ({MAX_AI_QUEUE} jobs); skipping enrichment for: {title[:60]}")
-                else:
-                    self._ai_queue.append({
-                        "alert_id": alert_id,
-                        "url": url,
-                        "snippet_text": quick_text,
-                        "source_id": source_id,
-                        "keyword": keyword,
-                        "needs_fetch": True,
-                    })
-                    queued_for_ai = True
-                    ai_note = " [AI queued]"
-
-        log.info(f"{emoji} [{source_id}] tone={word_result['article_tone']} conf={word_result['confidence']}{tickers_str} keyword='{keyword}' → {title[:60]}{ai_note}")
+                self._ai_queue.append({
+                    "alert_id": alert_id,
+                    "url": url,
+                    "snippet_text": quick_text,
+                    "source_id": source_id,
+                    "keyword": keyword,
+                    "needs_fetch": True,
+                })
         return True
 
     def get_all(self, since=None, limit=None):
@@ -1798,40 +1774,19 @@ HIGH_IMPACT_COMBOS = [
 
 SIGNAL_SETS_PATH = Path("signal_sets.json")
 
-# Simple in-memory cache for signal sets — invalidated by mtime on reads,
-# and updated immediately on writes to avoid unnecessary disk hits.
-_signal_sets_cache = None
-_signal_sets_mtime = 0.0
-
 
 def load_signal_sets():
-    """Load signal sets from file, or create defaults. Uses mtime-based cache."""
-    global _signal_sets_cache, _signal_sets_mtime
+    """Load signal sets from file, or create defaults."""
     if not SIGNAL_SETS_PATH.exists():
         SIGNAL_SETS_PATH.write_text(json.dumps(DEFAULT_SIGNAL_SETS, indent=2))
     try:
-        mtime = SIGNAL_SETS_PATH.stat().st_mtime
+        return json.loads(SIGNAL_SETS_PATH.read_text())
     except Exception:
-        mtime = 0.0
-    if _signal_sets_cache is not None and mtime == _signal_sets_mtime:
-        return _signal_sets_cache
-    try:
-        result = json.loads(SIGNAL_SETS_PATH.read_text())
-    except Exception:
-        result = DEFAULT_SIGNAL_SETS
-    _signal_sets_cache = result
-    _signal_sets_mtime = mtime
-    return result
+        return DEFAULT_SIGNAL_SETS
 
 
 def save_signal_sets(sets):
-    global _signal_sets_cache, _signal_sets_mtime
     SIGNAL_SETS_PATH.write_text(json.dumps(sets, indent=2))
-    _signal_sets_cache = sets
-    try:
-        _signal_sets_mtime = SIGNAL_SETS_PATH.stat().st_mtime
-    except Exception:
-        _signal_sets_mtime = 0.0
 
 
 def get_active_signals():
@@ -1977,15 +1932,16 @@ def get_macro_context():
 
 def ollama_analyze(text, ollama_url, model="llama3", keyword=""):
     """
-    Call Ollama with JSON-schema prompt. Returns (parsed_dict, raw_response, success).
-    Includes retry on parse failure and macro context injection.
+    Call Ollama with JSON-schema prompt on the ANALYSIS lane.
+    Returns (parsed_dict, raw_response, success).
+    Uses analysis-optimized generation settings.
     """
     if not ollama_url:
         return None, "", False
 
     trend_ctx = ""
     if keyword:
-        ctx = build_trend_context(keyword=keyword, limit=5)
+        ctx = build_trend_context(keyword=keyword, limit=3)  # Reduced from 5 to 3
         if ctx:
             trend_ctx = f"RECENT CONTEXT:\n{ctx}\n\n"
 
@@ -1997,7 +1953,7 @@ def ollama_analyze(text, ollama_url, model="llama3", keyword=""):
     for attempt in range(3):
         try:
             prompt = OLLAMA_PROMPT.format(
-                article_text=text[:2500],
+                article_text=text[:1800],  # Reduced from 2500 to 1800
                 trend_context=trend_ctx,
             )
             if attempt > 0:
@@ -2005,25 +1961,38 @@ def ollama_analyze(text, ollama_url, model="llama3", keyword=""):
 
             resp = requests.post(
                 f"{ollama_url.rstrip('/')}/api/generate",
-                json={"model": model, "prompt": prompt, "stream": False},
-                timeout=50,
+                json={
+                    "model": model,
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {
+                        "num_predict": OLLAMA_ANALYSIS_NUM_PREDICT,
+                        "temperature": OLLAMA_ANALYSIS_TEMPERATURE,
+                    },
+                },
+                timeout=OLLAMA_ANALYSIS_TIMEOUT,
             )
             if resp.status_code != 200:
+                log.debug(f"Analysis lane: Ollama returned {resp.status_code} on attempt {attempt+1}")
                 continue
 
             raw = resp.json().get("response", "")
             parsed, status = parse_llm_response(raw)
 
             if parsed:
-                log_system_event("ollama_success", f"Parsed on attempt {attempt+1}", status)
+                log_system_event("ollama_success", f"Analysis parsed on attempt {attempt+1}", status)
                 return parsed, raw, True
 
-            log.debug(f"LLM parse attempt {attempt+1} failed: {status}")
+            log.debug(f"Analysis lane parse attempt {attempt+1} failed: {status}")
 
+        except requests.exceptions.Timeout:
+            log.warning(f"Analysis lane: timeout on attempt {attempt+1} ({OLLAMA_ANALYSIS_TIMEOUT}s)")
+            log_system_event("ollama_timeout", f"Analysis timeout attempt {attempt+1}",
+                             f"model={model} timeout={OLLAMA_ANALYSIS_TIMEOUT}s")
         except Exception as e:
-            log.debug(f"LLM call attempt {attempt+1} error: {e}")
+            log.debug(f"Analysis lane call attempt {attempt+1} error: {e}")
 
-    log_system_event("ollama_fail", "All parse attempts failed")
+    log_system_event("ollama_fail", "All analysis parse attempts failed", f"model={model}")
     return None, "", False
 
 
@@ -2277,38 +2246,9 @@ def analyze_sentiment_words_only(text, source_id="", matched_keywords=None):
     source_reliability = SOURCE_WEIGHTS.get(source_id, 0.5)
     confidence *= (0.7 + source_reliability * 0.3)
 
-    # Compute market impact independently from tone where possible.
-    # Scan the full text for unambiguously directional market-impact signals.
-    # These patterns indicate a market outcome that may differ from article tone
-    # (e.g., a negatively-written article about a rate cut is still market-bullish).
-    _BULLISH_IMPACT = [
-        "rate cut", "rate cuts", "cuts rates", "easing", "stimulus",
-        "bailout", "quantitative easing", "QE", "dovish",
-        "beat earnings", "beats estimates", "record earnings", "buyback",
-        "merger approved", "acquisition approved", "ipo success",
-        "market rally", "stocks surge", "markets cheer", "risk on",
-    ]
-    _BEARISH_IMPACT = [
-        "rate hike", "rate hikes", "hikes rates", "tightening", "hawkish",
-        "sanctions", "tariff", "tariffs", "default", "bankruptcy",
-        "recession", "stagflation", "layoffs", "mass layoffs",
-        "earnings miss", "misses estimates", "profit warning",
-        "flash crash", "market crash", "stocks plunge", "risk off",
-    ]
-    text_lower = text.lower() if text else ""
-    bull_hits = sum(1 for p in _BULLISH_IMPACT if p.lower() in text_lower)
-    bear_hits = sum(1 for p in _BEARISH_IMPACT if p.lower() in text_lower)
-    if bull_hits > bear_hits:
-        lexicon_impact = "bullish"
-    elif bear_hits > bull_hits:
-        lexicon_impact = "bearish"
-    else:
-        # No clear independent signal — fall back to tone-derived impact
-        lexicon_impact = {"positive": "bullish", "negative": "bearish", "neutral": "neutral"}[tone]
-
     return {
         "article_tone": tone,
-        "market_impact": lexicon_impact,
+        "market_impact": {"positive": "bullish", "negative": "bearish", "neutral": "neutral"}[tone],
         "polarity": round(final_polarity, 3),
         "confidence": round(min(1.0, confidence), 2),
         "severity": severity,
@@ -2546,18 +2486,6 @@ def poll_whitehouse(keywords):
                 continue
             matches = match_keywords(text, keywords)
             for kw, sev in matches:
-                # Freshness / restart-dedup gate: skip URLs already in SQLite
-                # so stale items don't flood back after an in-memory reset.
-                try:
-                    _wh_conn = sqlite3.connect(str(DATA_STORE_PATH))
-                    _wh_row = _wh_conn.execute(
-                        "SELECT 1 FROM articles WHERE url = ? LIMIT 1", (href,)
-                    ).fetchone()
-                    _wh_conn.close()
-                    if _wh_row:
-                        continue
-                except Exception:
-                    pass
                 store.add(
                     source_id="whitehouse",
                     source_name="White House",
@@ -2729,10 +2657,15 @@ def monitor_loop():
             interval = config.get("poll_interval_seconds", 120)
             _max_article_age_hours = config.get("max_article_age_hours", 4)
 
-            # Ollama config
-            store.ollama_url = config.get("ollama_url", "")
-            store.ollama_model = config.get("ollama_model", "llama3")
-            ollama_status = f"Ollama: {store.ollama_model}@{store.ollama_url}" if store.ollama_url else "Ollama: off"
+            # Ollama config — analysis lane for background enrichment
+            analysis_url, analysis_model = get_ollama_lane(config, "analysis")
+            store.ollama_url = analysis_url
+            store.ollama_model = analysis_model
+            # Log both lanes for observability
+            chat_url, chat_model = get_ollama_lane(config, "chat")
+            ollama_status = f"Analysis: {analysis_model}@{analysis_url}" if analysis_url else "Analysis: off"
+            if chat_url != analysis_url or chat_model != analysis_model:
+                ollama_status += f" | Chat: {chat_model}@{chat_url}"
 
             # Split accounts by platform
             all_accounts = config.get("monitored_accounts", [])
@@ -3020,23 +2953,18 @@ def import_signal_csv():
 @app.route("/api/chat", methods=["POST"])
 def ollama_chat():
     """
-    Ask a follow-up question about an article using Ollama.
-    Expects: {
-        "alert_id": 123456,
-        "question": "What sectors are affected?",
-        "history": [{"role":"user","text":"..."}, {"role":"ai","text":"..."}]
-    }
+    Ask a follow-up question about an article using Ollama (CHAT lane).
     """
+    global _chat_active
     data = request.get_json(silent=True) or {}
     question = data.get("question", "").strip()
     alert_id = data.get("alert_id")
     history = data.get("history", [])
 
     config = load_config()
-    ollama_url = config.get("ollama_url", "")
-    ollama_model = config.get("ollama_model", "llama3")
+    chat_url, chat_model = get_ollama_lane(config, "chat")
 
-    if not ollama_url:
+    if not chat_url:
         return jsonify({"error": "Ollama not configured. Add ollama_url to config.json"}), 400
     if not question:
         return jsonify({"error": "No question provided"}), 400
@@ -3052,11 +2980,15 @@ def ollama_chat():
     if not context:
         context = "No specific article context available."
 
-    # Build conversation history for context
+    # Reduced history from 10 to 5
     conv_text = ""
-    for msg in history[-10:]:  # Last 10 messages to keep prompt manageable
+    for msg in history[-5:]:
         role = "User" if msg.get("role") == "user" else "Assistant"
         conv_text += f"\n{role}: {msg.get('text', '')}"
+
+    # Signal that chat is active so background enrichment yields
+    with _chat_active_lock:
+        _chat_active += 1
 
     try:
         prompt = (
@@ -3068,13 +3000,20 @@ def ollama_chat():
         prompt += f"\nUser: {question}\n\nAssistant:"
 
         resp = requests.post(
-            f"{ollama_url.rstrip('/')}/api/generate",
-            json={"model": ollama_model, "prompt": prompt, "stream": False},
-            timeout=60,
+            f"{chat_url.rstrip('/')}/api/generate",
+            json={
+                "model": chat_model,
+                "prompt": prompt,
+                "stream": False,
+                "options": {
+                    "num_predict": OLLAMA_CHAT_NUM_PREDICT,
+                    "temperature": OLLAMA_CHAT_TEMPERATURE,
+                },
+            },
+            timeout=OLLAMA_CHAT_TIMEOUT,
         )
         if resp.status_code == 200:
             answer = resp.json().get("response", "").strip()
-            # Log chat to data store with full context
             article_title = ""
             article_url = ""
             source_id_chat = ""
@@ -3091,50 +3030,51 @@ def ollama_chat():
                      article_url=article_url, source_id=source_id_chat, keyword=keyword_chat)
             return jsonify({"answer": answer})
         return jsonify({"error": f"Ollama returned {resp.status_code}"}), 500
+    except requests.exceptions.Timeout:
+        log_system_event("ollama_timeout", "Per-article chat timeout",
+                         f"model={chat_model} timeout={OLLAMA_CHAT_TIMEOUT}s")
+        return jsonify({"error": "Ollama took too long to respond. Try a shorter question or wait for background analysis to finish."}), 504
     except Exception as e:
         return jsonify({"error": f"Ollama error: {str(e)}"}), 500
+    finally:
+        with _chat_active_lock:
+            _chat_active = max(0, _chat_active - 1)
 
 
 @app.route("/api/chat/general", methods=["POST"])
 def general_chat():
     """
-    General-purpose AI chat that uses stored articles as context.
-    The AI can reference recent news it has read to give informed responses.
-    Expects: {"question": "...", "history": [...], "tab": "alerts|market|economy|analytics"}
+    General-purpose AI chat using stored articles as context (CHAT lane).
+    Prompts are kept lightweight for fast interactive response.
     """
+    global _chat_active
     data = request.get_json(silent=True) or {}
     question = data.get("question", "").strip()
     history = data.get("history", [])
     current_tab = data.get("tab", "")
 
     config = load_config()
-    ollama_url = config.get("ollama_url", "")
-    ollama_model = config.get("ollama_model", "llama3")
+    chat_url, chat_model = get_ollama_lane(config, "chat")
 
-    if not ollama_url:
+    if not chat_url:
         return jsonify({"error": "Ollama not configured. Add ollama_url to config.json"}), 400
     if not question:
         return jsonify({"error": "No question provided"}), 400
 
-    # ─── Build context from stored data ───
+    # ─── Build lightweight context ───
     context_parts = []
 
-    # 1. Search articles database for relevant content
     try:
         conn = sqlite3.connect(str(DATA_STORE_PATH))
         conn.row_factory = sqlite3.Row
         c = conn.cursor()
 
-        # Extract key terms from the question for search
         q_lower = question.lower()
         search_words = [w for w in q_lower.split() if len(w) > 3 and w not in
                         ("what", "when", "where", "which", "about", "could", "would",
                          "should", "think", "your", "that", "this", "have", "from",
                          "they", "been", "with", "will", "does", "going")]
 
-        # Search for matching articles (title + keyword match)
-        matched_articles = []
-        # Determine available columns safely
         safe_cols = "title, summary, sentiment, source_name, published_at, keyword"
         try:
             c.execute("SELECT market_impact FROM articles LIMIT 1")
@@ -3147,26 +3087,23 @@ def general_chat():
         except Exception:
             pass
 
+        # Matched articles — reduced from 8 to 4
+        matched_articles = []
         if search_words:
             where_clauses = []
             params = []
-            for w in search_words[:5]:
-                # Also search summary and article_text (first 500 chars) for better recall
-                where_clauses.append(
-                    "(LOWER(title) LIKE ? OR keyword LIKE ?"
-                    " OR LOWER(summary) LIKE ?"
-                    " OR LOWER(SUBSTR(article_text,1,500)) LIKE ?)"
-                )
-                params.extend([f"%{w}%", f"%{w}%", f"%{w}%", f"%{w}%"])
-            query = f"SELECT {safe_cols} FROM articles WHERE {' OR '.join(where_clauses)} ORDER BY id DESC LIMIT 8"
+            for w in search_words[:4]:
+                where_clauses.append("(LOWER(title) LIKE ? OR keyword LIKE ?)")
+                params.extend([f"%{w}%", f"%{w}%"])
+            query = f"SELECT {safe_cols} FROM articles WHERE {' OR '.join(where_clauses)} ORDER BY id DESC LIMIT 4"
             c.execute(query, params)
             matched_articles = [dict(r) for r in c.fetchall()]
 
-        # 2. Always include the most recent articles for general awareness
-        c.execute(f"SELECT {safe_cols} FROM articles ORDER BY id DESC LIMIT 5")
+        # Recent articles — reduced from 5 to 3
+        c.execute(f"SELECT {safe_cols} FROM articles ORDER BY id DESC LIMIT 3")
         recent_articles = [dict(r) for r in c.fetchall()]
 
-        # 3. Get sentiment stats for overall market mood
+        # 24h mood — keep lightweight
         c.execute("SELECT sentiment, COUNT(*) FROM articles WHERE timestamp > datetime('now', '-24 hours') GROUP BY sentiment")
         sentiment_24h = dict(c.fetchall())
 
@@ -3177,19 +3114,18 @@ def general_chat():
         recent_articles = []
         sentiment_24h = {}
 
-    # Build the context string
     if matched_articles:
-        context_parts.append("RELEVANT ARTICLES (matching your question):")
+        context_parts.append("RELEVANT ARTICLES:")
         for a in matched_articles:
-            # Prefer user-corrected impact
             impact = a.get("user_corrected_impact", "") or a.get("market_impact", "")
-            summary = a.get("summary", "")[:150]
-            context_parts.append(f"- [{impact}] {a.get('title', '')} ({a.get('source_name', '')}, {a.get('published_at', '')})")
+            # Trim summaries aggressively
+            summary = a.get("summary", "")[:100]
+            context_parts.append(f"- [{impact}] {a.get('title', '')} ({a.get('source_name', '')})")
             if summary:
-                context_parts.append(f"  Summary: {summary}")
+                context_parts.append(f"  {summary}")
 
     if recent_articles:
-        context_parts.append("\nLATEST ARTICLES (most recent):")
+        context_parts.append("\nLATEST:")
         for a in recent_articles:
             impact = a.get("user_corrected_impact", "") or a.get("market_impact", "")
             context_parts.append(f"- [{impact}] {a.get('title', '')} ({a.get('source_name', '')})")
@@ -3198,50 +3134,53 @@ def general_chat():
         pos = sentiment_24h.get("positive", 0)
         neg = sentiment_24h.get("negative", 0)
         neu = sentiment_24h.get("neutral", 0)
-        context_parts.append(f"\nMARKET MOOD (last 24h): {pos} positive, {neg} negative, {neu} neutral articles")
+        context_parts.append(f"\n24h mood: {pos}+ {neg}- {neu}= articles")
 
-    # 4. Add live alert snapshot
+    # Live alerts — reduced from 5 to 3
     with store.lock:
-        recent_alerts = store.alerts[:5]
+        recent_alerts = store.alerts[:3]
     if recent_alerts:
-        context_parts.append("\nLIVE ALERTS (most recent):")
+        context_parts.append("\nLIVE:")
         for a in recent_alerts:
-            context_parts.append(f"- [{a.get('market_impact', 'neutral')}] {a.get('title', '')} (conf: {a.get('confidence', 0)}, via {a.get('source_name', '')})")
-
-    # 5. Get macro context
-    macro = get_macro_context()
-    if macro:
-        context_parts.append(f"\n{macro}")
+            context_parts.append(f"- [{a.get('market_impact', 'neutral')}] {a.get('title', '')} (via {a.get('source_name', '')})")
 
     context_str = "\n".join(context_parts) if context_parts else "No article data available yet."
 
-    # Build conversation history
+    # Conversation history — reduced from 10 to 5
     conv_text = ""
-    for msg in history[-10:]:
+    for msg in history[-5:]:
         role = "User" if msg.get("role") == "user" else "Assistant"
         conv_text += f"\n{role}: {msg.get('text', '')}"
 
-    # Build prompt
     prompt = (
-        "You are a financial market analyst assistant. You have been reading and analyzing news articles "
-        "in real-time. Use the article data below to give informed, specific responses. "
-        "Reference specific articles, trends, and data points when relevant. "
-        "Be concise but thorough. If you don't have relevant data, say so honestly.\n\n"
-        f"YOUR KNOWLEDGE BASE:\n{context_str}\n"
+        "You are a financial market analyst assistant with real-time news data. "
+        "Be concise and specific. Reference articles when relevant.\n\n"
+        f"DATA:\n{context_str}\n"
     )
     if conv_text:
-        prompt += f"\nPREVIOUS CONVERSATION:{conv_text}\n"
+        prompt += f"\nHISTORY:{conv_text}\n"
     prompt += f"\nUser: {question}\n\nAssistant:"
+
+    # Signal chat is active
+    with _chat_active_lock:
+        _chat_active += 1
 
     try:
         resp = requests.post(
-            f"{ollama_url.rstrip('/')}/api/generate",
-            json={"model": ollama_model, "prompt": prompt, "stream": False},
-            timeout=90,
+            f"{chat_url.rstrip('/')}/api/generate",
+            json={
+                "model": chat_model,
+                "prompt": prompt,
+                "stream": False,
+                "options": {
+                    "num_predict": OLLAMA_CHAT_NUM_PREDICT,
+                    "temperature": OLLAMA_CHAT_TEMPERATURE,
+                },
+            },
+            timeout=OLLAMA_CHAT_TIMEOUT,
         )
         if resp.status_code == 200:
             answer = resp.json().get("response", "").strip()
-            # Log the conversation
             log_chat(0, "general_chat", question, answer)
             return jsonify({
                 "answer": answer,
@@ -3249,8 +3188,15 @@ def general_chat():
                 "recent_articles": len(recent_articles),
             })
         return jsonify({"error": f"Ollama returned {resp.status_code}"}), 500
+    except requests.exceptions.Timeout:
+        log_system_event("ollama_timeout", "General chat timeout",
+                         f"model={chat_model} timeout={OLLAMA_CHAT_TIMEOUT}s prompt_len={len(prompt)}")
+        return jsonify({"error": "Ollama took too long to respond. Try a shorter question or wait for background analysis to finish."}), 504
     except Exception as e:
         return jsonify({"error": f"Ollama error: {str(e)}"}), 500
+    finally:
+        with _chat_active_lock:
+            _chat_active = max(0, _chat_active - 1)
 
 
 # ─── Market Data API ──────────────────────────────────────────────────────────
@@ -3356,10 +3302,6 @@ def save_market_news_sources(sources):
 
 def fetch_yahoo_quote(symbol, range_str="1d", interval="5m"):
     """Fetch quote and chart data from Yahoo Finance."""
-    cache_key = f"yahoo:{symbol.upper()}:{range_str}:{interval}"
-    cached = cache_get(cache_key, quote_cache_ttl(range_str, interval))
-    if cached:
-        return cached
     try:
         headers = {"User-Agent": "Mozilla/5.0"}
         params = {"range": range_str, "interval": interval, "includePrePost": "true"}
@@ -3397,7 +3339,7 @@ def fetch_yahoo_quote(symbol, range_str="1d", interval="5m"):
         change = current - prev_close if prev_close else 0
         change_pct = (change / prev_close * 100) if prev_close else 0
 
-        return cache_set(cache_key, {
+        return {
             "symbol": meta.get("symbol", symbol).upper(),
             "name": meta.get("shortName", meta.get("longName", symbol)),
             "type": "stock",
@@ -3416,7 +3358,7 @@ def fetch_yahoo_quote(symbol, range_str="1d", interval="5m"):
             "fifty_two_wk_low": round(meta.get("fiftyTwoWeekLow", 0), 2),
             "chart": chart_data,
             "valid": True,
-        })
+        }
     except Exception as e:
         log.warning(f"Yahoo Finance error [{symbol}]: {e}")
         return None
@@ -3424,10 +3366,6 @@ def fetch_yahoo_quote(symbol, range_str="1d", interval="5m"):
 
 def fetch_crypto_quote(crypto_id, range_str="1d"):
     """Fetch crypto data from CoinGecko (free, no key needed)."""
-    cache_key = f"crypto_quote:{crypto_id}:{range_str}"
-    cached = cache_get(cache_key, quote_cache_ttl(range_str))
-    if cached:
-        return cached
     try:
         # Map range to CoinGecko days param
         days_map = {"1d": "1", "5d": "5", "1mo": "30", "3mo": "90", "6mo": "180", "1y": "365"}
@@ -3462,7 +3400,7 @@ def fetch_crypto_quote(crypto_id, range_str="1d"):
         change_pct = md.get("price_change_percentage_24h", 0) or 0
         symbol = coin.get("symbol", crypto_id).upper()
 
-        return cache_set(cache_key, {
+        return {
             "symbol": symbol,
             "name": coin.get("name", crypto_id),
             "type": "crypto",
@@ -3482,7 +3420,7 @@ def fetch_crypto_quote(crypto_id, range_str="1d"):
             "chart": chart_data,
             "valid": True,
             "coingecko_id": crypto_id,
-        })
+        }
     except Exception as e:
         log.warning(f"CoinGecko error [{crypto_id}]: {e}")
         return None
@@ -3491,18 +3429,15 @@ def fetch_crypto_quote(crypto_id, range_str="1d"):
 def resolve_crypto_id(symbol):
     """Resolve a crypto ticker to a CoinGecko ID."""
     sym = symbol.upper().strip()
-    cached = cache_get(f"crypto_id:{sym}", 86400)
-    if cached:
-        return cached
     if sym in CRYPTO_MAP:
-        return cache_set(f"crypto_id:{sym}", CRYPTO_MAP[sym])
+        return CRYPTO_MAP[sym]
     # Try searching CoinGecko
     try:
         resp = requests.get(f"{COINGECKO_URL}/search", params={"query": sym}, timeout=10)
         if resp.status_code == 200:
             coins = resp.json().get("coins", [])
             if coins:
-                return cache_set(f"crypto_id:{sym}", coins[0]["id"])
+                return coins[0]["id"]
     except Exception:
         pass
     return None
@@ -3514,18 +3449,12 @@ def get_indices():
     range_str = request.args.get("range", "1d")
     interval = request.args.get("interval", "5m")
     selected = load_indices_config()
-    cache_key = "indices:%s:%s:%s" % ("|".join(selected), range_str, interval)
-    cached = cache_get(cache_key, 15)
-    if cached:
-        return jsonify(cached)
     results = {}
     for sym in selected:
         data = fetch_yahoo_quote(sym, range_str, interval)
         if data:
             results[sym] = data
-    payload = {"indices": results}
-    cache_set(cache_key, payload)
-    return jsonify(payload)
+    return jsonify({"indices": results})
 
 
 @app.route("/api/market/indices/config")
@@ -3564,9 +3493,6 @@ SECTOR_ETFS = {
 @app.route("/api/market/sectors")
 def get_sectors():
     """Get sector performance data using sector ETFs."""
-    cached = cache_get("market:sectors", 60)
-    if cached:
-        return jsonify(cached)
     results = []
     for sym, name in SECTOR_ETFS.items():
         try:
@@ -3584,9 +3510,7 @@ def get_sectors():
             pass
     # Sort by absolute market cap (approximate via ETF AUM)
     results.sort(key=lambda x: abs(x.get("market_cap", 0)), reverse=True)
-    payload = {"sectors": results}
-    cache_set("market:sectors", payload)
-    return jsonify(payload)
+    return jsonify({"sectors": results})
 
 
 @app.route("/api/market/quote/<symbol>")
@@ -3614,10 +3538,6 @@ def get_quote(symbol):
 def get_watchlist():
     """Get watchlist with live quotes."""
     wl = load_watchlist()
-    cache_key = "watchlist:%s" % json.dumps(wl, sort_keys=True)
-    cached = cache_get(cache_key, 15)
-    if cached:
-        return jsonify(cached)
     quotes = {}
     errors = []
     for item in wl:
@@ -3637,9 +3557,7 @@ def get_watchlist():
                 quotes[sym] = data
             else:
                 errors.append(sym)
-    payload = {"watchlist": wl, "quotes": quotes, "errors": errors}
-    cache_set(cache_key, payload)
-    return jsonify(payload)
+    return jsonify({"watchlist": wl, "quotes": quotes, "errors": errors})
 
 
 @app.route("/api/market/watchlist", methods=["POST"])
@@ -3669,14 +3587,12 @@ def update_watchlist():
             wl.append({"symbol": sym, "type": "stock"})
 
         save_watchlist(wl)
-        cache_invalidate("watchlist:")
         return jsonify({"watchlist": wl, "status": "added"})
 
     elif data.get("remove"):
         sym = data["remove"].upper().strip()
         wl = [item for item in wl if item["symbol"] != sym]
         save_watchlist(wl)
-        cache_invalidate("watchlist:")
         return jsonify({"watchlist": wl, "status": "removed"})
 
     return jsonify({"watchlist": wl})
@@ -3689,11 +3605,6 @@ def get_market_news():
     """Fetch market news from configured sources. Optional ?symbol= to filter by ticker."""
     symbol = request.args.get("symbol", "").upper()
     sources = load_market_news_sources()
-    enabled_snapshot = json.dumps(sources, sort_keys=True)
-    cache_key = "market_news:%s:%s" % (symbol, enabled_snapshot)
-    cached = cache_get(cache_key, 60)
-    if cached:
-        return jsonify(cached)
     articles = []
 
     for src_id, src in sources.items():
@@ -3729,9 +3640,7 @@ def get_market_news():
         except Exception as e:
             log.debug(f"Market news error [{src_id}]: {e}")
 
-    payload = {"articles": articles[:30]}
-    cache_set(cache_key, payload)
-    return jsonify(payload)
+    return jsonify({"articles": articles[:30]})
 
 
 @app.route("/api/market/news-sources")
@@ -3748,7 +3657,6 @@ def update_market_news_sources():
         if src_id in sources:
             sources[src_id]["enabled"] = not sources[src_id].get("enabled", True)
             save_market_news_sources(sources)
-            cache_invalidate("market_news:")
     return jsonify({"sources": sources})
 
 
@@ -4115,9 +4023,6 @@ def fred_dashboard():
     api_key = config.get("fred_api_key", "")
     if not api_key:
         return jsonify({"error": "Add fred_api_key to config.json"}), 400
-    cached = cache_get("economy:fred_dashboard", 300)
-    if cached:
-        return jsonify(cached)
     indicators = {
         "FEDFUNDS": "Fed Funds Rate",
         "DFF": "Effective Fed Funds Rate",
@@ -4150,9 +4055,7 @@ def fred_dashboard():
                                     "date": current["date"]}
         except Exception:
             pass
-    payload = {"indicators": results}
-    cache_set("economy:fred_dashboard", payload)
-    return jsonify(payload)
+    return jsonify({"indicators": results})
 
 
 # Alpha Vantage — stock data with free key (25 req/day)
@@ -4195,17 +4098,13 @@ def alpha_vantage_quote(symbol):
 def binance_ticker(symbol):
     """Get 24h ticker data from Binance for a crypto pair."""
     try:
-        cache_key = "crypto:binance:%s" % symbol.upper()
-        cached = cache_get(cache_key, 15)
-        if cached:
-            return jsonify(cached)
         pair = symbol.upper() + "USDT"
         resp = requests.get(f"https://api.binance.com/api/v3/ticker/24hr",
                             params={"symbol": pair}, timeout=10)
         if resp.status_code != 200:
             return jsonify({"error": f"Binance: pair {pair} not found"}), 404
         d = resp.json()
-        payload = {
+        return jsonify({
             "symbol": symbol.upper(), "pair": pair,
             "price": round(float(d.get("lastPrice", 0)), 4),
             "change_24h": round(float(d.get("priceChange", 0)), 4),
@@ -4215,9 +4114,7 @@ def binance_ticker(symbol):
             "volume_24h": round(float(d.get("volume", 0)), 2),
             "quote_volume_24h": round(float(d.get("quoteVolume", 0)), 2),
             "trades_24h": int(d.get("count", 0)),
-        }
-        cache_set(cache_key, payload)
-        return jsonify(payload)
+        })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -4276,10 +4173,6 @@ def hackernews_top():
     """Get top Hacker News stories — useful for tech/startup/AI news."""
     try:
         limit = request.args.get("limit", 15, type=int)
-        cache_key = "news:hackernews:%s" % limit
-        cached = cache_get(cache_key, 120)
-        if cached:
-            return jsonify(cached)
         resp = requests.get("https://hacker-news.firebaseio.com/v0/topstories.json", timeout=10)
         if resp.status_code != 200:
             return jsonify({"error": "HN API unavailable"}), 500
@@ -4298,9 +4191,7 @@ def hackernews_top():
                         "by": s.get("by", ""),
                         "time": datetime.fromtimestamp(s.get("time", 0), tz=timezone.utc).isoformat(),
                     })
-        payload = {"stories": stories}
-        cache_set(cache_key, payload)
-        return jsonify(payload)
+        return jsonify({"stories": stories})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -4310,9 +4201,6 @@ def hackernews_top():
 def fear_greed_index():
     """Get CNN Fear & Greed Index — useful context for AI analysis."""
     try:
-        cached = cache_get("market:fear_greed", 120)
-        if cached:
-            return jsonify(cached)
         resp = requests.get("https://api.alternative.me/fng/?limit=7", timeout=10)
         if resp.status_code == 200:
             data = resp.json().get("data", [])
@@ -4323,9 +4211,7 @@ def fear_greed_index():
                     "label": d.get("value_classification", "Neutral"),
                     "timestamp": datetime.fromtimestamp(int(d.get("timestamp", 0)), tz=timezone.utc).isoformat(),
                 })
-            payload = {"fear_greed": results}
-            cache_set("market:fear_greed", payload)
-            return jsonify(payload)
+            return jsonify({"fear_greed": results})
         return jsonify({"error": "Fear & Greed API unavailable"}), 500
     except Exception as e:
         return jsonify({"error": str(e)}), 500

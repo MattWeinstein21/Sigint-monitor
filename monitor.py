@@ -136,7 +136,11 @@ def init_data_store():
     for col, coltype in [("sectors", "TEXT DEFAULT ''"), ("entities", "TEXT DEFAULT ''"),
                           ("user_corrected_sentiment", "TEXT DEFAULT ''"),
                           ("ai_analysis_raw", "TEXT DEFAULT ''"),
-                          ("fetch_duration_ms", "INTEGER DEFAULT 0")]:
+                          ("fetch_duration_ms", "INTEGER DEFAULT 0"),
+                          ("market_impact", "TEXT DEFAULT ''"),
+                          ("word_market_impact", "TEXT DEFAULT ''"),
+                          ("ai_market_impact", "TEXT DEFAULT ''"),
+                          ("published_at_utc", "TEXT DEFAULT ''")]:
         try:
             c.execute(f"ALTER TABLE articles ADD COLUMN {col} {coltype}")
         except Exception:
@@ -300,35 +304,78 @@ def link_tickers_to_alert(title, text, keyword, entities):
 # ─── Data Logging Functions ───────────────────────────────────────────────────
 
 def log_article(alert_data, article_text=""):
-    """Log an article and its analysis to the data store."""
+    """Log an article and its analysis to the data store.
+    Uses INSERT OR IGNORE + UPDATE to avoid silently dropping columns."""
     try:
-        # Extract sectors and entities
         full_text = article_text or alert_data.get("title", "")
         sectors = extract_sectors(full_text)
         entities = extract_entities(full_text)
+        url = alert_data.get("url", "")
+        if not url:
+            return
 
         conn = sqlite3.connect(str(DATA_STORE_PATH))
         c = conn.cursor()
-        c.execute("""INSERT OR REPLACE INTO articles
-            (timestamp, published_at, source_id, source_name, title, url, keyword,
-             article_text, summary, sentiment, sentiment_score,
-             ai_sentiment, word_sentiment, confidence, severity,
-             positive_signals, negative_signals,
-             article_fetched, ai_summary, sectors, entities)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+
+        # Try INSERT first (only fires if url is new)
+        c.execute("""INSERT OR IGNORE INTO articles
+            (timestamp, url, title, source_id, source_name, keyword)
+            VALUES (?,?,?,?,?,?)""",
+            (alert_data.get("timestamp", ""), url,
+             alert_data.get("title", ""),
+             alert_data.get("source", ""),
+             alert_data.get("source_name", ""),
+             alert_data.get("keyword", "")))
+
+        # Always UPDATE — safe for both new and existing rows
+        pub_utc = alert_data.get("published_at_utc", "")
+        c.execute("""UPDATE articles SET
+            timestamp = COALESCE(NULLIF(?, ''), timestamp),
+            published_at = COALESCE(NULLIF(?, ''), published_at),
+            published_at_utc = COALESCE(NULLIF(?, ''), published_at_utc),
+            source_id = COALESCE(NULLIF(?, ''), source_id),
+            source_name = COALESCE(NULLIF(?, ''), source_name),
+            title = COALESCE(NULLIF(?, ''), title),
+            keyword = COALESCE(NULLIF(?, ''), keyword),
+            article_text = CASE WHEN LENGTH(?) > LENGTH(COALESCE(article_text, '')) THEN ? ELSE article_text END,
+            summary = COALESCE(NULLIF(?, ''), summary),
+            sentiment = COALESCE(NULLIF(?, ''), sentiment),
+            sentiment_score = CASE WHEN ? != 0 THEN ? ELSE sentiment_score END,
+            ai_sentiment = COALESCE(NULLIF(?, ''), ai_sentiment),
+            word_sentiment = COALESCE(NULLIF(?, ''), word_sentiment),
+            market_impact = COALESCE(NULLIF(?, ''), market_impact),
+            word_market_impact = COALESCE(NULLIF(?, ''), word_market_impact),
+            ai_market_impact = COALESCE(NULLIF(?, ''), ai_market_impact),
+            confidence = CASE WHEN ? > 0 THEN ? ELSE confidence END,
+            severity = COALESCE(NULLIF(?, ''), severity),
+            positive_signals = COALESCE(NULLIF(?, '[]'), positive_signals),
+            negative_signals = COALESCE(NULLIF(?, '[]'), negative_signals),
+            article_fetched = MAX(COALESCE(article_fetched, 0), ?),
+            ai_summary = MAX(COALESCE(ai_summary, 0), ?),
+            sectors = COALESCE(NULLIF(?, '[]'), sectors),
+            entities = COALESCE(NULLIF(?, '[]'), entities),
+            ai_analysis_raw = COALESCE(NULLIF(?, ''), ai_analysis_raw),
+            fetch_duration_ms = CASE WHEN ? > 0 THEN ? ELSE fetch_duration_ms END
+            WHERE url = ?""",
             (alert_data.get("timestamp", ""),
              alert_data.get("published_at", ""),
+             pub_utc,
              alert_data.get("source", ""),
              alert_data.get("source_name", ""),
              alert_data.get("title", ""),
-             alert_data.get("url", ""),
              alert_data.get("keyword", ""),
+             article_text[:8000] if article_text else "",
              article_text[:8000] if article_text else "",
              alert_data.get("summary", ""),
              alert_data.get("sentiment", ""),
              alert_data.get("sentiment_score", 0),
+             alert_data.get("sentiment_score", 0),
              alert_data.get("ai_sentiment", "") or "",
              alert_data.get("word_sentiment", "") or "",
+             alert_data.get("market_impact", "") or "",
+             alert_data.get("word_market_impact", "") or "",
+             alert_data.get("ai_market_impact", "") or "",
+             alert_data.get("confidence", 0),
              alert_data.get("confidence", 0),
              alert_data.get("severity", ""),
              json.dumps(alert_data.get("positive_signals", [])),
@@ -336,7 +383,11 @@ def log_article(alert_data, article_text=""):
              1 if alert_data.get("article_fetched") else 0,
              1 if alert_data.get("ai_summary") else 0,
              json.dumps(sectors),
-             json.dumps(entities)))
+             json.dumps(entities),
+             alert_data.get("ai_analysis_raw", "") or "",
+             alert_data.get("fetch_duration_ms", 0),
+             alert_data.get("fetch_duration_ms", 0),
+             url))
         conn.commit()
         conn.close()
     except Exception as e:
@@ -394,20 +445,21 @@ def log_sentiment_correction(url, title, original, corrected, source_id="", keyw
 def get_related_articles(keyword="", sector="", limit=5):
     """
     Fetch recent related articles from the data store.
-    Used to build context for Ollama so it can reference past coverage.
+    Includes user-corrected labels when available for trend context.
     """
     try:
         conn = sqlite3.connect(str(DATA_STORE_PATH))
         conn.row_factory = sqlite3.Row
         c = conn.cursor()
+        cols = "title, summary, sentiment, market_impact, published_at, source_name, user_corrected_sentiment"
         if keyword:
-            c.execute("SELECT title, summary, sentiment, published_at, source_name FROM articles WHERE keyword = ? ORDER BY id DESC LIMIT ?",
+            c.execute(f"SELECT {cols} FROM articles WHERE keyword = ? ORDER BY id DESC LIMIT ?",
                       (keyword.lower(), limit))
         elif sector:
-            c.execute("SELECT title, summary, sentiment, published_at, source_name FROM articles WHERE sectors LIKE ? ORDER BY id DESC LIMIT ?",
+            c.execute(f"SELECT {cols} FROM articles WHERE sectors LIKE ? ORDER BY id DESC LIMIT ?",
                       (f"%{sector}%", limit))
         else:
-            c.execute("SELECT title, summary, sentiment, published_at, source_name FROM articles ORDER BY id DESC LIMIT ?", (limit,))
+            c.execute(f"SELECT {cols} FROM articles ORDER BY id DESC LIMIT ?", (limit,))
         rows = [dict(r) for r in c.fetchall()]
         conn.close()
         return rows
@@ -418,15 +470,19 @@ def get_related_articles(keyword="", sector="", limit=5):
 def build_trend_context(keyword="", sector="", limit=10):
     """
     Build a text summary of recent trends for a keyword/sector.
-    This gets injected into Ollama prompts for better contextual analysis.
+    Prefers user-corrected labels when available. Shows impact + tone.
     """
     articles = get_related_articles(keyword=keyword, sector=sector, limit=limit)
     if not articles:
         return ""
     lines = [f"Recent coverage on '{keyword or sector}':"]
     for a in articles:
-        sent = a.get("sentiment", "neutral")
-        lines.append(f"- [{sent}] {a.get('title', '')} ({a.get('source_name', '')}, {a.get('published_at', '')})")
+        # Prefer corrected labels
+        corrected = a.get("user_corrected_sentiment", "")
+        tone = corrected if corrected else a.get("sentiment", "neutral")
+        impact = a.get("market_impact", "neutral")
+        corrected_tag = " (user-corrected)" if corrected else ""
+        lines.append(f"- [impact:{impact} tone:{tone}{corrected_tag}] {a.get('title', '')} ({a.get('source_name', '')}, {a.get('published_at', '')})")
     return "\n".join(lines)
 
 
@@ -439,15 +495,14 @@ log_system_event("startup", "SIGINT monitor initialized")
 
 def get_correction_stats(source_id="", keyword=""):
     """
-    Query historical corrections to determine AI vs lexicon accuracy.
-    Used by the ensemble to decide who to trust on disagreements.
-    Returns default values if insufficient data.
+    Query historical corrections to determine AI vs lexicon accuracy for both tone and impact.
+    Uses AND when both filters provided, falls back to global stats if sample too small.
     """
     try:
         conn = sqlite3.connect(str(DATA_STORE_PATH))
         c = conn.cursor()
 
-        # Build query based on filters
+        # Build query — AND when both provided, not OR
         where_parts = []
         params = []
         if source_id:
@@ -457,8 +512,9 @@ def get_correction_stats(source_id="", keyword=""):
             where_parts.append("sc.keyword = ?")
             params.append(keyword)
 
-        where_clause = "WHERE " + " OR ".join(where_parts) if where_parts else ""
+        where_clause = "WHERE " + " AND ".join(where_parts) if where_parts else ""
 
+        # Tone accuracy (backward compat)
         c.execute(f"""SELECT
             SUM(CASE WHEN sc.corrected_sentiment = a.ai_sentiment THEN 1 ELSE 0 END) as ai_right,
             SUM(CASE WHEN sc.corrected_sentiment = a.word_sentiment THEN 1 ELSE 0 END) as word_right,
@@ -466,21 +522,55 @@ def get_correction_stats(source_id="", keyword=""):
             FROM sentiment_corrections sc
             LEFT JOIN articles a ON sc.article_url = a.url
             {where_clause}""", params)
-
         row = c.fetchone()
+
+        # Impact accuracy (new)
+        c.execute(f"""SELECT
+            SUM(CASE WHEN sc.corrected_impact = a.ai_market_impact THEN 1 ELSE 0 END) as ai_impact_right,
+            SUM(CASE WHEN sc.corrected_impact = a.word_market_impact THEN 1 ELSE 0 END) as word_impact_right,
+            SUM(CASE WHEN sc.corrected_impact != '' THEN 1 ELSE 0 END) as impact_total
+            FROM sentiment_corrections sc
+            LEFT JOIN articles a ON sc.article_url = a.url
+            {where_clause}""", params)
+        impact_row = c.fetchone()
+
         conn.close()
+
+        result = {"llm_accuracy": 0.7, "lexicon_accuracy": 0.5, "sample_size": 0,
+                  "llm_impact_accuracy": 0.7, "lexicon_impact_accuracy": 0.5, "impact_sample_size": 0}
 
         if row and row[2] and row[2] > 5:
             total = row[2]
-            return {
-                "llm_accuracy": (row[0] or 0) / total,
-                "lexicon_accuracy": (row[1] or 0) / total,
-                "sample_size": total,
-            }
+            result["llm_accuracy"] = (row[0] or 0) / total
+            result["lexicon_accuracy"] = (row[1] or 0) / total
+            result["sample_size"] = total
+        elif where_parts:
+            # Fallback to global stats if filtered sample is too small
+            c2 = sqlite3.connect(str(DATA_STORE_PATH)).cursor()
+            c2.execute("""SELECT
+                SUM(CASE WHEN sc.corrected_sentiment = a.ai_sentiment THEN 1 ELSE 0 END),
+                SUM(CASE WHEN sc.corrected_sentiment = a.word_sentiment THEN 1 ELSE 0 END),
+                COUNT(*)
+                FROM sentiment_corrections sc LEFT JOIN articles a ON sc.article_url = a.url""")
+            grow = c2.fetchone()
+            c2.connection.close()
+            if grow and grow[2] and grow[2] > 5:
+                result["llm_accuracy"] = (grow[0] or 0) / grow[2]
+                result["lexicon_accuracy"] = (grow[1] or 0) / grow[2]
+                result["sample_size"] = grow[2]
+
+        if impact_row and impact_row[2] and impact_row[2] > 3:
+            itotal = impact_row[2]
+            result["llm_impact_accuracy"] = (impact_row[0] or 0) / itotal
+            result["lexicon_impact_accuracy"] = (impact_row[1] or 0) / itotal
+            result["impact_sample_size"] = itotal
+
+        return result
     except Exception as e:
         log.debug(f"Correction stats error: {e}")
 
-    return {"llm_accuracy": 0.7, "lexicon_accuracy": 0.5, "sample_size": 0}
+    return {"llm_accuracy": 0.7, "lexicon_accuracy": 0.5, "sample_size": 0,
+            "llm_impact_accuracy": 0.7, "lexicon_impact_accuracy": 0.5, "impact_sample_size": 0}
 
 
 def recalibrate_thresholds():
@@ -983,11 +1073,46 @@ class AlertStore:
                 time.sleep(2)
 
     def _enrich_with_ai(self, job):
-        """Run Ollama analysis, ensemble with lexicon, update alert in place."""
+        """Fetch article (if needed), run Ollama analysis, ensemble with lexicon, update alert."""
         alert_id = job["alert_id"]
-        analysis_text = job["analysis_text"]
         source_id = job["source_id"]
         keyword = job["keyword"]
+
+        # Phase 1: Fetch article text if not already done
+        analysis_text = job.get("snippet_text", "")
+        if job.get("needs_fetch") and job.get("url"):
+            t0 = time.time()
+            article_text, fetched = fetch_article_text(job["url"])
+            fetch_ms = int((time.time() - t0) * 1000)
+            if fetched and article_text:
+                analysis_text = article_text
+                # Re-run lexicon on full text for better accuracy
+                word_result = analyze_sentiment_words_only(
+                    analysis_text, source_id=source_id, matched_keywords=[keyword],
+                )
+                with self.lock:
+                    for a in self.alerts:
+                        if a["id"] == alert_id:
+                            a["article_fetched"] = True
+                            a["fetch_duration_ms"] = fetch_ms
+                            a["word_sentiment"] = word_result["article_tone"]
+                            a["word_market_impact"] = word_result["market_impact"]
+                            a["positive_signals"] = word_result["positive_signals"]
+                            a["negative_signals"] = word_result["negative_signals"]
+                            # Update lexicon classification with full text
+                            if not a.get("user_corrected"):
+                                a["article_tone"] = word_result["article_tone"]
+                                a["market_impact"] = word_result["market_impact"]
+                                a["sentiment"] = word_result["article_tone"]
+                                a["confidence"] = word_result["confidence"]
+                            # Update summary
+                            sentences = re.split(r'(?<=[.!?])\s+', analysis_text[:600])
+                            a["summary"] = " ".join(sentences[:2]).strip()[:250]
+                            break
+                log_article({"url": job["url"], "article_fetched": True,
+                             "fetch_duration_ms": fetch_ms,
+                             "word_sentiment": word_result["article_tone"],
+                             "word_market_impact": word_result["market_impact"]}, article_text)
 
         if not self.ollama_url:
             with self.lock:
@@ -997,6 +1122,7 @@ class AlertStore:
                         break
             return
 
+        # Phase 2: Run Ollama
         llm_result, raw_response, success = ollama_analyze(
             analysis_text, self.ollama_url, self.ollama_model, keyword=keyword
         )
@@ -1005,25 +1131,32 @@ class AlertStore:
             for alert in self.alerts:
                 if alert["id"] == alert_id:
                     alert["ai_processing"] = False
+                    alert["ai_analysis_raw"] = raw_response[:2000] if raw_response else ""
 
                     if not success:
                         log.debug(f"AI enrichment failed for alert {alert_id}")
+                        log_system_event("ollama_fail", f"Enrichment failed: {alert.get('title', '')[:60]}", raw_response[:500])
                         break
 
                     # ─── Ensemble: combine lexicon + LLM ───
                     lexicon_tone = alert.get("article_tone", alert.get("sentiment", "neutral"))
+                    lexicon_impact = alert.get("word_market_impact", alert.get("market_impact", "neutral"))
                     llm_tone = llm_result.get("article_tone", "neutral")
                     llm_impact = llm_result.get("market_impact", "neutral")
                     llm_conf = llm_result.get("confidence", 0.5)
                     lex_conf = alert.get("confidence", 0.3)
                     source_reliability = SOURCE_WEIGHTS.get(source_id, 0.5)
 
-                    # Update summary (always use LLM if available)
+                    # Store per-engine results
+                    alert["ai_sentiment"] = llm_tone
+                    alert["ai_market_impact"] = llm_impact
+
+                    # Summary (always prefer LLM)
                     if llm_result.get("summary"):
                         alert["summary"] = llm_result["summary"][:500]
                         alert["ai_summary"] = True
 
-                    # Ensemble tone decision
+                    # ─── Tone ensemble ───
                     if lexicon_tone == llm_tone:
                         final_tone = llm_tone
                         final_conf = min(1.0, llm_conf * 0.6 + lex_conf * 0.3 + 0.1)
@@ -1042,7 +1175,6 @@ class AlertStore:
                             final_conf = 0.4
                             method = "both_weak"
                     else:
-                        # Direct disagreement — use historical accuracy to decide
                         stats = get_correction_stats(source_id, keyword)
                         if stats["sample_size"] > 5 and stats["llm_accuracy"] > stats["lexicon_accuracy"] + 0.1:
                             final_tone = llm_tone
@@ -1053,18 +1185,34 @@ class AlertStore:
                             final_conf = 0.4
                             method = "lexicon_override_learned"
                         else:
-                            final_tone = llm_tone  # default to LLM
+                            final_tone = llm_tone
                             final_conf = 0.35
                             method = "llm_override"
 
-                    # Source reliability affects confidence, NOT polarity
+                    # ─── Impact ensemble (separate from tone) ───
+                    if lexicon_impact == llm_impact:
+                        final_impact = llm_impact
+                    elif lexicon_impact == "neutral":
+                        final_impact = llm_impact
+                    elif llm_impact == "neutral":
+                        final_impact = lexicon_impact if lex_conf > 0.5 else "neutral"
+                    else:
+                        # Direct disagreement on impact — use impact-specific correction stats
+                        stats = get_correction_stats(source_id, keyword)
+                        if stats["impact_sample_size"] > 3 and stats["llm_impact_accuracy"] > stats["lexicon_impact_accuracy"] + 0.1:
+                            final_impact = llm_impact
+                        elif stats["impact_sample_size"] > 3 and stats["lexicon_impact_accuracy"] > stats["llm_impact_accuracy"] + 0.1:
+                            final_impact = lexicon_impact
+                        else:
+                            final_impact = llm_impact  # default LLM
+
+                    # Source reliability affects confidence only
                     final_conf *= (0.7 + source_reliability * 0.3)
 
-                    # Update alert fields
+                    # Update alert
                     alert["article_tone"] = final_tone
-                    alert["market_impact"] = llm_impact
-                    alert["sentiment"] = final_tone  # backward compat
-                    alert["ai_sentiment"] = llm_tone
+                    alert["market_impact"] = final_impact
+                    alert["sentiment"] = final_tone
                     alert["confidence"] = round(min(1.0, final_conf), 2)
                     alert["classification_method"] = method
                     alert["event_type"] = llm_result.get("event_type", "other")
@@ -1072,32 +1220,36 @@ class AlertStore:
                     alert["time_horizon"] = llm_result.get("time_horizon", "unclear")
                     alert["mixed_signals"] = llm_result.get("mixed_signals", False) or alert.get("mixed_signals", False)
 
-                    # Store event extraction if provided
                     event = llm_result.get("event")
                     if event and isinstance(event, dict):
                         alert["event"] = event
 
-                    # Severity from confidence + impact
-                    if llm_impact in ("bullish", "bearish") and final_conf > 0.6:
+                    # Severity
+                    if final_impact in ("bullish", "bearish") and final_conf > 0.6:
                         alert["severity"] = "high"
                     elif final_conf > 0.4:
                         alert["severity"] = "medium"
                     else:
                         alert["severity"] = "low"
 
-                    # Re-log to data store with enriched data
+                    # Re-log with all enriched data
                     log_article(alert, analysis_text)
 
                     emoji_map = {"bullish": "📈", "bearish": "📉", "neutral": "➡️"}
-                    emoji = emoji_map.get(llm_impact, "➡️")
+                    emoji = emoji_map.get(final_impact, "➡️")
                     disagree = " ⚡DISAGREE" if lexicon_tone != llm_tone and lexicon_tone != "neutral" else ""
-                    log.info(f"🤖{emoji}{disagree} [{method}] tone={final_tone} impact={llm_impact} conf={alert['confidence']} → {alert['title'][:55]}")
+                    impact_disagree = " ⚡IMPACT" if lexicon_impact != llm_impact and lexicon_impact != "neutral" else ""
+                    log.info(f"🤖{emoji}{disagree}{impact_disagree} [{method}] tone={final_tone} impact={final_impact} conf={alert['confidence']} → {alert['title'][:55]}")
                     break
 
     def add(self, source_id, source_name, title, url, snippet, keyword, severity="medium", published_at=None):
         if not title or not is_valid_source_url(url):
             return False
-        h = self._hash(source_id, title, url)
+
+        # Canonicalize URL for better dedup
+        clean_url = re.sub(r'[?#].*$', '', url.strip()) if url else ""
+        h = self._hash(source_id, title, clean_url or url)
+
         with self.lock:
             if h in self.seen_hashes:
                 return False
@@ -1117,34 +1269,28 @@ class AlertStore:
                 log.debug(f"Semantic dup merged: '{title[:50]}' → existing alert {dup_id}")
                 return False
 
-        # Fetch article text
-        article_text, fetched = fetch_article_text(url)
-        analysis_text = article_text if fetched else f"{title}. {snippet}"
-
-        # Run sentence-level lexicon engine (instant)
+        # Run lexicon on title + snippet ONLY (fast, no network)
+        quick_text = f"{title}. {snippet or ''}"
         word_result = analyze_sentiment_words_only(
-            analysis_text,
-            source_id=source_id,
-            matched_keywords=[keyword],
+            quick_text, source_id=source_id, matched_keywords=[keyword],
         )
 
-        # Generate fallback summary
-        sentences = re.split(r'(?<=[.!?])\s+', analysis_text[:600])
-        fallback_summary = " ".join(sentences[:2]).strip()
-        if len(fallback_summary) > 250:
-            fallback_summary = fallback_summary[:247] + "..."
+        # Fallback summary from snippet
+        fallback_summary = (snippet or title)[:250]
 
-        # Format published_at
+        # Format published_at for display, store UTC separately
         pub_str = ""
+        pub_utc = ""
         if published_at:
             try:
+                pub_utc = published_at.astimezone(timezone.utc).isoformat()
                 pub_str = published_at.astimezone(timezone(timedelta(hours=-5))).strftime("%b %d, %I:%M %p EST")
             except Exception:
                 pub_str = str(published_at)
 
-        # Ticker linking — deterministic mapping to user's watchlist
-        affected_tickers = link_tickers_to_alert(title, analysis_text, keyword,
-                                                  extract_entities(analysis_text))
+        # Ticker linking
+        affected_tickers = link_tickers_to_alert(title, quick_text, keyword,
+                                                  extract_entities(quick_text))
 
         with self.lock:
             alert_id = int(time.time() * 1000)
@@ -1159,6 +1305,7 @@ class AlertStore:
                 # Multi-dimensional classification
                 "article_tone": word_result["article_tone"],
                 "market_impact": word_result["market_impact"],
+                "word_market_impact": word_result["market_impact"],
                 "sentiment": word_result["article_tone"],  # backward compat
                 "sentiment_score": word_result["polarity"],
                 "confidence": word_result["confidence"],
@@ -1179,12 +1326,14 @@ class AlertStore:
                 "summary": fallback_summary,
                 "ai_summary": False,
                 "ai_sentiment": None,
+                "ai_market_impact": None,
                 "ai_processing": bool(self.ollama_url),
                 "word_sentiment": word_result["article_tone"],
                 "positive_signals": word_result["positive_signals"],
                 "negative_signals": word_result["negative_signals"],
-                "article_fetched": fetched,
+                "article_fetched": False,
                 "published_at": pub_str,
+                "published_at_utc": pub_utc,
                 "source_reliability": word_result.get("source_reliability", 0.5),
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
@@ -1192,21 +1341,23 @@ class AlertStore:
             if len(self.alerts) > self.max_alerts:
                 self.alerts = self.alerts[: self.max_alerts]
 
-            log_article(alert, article_text)
+            log_article(alert, "")
 
             tickers_str = f" [{','.join(affected_tickers)}]" if affected_tickers else ""
             emoji_map = {"positive": "📈", "negative": "📉", "neutral": "➡️"}
             emoji = emoji_map.get(word_result["article_tone"], "➡️")
             log.info(f"{emoji} [{source_id}] tone={word_result['article_tone']} conf={word_result['confidence']}{tickers_str} keyword='{keyword}' → {title[:60]} [AI queued]")
 
-        # Queue AI enrichment
+        # Queue background fetch + AI enrichment (article text fetched async)
         if self.ollama_url:
             with self._ai_lock:
                 self._ai_queue.append({
                     "alert_id": alert_id,
-                    "analysis_text": analysis_text,
+                    "url": url,
+                    "snippet_text": quick_text,
                     "source_id": source_id,
                     "keyword": keyword,
+                    "needs_fetch": True,
                 })
         return True
 
@@ -1814,10 +1965,10 @@ def quick_polarity(text_fragment):
     score = 0.0
     text_lower = text_fragment.lower()
     for word, weight in pos_signals.items():
-        if re.search(rf"(?<!\w){re.escape(word)}", text_lower):
+        if re.search(rf"(?<!\w){re.escape(word)}(?!\w)", text_lower):
             score += weight
     for word, weight in neg_signals.items():
-        if re.search(rf"(?<!\w){re.escape(word)}", text_lower):
+        if re.search(rf"(?<!\w){re.escape(word)}(?!\w)", text_lower):
             score -= weight
     return score
 
@@ -1828,13 +1979,13 @@ def score_sentence(sentence, pos_signals, neg_signals):
     score = 0.0
     signals = []
 
-    # 1. Standard keyword matching
+    # 1. Standard keyword matching with proper word boundaries
     for word, weight in pos_signals.items():
-        if re.search(rf"(?<!\w){re.escape(word)}", tokens):
+        if re.search(rf"(?<!\w){re.escape(word)}(?!\w)", tokens):
             score += weight
             signals.append(("pos", word))
     for word, weight in neg_signals.items():
-        if re.search(rf"(?<!\w){re.escape(word)}", tokens):
+        if re.search(rf"(?<!\w){re.escape(word)}(?!\w)", tokens):
             score -= weight
             signals.append(("neg", word))
 
@@ -2095,15 +2246,22 @@ def poll_rss(keywords):
 
 
 def poll_newsapi(keywords, api_key):
-    """Poll NewsAPI for keyword matches (requires free API key from newsapi.org)."""
+    """Poll NewsAPI for keyword matches (requires free API key from newsapi.org).
+    Config option newsapi_mode: 'trump_only' (legacy) or 'all_news' (default)."""
     if not api_key:
         return
     try:
+        config = load_config()
+        newsapi_mode = config.get("newsapi_mode", "all_news")
         priority_kw = keywords[:10]
         for kw in priority_kw:
             url = "https://newsapi.org/v2/everything"
+            if newsapi_mode == "trump_only":
+                q_param = f'Trump AND "{kw}"'
+            else:
+                q_param = f'"{kw}"'
             params = {
-                "q": f'Trump AND "{kw}"',
+                "q": q_param,
                 "sortBy": "publishedAt",
                 "pageSize": 10,
                 "apiKey": api_key,
@@ -2146,20 +2304,46 @@ def poll_newsapi(keywords, api_key):
 
 
 def poll_whitehouse(keywords):
-    """Scrape White House presidential actions page for new items."""
+    """Scrape White House presidential actions page for new items.
+    Prefers article containers, filters nav links, checks freshness."""
     try:
         resp = requests.get(WHITEHOUSE_URL, timeout=15, headers={
             "User-Agent": "Mozilla/5.0 (compatible; KeywordMonitor/1.0)"
         })
         soup = BeautifulSoup(resp.text, "html.parser")
-        for link_tag in soup.find_all("a", href=True):
+
+        # Skip common navigation/footer/header patterns
+        nav_patterns = ["menu", "nav", "footer", "header", "sidebar", "breadcrumb"]
+
+        # Try structured article containers first
+        articles = soup.find_all("article") or soup.find_all("div", class_=re.compile(r"post|entry|item|news"))
+        search_tags = articles if articles else soup.find_all("a", href=True)
+
+        for tag in search_tags:
+            # If we found <article> elements, get the link inside
+            if tag.name != "a":
+                link_tag = tag.find("a", href=True)
+                if not link_tag:
+                    continue
+            else:
+                link_tag = tag
+                # Skip links inside nav/footer/header elements
+                parent_classes = " ".join(p.get("class", []) for p in link_tag.parents if p.get("class"))
+                parent_ids = " ".join(p.get("id", "") for p in link_tag.parents if p.get("id"))
+                parent_str = (parent_classes + " " + parent_ids).lower()
+                if any(n in parent_str for n in nav_patterns):
+                    continue
+
             text = normalize_whitespace(link_tag.get_text(" ", strip=True))
             href = normalize_whitespace(link_tag["href"])
-            if not text or len(text) < 15:
+            if not text or len(text) < 20 or len(text) > 300:
                 continue
             if not href.startswith("http"):
                 href = f"https://www.whitehouse.gov{href}"
             if not is_valid_source_url(href):
+                continue
+            # Skip non-content URLs
+            if any(x in href.lower() for x in ["/search", "/contact", "/privacy", "/accessibility", "#", "javascript:"]):
                 continue
             matches = match_keywords(text, keywords)
             for kw, sev in matches:
@@ -2745,12 +2929,21 @@ def general_chat():
             for w in search_words[:5]:
                 where_clauses.append("(LOWER(title) LIKE ? OR keyword LIKE ?)")
                 params.extend([f"%{w}%", f"%{w}%"])
-            query = f"SELECT title, summary, sentiment, market_impact, source_name, published_at, keyword FROM articles WHERE {' OR '.join(where_clauses)} ORDER BY id DESC LIMIT 8"
+            query = f"SELECT title, summary, sentiment, source_name, published_at, keyword FROM articles WHERE {' OR '.join(where_clauses)} ORDER BY id DESC LIMIT 8"
             c.execute(query, params)
             matched_articles = [dict(r) for r in c.fetchall()]
+            # Try to add market_impact if column exists
+            try:
+                for i, art in enumerate(matched_articles):
+                    c.execute("SELECT market_impact FROM articles WHERE title = ? LIMIT 1", (art.get("title", ""),))
+                    row2 = c.fetchone()
+                    if row2:
+                        matched_articles[i]["market_impact"] = row2[0] or ""
+            except Exception:
+                pass  # Column may not exist in old DBs
 
         # 2. Always include the most recent articles for general awareness
-        c.execute("SELECT title, summary, sentiment, market_impact, source_name, published_at FROM articles ORDER BY id DESC LIMIT 5")
+        c.execute("SELECT title, summary, sentiment, source_name, published_at FROM articles ORDER BY id DESC LIMIT 5")
         recent_articles = [dict(r) for r in c.fetchall()]
 
         # 3. Get sentiment stats for overall market mood

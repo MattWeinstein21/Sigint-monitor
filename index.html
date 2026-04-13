@@ -31,7 +31,7 @@
 <script type="text/babel">
 var h = React.useState, ue = React.useEffect;
 
-var API = window.location.protocol + "//" + window.location.hostname + ":" + (window.location.port || 5000);
+var API = window.location.port ? (window.location.protocol + "//" + window.location.hostname + ":" + window.location.port) : window.location.origin;
 
 var SRC = [
   {id:"truthsocial",name:"Truth Social",icon:"📢",color:"#5448C8"},
@@ -50,7 +50,7 @@ var SRC = [
   {id:"google_news",name:"Google News",icon:"◎",color:"#4285F4"},
   {id:"whitehouse",name:"White House",icon:"🏛",color:"#3C3B6E"},
   {id:"sec_edgar",name:"SEC",icon:"📋",color:"#002868"},
-  {id:"fed_register",name:"Fed Register",icon:"📜",color:"#B22234"},
+  {id:"federal_register",name:"Fed Register",icon:"📜",color:"#B22234"},
   {id:"congress",name:"Congress",icon:"⚖",color:"#002868"},
   {id:"fed_reserve",name:"Fed Reserve",icon:"🏦",color:"#1B4D3E"},
   {id:"treasury",name:"Treasury",icon:"💵",color:"#003366"},

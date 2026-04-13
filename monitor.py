@@ -3313,6 +3313,38 @@ def update_indices_config():
     return jsonify({"selected": valid, "available": AVAILABLE_INDICES})
 
 
+# Sector ETFs for the sector heatmap
+SECTOR_ETFS = {
+    "XLK": "Technology", "XLF": "Financials", "XLV": "Healthcare",
+    "XLY": "Consumer Disc.", "XLP": "Consumer Staples", "XLE": "Energy",
+    "XLI": "Industrials", "XLB": "Materials", "XLRE": "Real Estate",
+    "XLU": "Utilities", "XLC": "Communication",
+}
+
+
+@app.route("/api/market/sectors")
+def get_sectors():
+    """Get sector performance data using sector ETFs."""
+    results = []
+    for sym, name in SECTOR_ETFS.items():
+        try:
+            data = fetch_yahoo_quote(sym, "1d", "5m")
+            if data:
+                results.append({
+                    "symbol": sym,
+                    "name": name,
+                    "price": data.get("price", 0),
+                    "change_pct": data.get("change_pct", 0),
+                    "change": data.get("change", 0),
+                    "market_cap": data.get("market_cap", 0),
+                })
+        except Exception:
+            pass
+    # Sort by absolute market cap (approximate via ETF AUM)
+    results.sort(key=lambda x: abs(x.get("market_cap", 0)), reverse=True)
+    return jsonify({"sectors": results})
+
+
 @app.route("/api/market/quote/<symbol>")
 def get_quote(symbol):
     """Get detailed quote + chart for a stock or crypto."""

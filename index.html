@@ -24,6 +24,7 @@
   @keyframes td{0%{content:'.'} 33%{content:'..'} 66%{content:'...'}100%{content:'.'}}
   .thk::after{content:'.';animation:td 1.2s infinite steps(1)}
   .cm{animation:slideIn .2s ease-out}
+  ::-webkit-resizer{background:#2A2A35;border-radius:4px}
 </style>
 </head>
 <body>
@@ -94,6 +95,15 @@ function App(){
   var[gcMsgs,sGcMsgs]=s([]);
   var[gcInput,sGcInput]=s("");
   var[gcLoading,sGcLoading]=s(false);
+  // Market enhancements
+  var[sectors,sSectors]=s([]);
+  var[newsFilter,sNewsFilter]=s("all");
+  var[hoverIdx,sHoverIdx]=s(-1);
+  var[clockTick,sClockTick]=s(0);
+  var[userTz,sUserTz]=s(Intl.DateTimeFormat().resolvedOptions().timeZone||"America/New_York");
+  // Chart zoom (indices into chart data array)
+  var[zoomStart,sZoomStart]=s(0);
+  var[zoomEnd,sZoomEnd]=s(-1); // -1 means show all
 
   var tt=function(m){sToast(m);setTimeout(function(){sToast("")},3000)};
   var te=function(id){sExp(function(p){var n=new Set(p);if(n.has(id))n.delete(id);else n.add(id);return n})};
@@ -145,8 +155,16 @@ function App(){
   u(function(){if(!mon)return;var c=false;var p=function(){F("/api/alerts?limit=300").then(function(d){if(!c&&d.alerts){sAl(d.alerts);sConn(true)}}).catch(function(){if(!c)sConn(false)})};p();var iv=setInterval(p,8000);return function(){c=true;clearInterval(iv)}},[mon]);
   // Tick
   u(function(){var iv=setInterval(function(){sTk(function(t){return t+1})},10000);return function(){clearInterval(iv)}},[]);
-  // Market
-  u(function(){if(mv!=="market")return;var ld=function(){var iv2=rng==="1d"?"5m":rng==="5d"?"15m":"1d";F("/api/market/indices?range="+rng+"&interval="+iv2).then(function(d){if(d.indices)sIdx(d.indices)}).catch(function(){});F("/api/market/watchlist").then(function(d){if(d.watchlist)sWl(d.watchlist);if(d.quotes)sWq(d.quotes)}).catch(function(){});F("/api/market/news").then(function(d){if(d.articles)sMn(d.articles)}).catch(function(){});F("/api/market/news-sources").then(function(d){if(d.sources)sMns(d.sources)}).catch(function(){});F("/api/market/indices/config").then(function(d){if(d.available)sIdxCfg(d)}).catch(function(){})};ld();var iv=setInterval(ld,60000);return function(){clearInterval(iv)}},[mv,rng]);
+  // Clock tick every second
+  u(function(){var iv=setInterval(function(){sClockTick(function(t){return t+1})},1000);return function(){clearInterval(iv)}},[]);
+  // Market - faster polling (15s for prices, 60s for news/config)
+  u(function(){if(mv!=="market")return;
+    var loadPrices=function(){var iv2=rng==="1d"?"5m":rng==="5d"?"15m":"1d";F("/api/market/indices?range="+rng+"&interval="+iv2).then(function(d){if(d.indices)sIdx(d.indices)}).catch(function(){});F("/api/market/watchlist").then(function(d){if(d.watchlist)sWl(d.watchlist);if(d.quotes)sWq(d.quotes)}).catch(function(){})};
+    var loadMeta=function(){F("/api/market/news").then(function(d){if(d.articles)sMn(d.articles)}).catch(function(){});F("/api/market/news-sources").then(function(d){if(d.sources)sMns(d.sources)}).catch(function(){});F("/api/market/indices/config").then(function(d){if(d.available)sIdxCfg(d)}).catch(function(){});F("/api/market/sectors").then(function(d){if(d.sectors)sSectors(d.sectors)}).catch(function(){})};
+    loadPrices();loadMeta();
+    var iv1=setInterval(loadPrices,15000);var iv2=setInterval(loadMeta,60000);
+    return function(){clearInterval(iv1);clearInterval(iv2)}
+  },[mv,rng]);
   // Analytics
   u(function(){if(mv!=="analytics")return;F("/api/data/accuracy").then(function(d){sAcd(d)}).catch(function(){})},[mv]);
   // Economy
@@ -160,6 +178,59 @@ function App(){
   var iC={bullish:"#34C759",bearish:"#FF3B30",neutral:"#8E8E93"};
   var tC={positive:"#34C759",negative:"#FF3B30",neutral:"#8E8E93"};
   var svC={high:"#FF3B30",medium:"#FF9500",low:"#34C759"};
+
+  // Market clock
+  var getMarketClock=function(){
+    var now=new Date();
+    // NYSE hours: 9:30 AM - 4:00 PM ET (UTC-4 in EDT, UTC-5 in EST)
+    var et=new Date(now.toLocaleString("en-US",{timeZone:"America/New_York"}));
+    var h2=et.getHours(),m2=et.getMinutes();
+    var mins=h2*60+m2;
+    var openMin=9*60+30, closeMin=16*60;
+    var day=et.getDay(); // 0=Sun, 6=Sat
+    if(day>=1&&day<=5&&mins>=openMin&&mins<closeMin){
+      var left=closeMin-mins;
+      var lh=Math.floor(left/60),lm=left%60;
+      return {open:true,text:"Market Open",countdown:lh+"h "+lm+"m to close",color:"#34C759"};
+    }else{
+      // Calculate next open
+      var nextOpen=new Date(et);
+      if(day===0){nextOpen.setDate(nextOpen.getDate()+1);} // Sun→Mon
+      else if(day===6){nextOpen.setDate(nextOpen.getDate()+2);} // Sat→Mon
+      else if(mins>=closeMin){nextOpen.setDate(nextOpen.getDate()+(day===5?3:1));} // After close
+      nextOpen.setHours(9,30,0,0);
+      var diff=nextOpen.getTime()-et.getTime();
+      var dh=Math.floor(diff/3600000),dm=Math.floor((diff%3600000)/60000);
+      var countdown=dh>=24?Math.floor(dh/24)+"d "+Math.floor(dh%24)+"h":dh+"h "+dm+"m";
+      return {open:false,text:"Market Closed",countdown:countdown+" to open",color:"#FF3B30"};
+    }
+  };
+  var mClock=getMarketClock();
+
+  // News filter categories
+  var NEWS_CATS=[
+    {id:"all",label:"All"},
+    {id:"stocks",label:"Stocks",kw:["stock","equity","shares","earnings","ipo","s&p","dow","nasdaq"]},
+    {id:"crypto",label:"Crypto",kw:["bitcoin","crypto","ethereum","btc","eth","blockchain","token","defi"]},
+    {id:"bonds",label:"Bonds",kw:["bond","treasury","yield","fixed income","debt","t-bill"]},
+    {id:"forex",label:"Forex",kw:["dollar","euro","yen","currency","forex","gbp","exchange rate"]},
+    {id:"commodities",label:"Commodities",kw:["oil","gold","silver","commodity","crude","natural gas","wheat","copper"]},
+    {id:"energy",label:"Energy",kw:["oil","gas","solar","wind","energy","opec","pipeline","nuclear"]},
+    {id:"tech",label:"Tech",kw:["tech","ai","software","chip","semiconductor","apple","google","microsoft","nvidia"]},
+    {id:"realestate",label:"Real Estate",kw:["housing","mortgage","real estate","reit","property","rent"]},
+    {id:"macro",label:"Macro",kw:["fed","inflation","gdp","employment","recession","rate","cpi","fomc","tariff"]},
+  ];
+
+  var filteredNews=mn.filter(function(n){
+    if(newsFilter==="all")return true;
+    var cat=NEWS_CATS.find(function(c){return c.id===newsFilter});
+    if(!cat||!cat.kw)return true;
+    var txt=(n.title||"").toLowerCase();
+    return cat.kw.some(function(k){return txt.indexOf(k)!==-1});
+  });
+
+  // Current time in user timezone
+  var nowStr=new Date().toLocaleTimeString("en-US",{timeZone:userTz,hour:"2-digit",minute:"2-digit",second:"2-digit",hour12:true});
 
   return <div style={{minHeight:"100vh"}}>
     {toast&&<div style={{position:"fixed",top:20,right:20,zIndex:100,background:"#1A2A1A",color:"#34C759",padding:"10px 18px",borderRadius:8,fontSize:12,border:"1px solid #34C75933",animation:"slideIn 0.3s ease-out"}}>{toast}</div>}
@@ -182,57 +253,107 @@ function App(){
       </div>}
 
       {/* Stock Detail Popup */}
-      {detailSym&&wq[detailSym]&&<div style={{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.7)",zIndex:200,display:"flex",alignItems:"center",justifyContent:"center"}} onClick={function(){sDetailSym(null)}}>
-        <div style={{background:"#14141F",borderRadius:12,padding:24,border:"1px solid #2A2A35",width:600,maxWidth:"95vw",maxHeight:"85vh",overflowY:"auto"}} onClick={function(e){e.stopPropagation()}}>
+      {detailSym&&wq[detailSym]&&<div style={{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.7)",zIndex:200,display:"flex",alignItems:"center",justifyContent:"center"}} onClick={function(){sDetailSym(null);sHoverIdx(-1)}}>
+        <div style={{background:"#14141F",borderRadius:12,padding:24,border:"1px solid #2A2A35",width:700,maxWidth:"95vw",maxHeight:"90vh",overflowY:"auto",resize:"both",overflow:"auto",minWidth:400,minHeight:300}} onClick={function(e){e.stopPropagation()}}>
           {function(){
             var q=wq[detailSym];if(!q)return null;var up=q.change>=0;
             var cd=q.chart||[];
-            // Build SVG chart
-            var cw=550,ch2=220;
-            var chartSvg="";
-            if(cd.length>1){
-              var mn2=999999,mx2=0;
-              cd.forEach(function(d){var hi=d.high||d.close;var lo=d.low||d.close;if(hi>mx2)mx2=hi;if(lo<mn2)mn2=lo});
-              var rn=mx2-mn2||1;
-              if(chartType==="candle"){
-                var bw=Math.max(1,Math.floor(cw/cd.length)-1);
-                chartSvg=cd.map(function(d,i){
-                  var x=Math.floor((i/(cd.length-1))*cw);
-                  var o=d.open||d.close;var c2=d.close;var hi=d.high||Math.max(o,c2);var lo=d.low||Math.min(o,c2);
-                  var yhi=ch2-((hi-mn2)/rn)*ch2;var ylo=ch2-((lo-mn2)/rn)*ch2;
-                  var yo=ch2-((o-mn2)/rn)*ch2;var yc=ch2-((c2-mn2)/rn)*ch2;
-                  var col=c2>=o?"#34C759":"#FF3B30";
-                  var bodyTop=Math.min(yo,yc);var bodyH=Math.max(Math.abs(yc-yo),1);
-                  return '<line x1="'+x+'" y1="'+yhi+'" x2="'+x+'" y2="'+ylo+'" stroke="'+col+'" stroke-width="1"/><rect x="'+(x-bw/2)+'" y="'+bodyTop+'" width="'+bw+'" height="'+bodyH+'" fill="'+col+'"/>';
-                }).join("");
-              }else{
-                var pts=cd.map(function(d,i){return Math.floor((i/(cd.length-1))*cw)+","+Math.floor(ch2-((d.close-mn2)/rn)*ch2)}).join(" ");
-                chartSvg='<polyline points="'+pts+'" fill="none" stroke="'+(up?"#34C759":"#FF3B30")+'" stroke-width="1.5"/>';
-              }
-            }
+            var cw=650,ch2=280,padL=50,padR=10,padT=10,padB=20;
+            var drawW=cw-padL-padR,drawH=ch2-padT-padB;
             return <div>
-              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}>
-                <div><span style={{fontSize:20,fontWeight:700,color:"#E8E8ED"}}>{detailSym}</span><span style={{fontSize:12,color:"#555",marginLeft:8}}>{q.name}</span></div>
-                <button className="b" onClick={function(){sDetailSym(null)}} style={{fontSize:14,color:"#555",background:"none",padding:"4px 8px"}}>✕</button>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
+                <div><span style={{fontSize:22,fontWeight:700,color:"#E8E8ED"}}>{detailSym}</span><span style={{fontSize:12,color:"#555",marginLeft:8}}>{q.name}</span></div>
+                <button className="b" onClick={function(){sDetailSym(null);sHoverIdx(-1)}} style={{fontSize:16,color:"#555",background:"none",padding:"4px 8px"}}>✕</button>
               </div>
-              <div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",marginBottom:16}}>
-                <span style={{fontSize:28,fontWeight:700,color:"#E8E8ED",fontFamily:"'Space Grotesk',sans-serif"}}>{"$"+(q.price||0).toLocaleString()}</span>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",marginBottom:12}}>
+                <span style={{fontSize:30,fontWeight:700,color:"#E8E8ED",fontFamily:"'Space Grotesk',sans-serif"}}>{"$"+(q.price||0).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})}</span>
                 <span style={{fontSize:14,color:up?"#34C759":"#FF3B30",fontWeight:600}}>{up?"▲":"▼"} {q.change} ({q.change_pct}%)</span>
               </div>
-              <div style={{display:"flex",gap:6,marginBottom:12}}>
-                <button className="b" onClick={function(){sChartType("line")}} style={{padding:"4px 12px",borderRadius:4,fontSize:10,background:chartType==="line"?"#5448C8":"#0A0A0F",color:chartType==="line"?"#fff":"#AAA"}}>Line</button>
-                <button className="b" onClick={function(){sChartType("candle")}} style={{padding:"4px 12px",borderRadius:4,fontSize:10,background:chartType==="candle"?"#5448C8":"#0A0A0F",color:chartType==="candle"?"#fff":"#AAA"}}>Candlestick</button>
+              <div style={{display:"flex",gap:6,marginBottom:10,flexWrap:"wrap"}}>
+                <button className="b" onClick={function(){sChartType("line")}} style={{padding:"5px 14px",borderRadius:4,fontSize:10,background:chartType==="line"?"#5448C8":"#0A0A0F",color:chartType==="line"?"#fff":"#AAA"}}>Line</button>
+                <button className="b" onClick={function(){sChartType("candle")}} style={{padding:"5px 14px",borderRadius:4,fontSize:10,background:chartType==="candle"?"#5448C8":"#0A0A0F",color:chartType==="candle"?"#fff":"#AAA"}}>Candlestick</button>
                 <div style={{marginLeft:"auto",display:"flex",gap:4}}>
-                  {[["1d","1D"],["5d","5D"],["1mo","1M"],["3mo","3M"],["6mo","6M"],["1y","1Y"]].map(function(p){return <button key={p[0]} className="b" onClick={function(){sRng(p[0]);var item=wl.find(function(w){return w.symbol===detailSym});var atype=item?item.type:"stock";var iv2=p[0]==="1d"?"5m":p[0]==="5d"?"15m":"1d";F("/api/market/quote/"+detailSym+"?type="+atype+"&range="+p[0]+"&interval="+iv2).then(function(d){if(d.quote)sWq(function(pr){var n=Object.assign({},pr);n[detailSym]=d.quote;return n})}).catch(function(){})}} style={{padding:"3px 8px",borderRadius:3,fontSize:9,background:rng===p[0]?"#5448C8":"#0A0A0F",color:rng===p[0]?"#fff":"#555"}}>{p[1]}</button>})}
+                  {[["1d","1D"],["5d","5D"],["1mo","1M"],["3mo","3M"],["6mo","6M"],["1y","1Y"]].map(function(p){return <button key={p[0]} className="b" onClick={function(){sRng(p[0]);sZoomStart(0);sZoomEnd(-1);sHoverIdx(-1);var item=wl.find(function(w){return w.symbol===detailSym});var atype=item?item.type:"stock";var iv2=p[0]==="1d"?"5m":p[0]==="5d"?"15m":"1d";F("/api/market/quote/"+detailSym+"?type="+atype+"&range="+p[0]+"&interval="+iv2).then(function(d){if(d.quote)sWq(function(pr){var n=Object.assign({},pr);n[detailSym]=d.quote;return n})}).catch(function(){})}} style={{padding:"4px 10px",borderRadius:4,fontSize:10,background:rng===p[0]?"#5448C8":"#0A0A0F",color:rng===p[0]?"#fff":"#555"}}>{p[1]}</button>})}
                 </div>
               </div>
-              <div style={{background:"#0A0A0F",borderRadius:8,padding:8,marginBottom:16}} dangerouslySetInnerHTML={{__html:'<svg viewBox="0 0 '+cw+' '+ch2+'" width="100%" height="'+ch2+'">'+chartSvg+'</svg>'}}/>
-              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:10}}>
-                {[["Day High","$"+q.day_high],["Day Low","$"+q.day_low],["Prev Close","$"+q.prev_close],["Volume",(q.volume||0).toLocaleString()],["52w High","$"+q.fifty_two_wk_high],["52w Low","$"+q.fifty_two_wk_low],["Exchange",q.exchange||""],["Mkt Cap",q.market_cap?(q.market_cap>1e12?(q.market_cap/1e12).toFixed(1)+"T":q.market_cap>1e9?(q.market_cap/1e9).toFixed(1)+"B":(q.market_cap/1e6).toFixed(0)+"M"):"N/A"],["Type",q.type||"stock"]].map(function(p2){return <div key={p2[0]} style={{fontSize:10}}><span style={{color:"#555"}}>{p2[0]}: </span><span style={{color:"#AAA"}}>{p2[1]}</span></div>})}
+              {/* Interactive chart with crosshair + zoom */}
+              {cd.length>1?function(){
+                // Apply zoom
+                var zs=zoomStart,ze=zoomEnd<0?cd.length:Math.min(zoomEnd,cd.length);
+                var vd=cd.slice(zs,ze); // visible data
+                if(vd.length<2)vd=cd;
+                var mn2=Infinity,mx2=-Infinity;
+                vd.forEach(function(d){var hi=d.high||d.close;var lo=d.low||d.close;if(hi>mx2)mx2=hi;if(lo<mn2)mn2=lo});
+                var rn2=mx2-mn2||1;
+                var yScale=function(v){return padT+drawH-((v-mn2)/rn2)*drawH};
+                var xScale=function(i){return padL+Math.floor((i/(vd.length-1))*drawW)};
+                // Price labels
+                var labels=[];for(var li=0;li<5;li++){var lv=mn2+(rn2*(li/4));labels.push({y:yScale(lv),label:"$"+lv.toFixed(2)})}
+                // Hovered data (relative to visible range)
+                var hd=hoverIdx>=0&&hoverIdx<vd.length?vd[hoverIdx]:null;
+                // Wheel zoom handler
+                var onWheel=function(e){
+                  e.preventDefault();
+                  var total=cd.length;
+                  var curStart=zoomStart;var curEnd=zoomEnd<0?total:zoomEnd;
+                  var visLen=curEnd-curStart;
+                  var zoomAmt=Math.max(1,Math.floor(visLen*0.15));
+                  if(e.deltaY<0){
+                    // Zoom in
+                    var ns2=Math.min(curStart+zoomAmt,curEnd-10);
+                    var ne2=Math.max(curEnd-zoomAmt,curStart+10);
+                    sZoomStart(ns2);sZoomEnd(ne2);
+                  }else{
+                    // Zoom out
+                    var ns3=Math.max(0,curStart-zoomAmt);
+                    var ne3=Math.min(total,curEnd+zoomAmt);
+                    if(ns3===0&&ne3>=total){sZoomStart(0);sZoomEnd(-1)}
+                    else{sZoomStart(ns3);sZoomEnd(ne3)}
+                  }
+                  sHoverIdx(-1);
+                };
+                return <div style={{background:"#0A0A0F",borderRadius:8,padding:4,marginBottom:16,position:"relative"}}>
+                  <svg width="100%" height={ch2} viewBox={"0 0 "+cw+" "+ch2} style={{display:"block",cursor:"crosshair"}}
+                    onMouseMove={function(e){var rect=e.currentTarget.getBoundingClientRect();var mx3=(e.clientX-rect.left)/rect.width*cw;var idx2=Math.round(((mx3-padL)/drawW)*(vd.length-1));idx2=Math.max(0,Math.min(vd.length-1,idx2));sHoverIdx(idx2)}}
+                    onMouseLeave={function(){sHoverIdx(-1)}}
+                    onWheel={onWheel}>
+                    {/* Grid lines + price labels */}
+                    {labels.map(function(l,i){return <g key={i}><line x1={padL} y1={l.y} x2={cw-padR} y2={l.y} stroke="#1A1A25" strokeWidth="0.5"/><text x={padL-4} y={l.y+3} fill="#444" fontSize="8" textAnchor="end" fontFamily="'JetBrains Mono'">{l.label}</text></g>})}
+                    {/* Chart data */}
+                    {chartType==="candle"?vd.map(function(d,i){
+                      var x=xScale(i);var bw2=Math.max(2,Math.floor(drawW/vd.length)-2);
+                      var o=d.open||d.close;var c2=d.close;var hi=d.high||Math.max(o,c2);var lo=d.low||Math.min(o,c2);
+                      var col=c2>=o?"#34C759":"#FF3B30";
+                      var bodyTop=Math.min(yScale(o),yScale(c2));var bodyH=Math.max(Math.abs(yScale(o)-yScale(c2)),1);
+                      return <g key={i}><line x1={x} y1={yScale(hi)} x2={x} y2={yScale(lo)} stroke={col} strokeWidth="1"/><rect x={x-bw2/2} y={bodyTop} width={bw2} height={bodyH} fill={col}/></g>
+                    }):<polyline points={vd.map(function(d,i){return xScale(i)+","+yScale(d.close)}).join(" ")} fill="none" stroke={up?"#34C759":"#FF3B30"} strokeWidth="1.5"/>}
+                    {/* Crosshair */}
+                    {hoverIdx>=0&&hoverIdx<vd.length&&<g>
+                      <line x1={xScale(hoverIdx)} y1={padT} x2={xScale(hoverIdx)} y2={ch2-padB} stroke="#5448C8" strokeWidth="1" strokeDasharray="3,3"/>
+                      <line x1={padL} y1={yScale(vd[hoverIdx].close)} x2={cw-padR} y2={yScale(vd[hoverIdx].close)} stroke="#5448C844" strokeWidth="0.5"/>
+                      <circle cx={xScale(hoverIdx)} cy={yScale(vd[hoverIdx].close)} r="4" fill="#5448C8"/>
+                    </g>}
+                  </svg>
+                  {/* Hover tooltip */}
+                  {hd&&<div style={{position:"absolute",top:8,right:12,background:"#14141F",padding:"6px 10px",borderRadius:6,border:"1px solid #2A2A35",fontSize:9,color:"#AAA",lineHeight:1.6}}>
+                    <div style={{color:"#E8E8ED",fontWeight:600}}>{"$"+(hd.close||0).toFixed(2)}</div>
+                    {hd.open&&<div>O: ${hd.open.toFixed(2)} H: ${(hd.high||hd.close).toFixed(2)}</div>}
+                    {hd.low&&<div>L: ${hd.low.toFixed(2)} V: {(hd.volume||0).toLocaleString()}</div>}
+                    <div style={{color:"#555"}}>{(hd.time||"").replace("T"," ").substring(0,16)}</div>
+                  </div>}
+                </div>;
+              }():<div style={{color:"#555",fontSize:11,padding:20,textAlign:"center"}}>No chart data</div>}
+              {/* Zoom controls */}
+              {cd.length>1&&<div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
+                <span style={{fontSize:8,color:"#444"}}>Scroll to zoom · Showing {zoomEnd<0?cd.length:(zoomEnd-zoomStart)} of {cd.length} points</span>
+                {(zoomStart>0||zoomEnd>0)&&<button className="b" onClick={function(){sZoomStart(0);sZoomEnd(-1);sHoverIdx(-1)}} style={{fontSize:8,color:"#5448C8",background:"none",padding:"2px 6px"}}>Reset Zoom</button>}
+              </div>}
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:10,marginBottom:12}}>
+                {[["Day High","$"+(q.day_high||0)],["Day Low","$"+(q.day_low||0)],["Prev Close","$"+(q.prev_close||0)],["Volume",(q.volume||0).toLocaleString()],["52w High","$"+(q.fifty_two_wk_high||0)],["52w Low","$"+(q.fifty_two_wk_low||0)],["Exchange",q.exchange||""],["Mkt Cap",q.market_cap?(q.market_cap>1e12?(q.market_cap/1e12).toFixed(1)+"T":q.market_cap>1e9?(q.market_cap/1e9).toFixed(1)+"B":(q.market_cap/1e6).toFixed(0)+"M"):"N/A"],["Type",q.type||"stock"]].map(function(p2){return <div key={p2[0]} style={{fontSize:10}}><span style={{color:"#555"}}>{p2[0]}: </span><span style={{color:"#AAA"}}>{p2[1]}</span></div>})}
               </div>
-              {sn.length>0&&<div style={{marginTop:16,borderTop:"1px solid #1A1A25",paddingTop:12}}>
+              {sn.length>0&&<div style={{borderTop:"1px solid #1A1A25",paddingTop:12}}>
                 <div style={{fontSize:10,fontWeight:600,color:"#666",letterSpacing:1,textTransform:"uppercase",marginBottom:8}}>Related News</div>
-                {sn.slice(0,8).map(function(n,i){return <a key={i} href={n.url} target="_blank" rel="noopener noreferrer" style={{display:"block",fontSize:11,color:"#AAA",textDecoration:"none",padding:"4px 0",lineHeight:1.4}}>{n.title} <span style={{fontSize:8,color:"#555"}}>{n.source} · {n.published_at}</span></a>})}
+                {sn.slice(0,8).map(function(n,i){return <a key={i} href={n.url} target="_blank" rel="noopener noreferrer" style={{display:"block",fontSize:11,color:"#AAA",textDecoration:"none",padding:"4px 0",lineHeight:1.4}}>{n.title} <span style={{fontSize:8,color:"#555"}}>{n.source}</span></a>})}
               </div>}
             </div>;
           }()}
@@ -241,15 +362,22 @@ function App(){
 
     {/* HEADER */}
     <div style={{borderBottom:"1px solid #1A1A25",padding:"14px 24px",display:"flex",alignItems:"center",justifyContent:"space-between",position:"sticky",top:0,background:"#0A0A0F",zIndex:10}}>
-      <div style={{display:"flex",alignItems:"center",gap:12}}>
+      <div style={{display:"flex",alignItems:"center",gap:10}}>
+        <button className="b" onClick={function(){sCfg(!cfg)}} style={{background:cfg?"#2A2A35":"#14141F",color:"#AAA",padding:"6px 10px",borderRadius:6,fontSize:11}}>⚙</button>
         <div style={{width:10,height:10,borderRadius:"50%",background:mon?"#34C759":"#FF3B30",animation:mon?"pulse 2s infinite":"none"}}/>
         <span style={{fontFamily:"'Space Grotesk',sans-serif",fontWeight:700,fontSize:18}}>SIGINT</span>
         <span style={{fontSize:9,padding:"2px 8px",borderRadius:4,background:conn?"#1A2A1A":"#2A1A1A",color:conn?"#34C759":"#FF3B30",border:"1px solid "+(conn?"#34C75933":"#FF3B3033")}}>{conn?"● CONNECTED":"✕ DISCONNECTED"}</span>
       </div>
-      <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+      <div style={{display:"flex",gap:6,flexWrap:"wrap",alignItems:"center"}}>
+        {/* Market clock */}
+        <div style={{display:"flex",alignItems:"center",gap:6,padding:"4px 10px",borderRadius:6,background:"#0F0F18",border:"1px solid #1A1A25",marginRight:4}}>
+          <div style={{width:6,height:6,borderRadius:"50%",background:mClock.color,animation:mClock.open?"pulse 2s infinite":"none"}}/>
+          <span style={{fontSize:9,color:mClock.color,fontWeight:600}}>{mClock.text}</span>
+          <span style={{fontSize:8,color:"#555"}}>{mClock.countdown}</span>
+          <span style={{fontSize:9,color:"#666",fontFamily:"'Space Grotesk',sans-serif",marginLeft:4}}>{nowStr}</span>
+        </div>
         {["alerts","market","economy","analytics"].map(function(v){var lb={alerts:"📋 Alerts",market:"📊 Markets",economy:"🏛 Economy",analytics:"🎯 Accuracy"};return <button key={v} className="b" onClick={function(){sMv(v)}} style={{background:mv===v?"#5448C8":"#14141F",color:mv===v?"#fff":"#AAA",padding:"6px 12px",borderRadius:6,fontSize:11}}>{lb[v]}</button>})}
         <button className="b" onClick={function(){sRef(true);fetch(API+"/api/refresh",{method:"POST"}).then(function(){setTimeout(function(){F("/api/alerts?limit=300").then(function(d){if(d.alerts)sAl(d.alerts)}).catch(function(){});sRef(false)},3000)}).catch(function(){sRef(false)})}} style={{background:"#14141F",color:"#AAA",padding:"6px 12px",borderRadius:6,fontSize:11}}>{ref?"⟳...":"⟳"}</button>
-        <button className="b" onClick={function(){sCfg(!cfg)}} style={{background:cfg?"#2A2A35":"#14141F",color:"#AAA",padding:"6px 12px",borderRadius:6,fontSize:11}}>⚙</button>
         <button className="b" onClick={function(){sMon(!mon)}} style={{background:mon?"#1A2A1A":"#2A1A1A",color:mon?"#34C759":"#FF3B30",padding:"6px 12px",borderRadius:6,fontSize:11}}>{mon?"● LIVE":"■ STOP"}</button>
       </div>
     </div>
@@ -265,6 +393,10 @@ function App(){
           </div>
           <div style={{padding:16}}>
             {ct==="general"&&<div>
+              <div style={{fontSize:10,fontWeight:600,color:"#666",letterSpacing:2,marginBottom:8,textTransform:"uppercase"}}>Timezone</div>
+              <select value={userTz} onChange={function(e){sUserTz(e.target.value);tt("Timezone: "+e.target.value)}} style={{width:"100%",background:"#14141F",border:"1px solid #2A2A35",borderRadius:6,padding:"6px 10px",color:"#E8E8ED",fontSize:11,outline:"none",marginBottom:16}}>
+                {["America/New_York","America/Chicago","America/Denver","America/Los_Angeles","America/Anchorage","Pacific/Honolulu","Europe/London","Europe/Paris","Europe/Berlin","Europe/Moscow","Asia/Tokyo","Asia/Shanghai","Asia/Hong_Kong","Asia/Singapore","Asia/Kolkata","Asia/Dubai","Australia/Sydney","UTC"].map(function(tz){return <option key={tz} value={tz}>{tz.replace(/_/g," ").replace("America/","").replace("Europe/","EU: ").replace("Asia/","")}</option>})}
+              </select>
               <div style={{fontSize:10,fontWeight:600,color:"#666",letterSpacing:2,marginBottom:10,textTransform:"uppercase"}}>Keywords ({kw.length})</div>
               <div style={{display:"flex",gap:6,marginBottom:12}}>
                 <input value={nk} onChange={function(e){sNk(e.target.value)}} onKeyDown={function(e){if(e.key==="Enter"){var k=nk.trim().toLowerCase();if(k&&!kw.includes(k)){sKw(function(p){return p.concat([k])});sNk("");fetch(API+"/api/keywords",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({add:k})}).catch(function(){})}}}} placeholder="add keyword..." style={{flex:1,background:"#14141F",border:"1px solid #2A2A35",borderRadius:6,padding:"6px 10px",color:"#E8E8ED",fontSize:12,outline:"none"}}/>
@@ -394,7 +526,7 @@ function App(){
           {showIdxPick&&idxCfg&&<div style={{background:"#0F0F18",borderRadius:8,padding:12,border:"1px solid #1A1A25",marginBottom:12}}>
             <div style={{fontSize:9,color:"#666",marginBottom:8,textTransform:"uppercase"}}>Select indices to display</div>
             <div style={{display:"flex",flexWrap:"wrap",gap:6}}>
-              {Object.keys(idxCfg.available||{}).map(function(sym){var isOn=(idxCfg.selected||[]).indexOf(sym)!==-1;return <button key={sym} className="b" onClick={function(){var cur=idxCfg.selected||[];var nxt=isOn?cur.filter(function(x){return x!==sym}):cur.concat([sym]);if(nxt.length===0)return;fetch(API+"/api/market/indices/config",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({selected:nxt})}).then(function(r){return r.json()}).then(function(d){if(d.selected)sIdxCfg(Object.assign({},idxCfg,{selected:d.selected}));tt("Indices updated")}).catch(function(){})}} style={{padding:"4px 8px",borderRadius:4,fontSize:9,background:isOn?"#1A2A1A":"#14141F",color:isOn?"#34C759":"#555",border:"1px solid "+(isOn?"#34C75933":"#2A2A35")}}>{(idxCfg.available||{})[sym]||sym}</button>})}
+              {Object.keys(idxCfg.available||{}).map(function(sym){var isOn=(idxCfg.selected||[]).indexOf(sym)!==-1;return <button key={sym} className="b" onClick={function(){var cur=idxCfg.selected||[];var nxt=isOn?cur.filter(function(x){return x!==sym}):cur.concat([sym]);if(nxt.length===0)return;fetch(API+"/api/market/indices/config",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({selected:nxt})}).then(function(r){return r.json()}).then(function(d){if(d.selected){sIdxCfg(Object.assign({},idxCfg,{selected:d.selected}));var iv2=rng==="1d"?"5m":rng==="5d"?"15m":"1d";F("/api/market/indices?range="+rng+"&interval="+iv2).then(function(d2){if(d2.indices)sIdx(d2.indices)});tt("Indices updated")}}).catch(function(){})}} style={{padding:"4px 8px",borderRadius:4,fontSize:9,background:isOn?"#1A2A1A":"#14141F",color:isOn?"#34C759":"#555",border:"1px solid "+(isOn?"#34C75933":"#2A2A35")}}>{(idxCfg.available||{})[sym]||sym}</button>})}
             </div>
           </div>}
           <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(200px,1fr))",gap:10,marginBottom:24}}>
@@ -409,11 +541,33 @@ function App(){
           </div>
           {ade&&<div style={{fontSize:10,color:"#FF3B30",marginBottom:10}}>{ade}</div>}
           <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(280px,1fr))",gap:10,marginBottom:24}}>
-            {wl.map(function(item){var sym=item.symbol,q=wq[sym];if(!q)return <div key={sym} style={{background:"#0F0F18",borderRadius:8,padding:14,border:"1px solid #1A1A25",display:"flex",justifyContent:"space-between",alignItems:"center"}}><span style={{color:"#555",fontSize:11}}>{sym} — loading...</span><span className="kt" onClick={function(){fetch(API+"/api/market/watchlist",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({remove:sym})}).then(function(r){return r.json()}).then(function(d){if(d.watchlist)sWl(d.watchlist)}).catch(function(){});sWq(function(p){var n=Object.assign({},p);delete n[sym];return n})}} style={{fontSize:10,color:"#FF3B30",padding:"2px 6px",cursor:"pointer"}}>✕</span></div>;var up=q.change>=0;return <div key={sym} className="st" onClick={function(){sDetailSym(sym);sSn([]);var atype=item.type||"stock";var iv2=rng==="1d"?"5m":rng==="5d"?"15m":"1d";F("/api/market/quote/"+sym+"?type="+atype+"&range="+rng+"&interval="+iv2).then(function(d){if(d.quote)sWq(function(p){var n=Object.assign({},p);n[sym]=d.quote;return n})}).catch(function(){});F("/api/market/news?symbol="+sym).then(function(d){if(d.articles)sSn(d.articles)}).catch(function(){})}} style={{background:"#0F0F18",borderRadius:8,padding:14,border:"1px solid #1A1A25",cursor:"pointer"}}><div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}><div><span style={{fontSize:14,fontWeight:700,color:"#E8E8ED"}}>{q.type==="crypto"?"₿ ":""}{sym}</span><span style={{fontSize:10,color:"#555",marginLeft:6}}>{q.name}</span></div><span className="kt" onClick={function(e){e.stopPropagation();fetch(API+"/api/market/watchlist",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({remove:sym})}).then(function(r){return r.json()}).then(function(d){if(d.watchlist)sWl(d.watchlist)}).catch(function(){});sWq(function(p){var n=Object.assign({},p);delete n[sym];return n})}} style={{fontSize:10,color:"#555"}}>✕</span></div><div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",marginBottom:8}}><span style={{fontSize:20,fontWeight:700,color:"#E8E8ED",fontFamily:"'Space Grotesk',sans-serif"}}>{"$"+(q.price||0).toLocaleString()}</span><span style={{fontSize:12,color:up?"#34C759":"#FF3B30",fontWeight:600}}>{up?"▲":"▼"} {q.change} ({q.change_pct}%)</span></div><Sp data={q.chart} width={250} height={50} color={up?"#34C759":"#FF3B30"}/></div>})}
+            {wl.map(function(item){var sym=item.symbol,q=wq[sym];if(!q)return <div key={sym} style={{background:"#0F0F18",borderRadius:8,padding:14,border:"1px solid #1A1A25",display:"flex",justifyContent:"space-between",alignItems:"center"}}><span style={{color:"#555",fontSize:11}}>{sym} — loading...</span><span className="kt" onClick={function(){fetch(API+"/api/market/watchlist",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({remove:sym})}).then(function(r){return r.json()}).then(function(d){if(d.watchlist)sWl(d.watchlist)}).catch(function(){});sWq(function(p){var n=Object.assign({},p);delete n[sym];return n})}} style={{fontSize:10,color:"#FF3B30",padding:"2px 6px",cursor:"pointer"}}>✕</span></div>;var up=q.change>=0;return <div key={sym} className="st" onClick={function(){sDetailSym(sym);sSn([]);sZoomStart(0);sZoomEnd(-1);sHoverIdx(-1);var atype=item.type||"stock";var iv2=rng==="1d"?"5m":rng==="5d"?"15m":"1d";F("/api/market/quote/"+sym+"?type="+atype+"&range="+rng+"&interval="+iv2).then(function(d){if(d.quote)sWq(function(p){var n=Object.assign({},p);n[sym]=d.quote;return n})}).catch(function(){});F("/api/market/news?symbol="+sym).then(function(d){if(d.articles)sSn(d.articles)}).catch(function(){})}} style={{background:"#0F0F18",borderRadius:8,padding:14,border:"1px solid #1A1A25",cursor:"pointer"}}><div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}><div><span style={{fontSize:14,fontWeight:700,color:"#E8E8ED"}}>{q.type==="crypto"?"₿ ":""}{sym}</span><span style={{fontSize:10,color:"#555",marginLeft:6}}>{q.name}</span></div><span className="kt" onClick={function(e){e.stopPropagation();fetch(API+"/api/market/watchlist",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({remove:sym})}).then(function(r){return r.json()}).then(function(d){if(d.watchlist)sWl(d.watchlist)}).catch(function(){});sWq(function(p){var n=Object.assign({},p);delete n[sym];return n})}} style={{fontSize:10,color:"#555"}}>✕</span></div><div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",marginBottom:8}}><span style={{fontSize:20,fontWeight:700,color:"#E8E8ED",fontFamily:"'Space Grotesk',sans-serif"}}>{"$"+(q.price||0).toLocaleString()}</span><span style={{fontSize:12,color:up?"#34C759":"#FF3B30",fontWeight:600}}>{up?"▲":"▼"} {q.change} ({q.change_pct}%)</span></div><Sp data={q.chart} width={250} height={50} color={up?"#34C759":"#FF3B30"}/></div>})}
           </div>
-          <div style={{fontSize:10,fontWeight:600,color:"#666",letterSpacing:2,marginBottom:10,textTransform:"uppercase"}}>Market News</div>
-          <div style={{display:"flex",gap:4,flexWrap:"wrap",marginBottom:8}}>{Object.keys(mns).map(function(id){var s2=mns[id];return <button key={id} className="b" onClick={function(){fetch(API+"/api/market/news-sources",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({toggle:id})}).then(function(r){return r.json()}).then(function(d){if(d.sources)sMns(d.sources)}).catch(function(){})}} style={{fontSize:8,padding:"2px 6px",borderRadius:3,background:s2.enabled?"#1A2A1A":"#14141F",color:s2.enabled?"#34C759":"#555"}}>{s2.name}</button>})}</div>
-          {mn.slice(0,15).map(function(n,i){return <a key={i} href={n.url} target="_blank" rel="noopener noreferrer" style={{display:"flex",justifyContent:"space-between",gap:10,padding:"8px 10px",background:"#0F0F18",borderRadius:6,border:"1px solid #1A1A25",textDecoration:"none",marginBottom:6}}><div style={{flex:1,fontSize:12,color:"#E8E8ED",lineHeight:1.3}}>{n.title}</div><div style={{textAlign:"right",flexShrink:0}}><div style={{fontSize:9,color:"#5448C8"}}>{n.source}</div><div style={{fontSize:8,color:"#555"}}>{n.published_at}</div></div></a>})}
+          {/* Sector Heatmap */}
+          {sectors.length>0&&<div style={{marginBottom:24}}>
+            <div style={{fontSize:10,fontWeight:600,color:"#666",letterSpacing:2,marginBottom:10,textTransform:"uppercase"}}>Market Sectors</div>
+            <div style={{display:"flex",flexWrap:"wrap",gap:3}}>
+              {sectors.map(function(sec){
+                var pct=sec.change_pct||0;
+                var bg=pct>1?"#1A3A1A":pct>0.3?"#152A15":pct>-0.3?"#1A1A25":pct>-1?"#2A1515":"#3A1A1A";
+                var col=pct>0.3?"#34C759":pct>-0.3?"#8E8E93":"#FF3B30";
+                var size=Math.max(80,Math.min(140,80+Math.abs(sec.market_cap||0)/1e10));
+                return <div key={sec.symbol} style={{background:bg,borderRadius:6,padding:"10px 12px",minWidth:size,flex:"1 1 "+size+"px",border:"1px solid "+col+"22",textAlign:"center"}}>
+                  <div style={{fontSize:10,fontWeight:600,color:col}}>{sec.name}</div>
+                  <div style={{fontSize:16,fontWeight:700,color:col,fontFamily:"'Space Grotesk',sans-serif"}}>{pct>0?"+":""}{pct.toFixed(2)}%</div>
+                  <div style={{fontSize:8,color:"#555"}}>{sec.symbol}</div>
+                </div>;
+              })}
+            </div>
+          </div>}
+
+          {/* Market News with Category Filter */}
+          <div style={{fontSize:10,fontWeight:600,color:"#666",letterSpacing:2,marginBottom:8,textTransform:"uppercase"}}>Market News</div>
+          <div style={{display:"flex",gap:3,flexWrap:"wrap",marginBottom:8}}>
+            {NEWS_CATS.map(function(cat){return <button key={cat.id} className="b" onClick={function(){sNewsFilter(cat.id)}} style={{fontSize:8,padding:"3px 8px",borderRadius:4,background:newsFilter===cat.id?"#5448C8":"#14141F",color:newsFilter===cat.id?"#fff":"#555",border:"1px solid "+(newsFilter===cat.id?"#5448C833":"#2A2A35")}}>{cat.label}</button>})}
+          </div>
+          <div style={{display:"flex",gap:4,flexWrap:"wrap",marginBottom:8}}>{Object.keys(mns).map(function(id){var s2=mns[id];return <button key={id} className="b" onClick={function(){fetch(API+"/api/market/news-sources",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({toggle:id})}).then(function(r){return r.json()}).then(function(d){if(d.sources)sMns(d.sources)}).catch(function(){})}} style={{fontSize:7,padding:"2px 5px",borderRadius:3,background:s2.enabled?"#1A2A1A":"#14141F",color:s2.enabled?"#34C759":"#555"}}>{s2.name}</button>})}</div>
+          {filteredNews.length>0?filteredNews.slice(0,20).map(function(n,i){return <a key={i} href={n.url} target="_blank" rel="noopener noreferrer" style={{display:"flex",justifyContent:"space-between",gap:10,padding:"8px 10px",background:"#0F0F18",borderRadius:6,border:"1px solid #1A1A25",textDecoration:"none",marginBottom:6}}><div style={{flex:1,fontSize:12,color:"#E8E8ED",lineHeight:1.3}}>{n.title}</div><div style={{textAlign:"right",flexShrink:0}}><div style={{fontSize:9,color:"#5448C8"}}>{n.source}</div><div style={{fontSize:8,color:"#555"}}>{n.published_at}</div></div></a>}):<div style={{color:"#555",fontSize:11,padding:20,textAlign:"center"}}>No {newsFilter} news found</div>}
         </div>}
 
         {/* ═══ ECONOMY ═══ */}

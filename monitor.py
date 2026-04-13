@@ -49,6 +49,40 @@ log = logging.getLogger("sigint")
 
 DATA_STORE_PATH = Path("sigint_data.db")
 
+# Lightweight in-memory TTL cache for expensive API-backed endpoints.
+# Keeps tab switches responsive without changing the persistence model.
+_API_CACHE = {}
+_API_CACHE_LOCK = threading.Lock()
+
+
+def cache_get(key, ttl_seconds):
+    now = time.time()
+    with _API_CACHE_LOCK:
+        hit = _API_CACHE.get(key)
+        if hit and (now - hit["ts"]) < ttl_seconds:
+            return hit["value"]
+    return None
+
+
+def cache_set(key, value):
+    with _API_CACHE_LOCK:
+        _API_CACHE[key] = {"ts": time.time(), "value": value}
+    return value
+
+
+def cache_invalidate(prefix):
+    with _API_CACHE_LOCK:
+        for key in list(_API_CACHE.keys()):
+            if key.startswith(prefix):
+                _API_CACHE.pop(key, None)
+
+
+def quote_cache_ttl(range_str, interval=""):
+    if range_str in ("1d", "5d") or interval in ("1m", "2m", "5m", "15m"):
+        return 15
+    return 60
+
+
 
 def init_data_store():
     """Initialize the SQLite database with required tables."""
@@ -3322,6 +3356,10 @@ def save_market_news_sources(sources):
 
 def fetch_yahoo_quote(symbol, range_str="1d", interval="5m"):
     """Fetch quote and chart data from Yahoo Finance."""
+    cache_key = f"yahoo:{symbol.upper()}:{range_str}:{interval}"
+    cached = cache_get(cache_key, quote_cache_ttl(range_str, interval))
+    if cached:
+        return cached
     try:
         headers = {"User-Agent": "Mozilla/5.0"}
         params = {"range": range_str, "interval": interval, "includePrePost": "true"}
@@ -3359,7 +3397,7 @@ def fetch_yahoo_quote(symbol, range_str="1d", interval="5m"):
         change = current - prev_close if prev_close else 0
         change_pct = (change / prev_close * 100) if prev_close else 0
 
-        return {
+        return cache_set(cache_key, {
             "symbol": meta.get("symbol", symbol).upper(),
             "name": meta.get("shortName", meta.get("longName", symbol)),
             "type": "stock",
@@ -3378,7 +3416,7 @@ def fetch_yahoo_quote(symbol, range_str="1d", interval="5m"):
             "fifty_two_wk_low": round(meta.get("fiftyTwoWeekLow", 0), 2),
             "chart": chart_data,
             "valid": True,
-        }
+        })
     except Exception as e:
         log.warning(f"Yahoo Finance error [{symbol}]: {e}")
         return None
@@ -3386,6 +3424,10 @@ def fetch_yahoo_quote(symbol, range_str="1d", interval="5m"):
 
 def fetch_crypto_quote(crypto_id, range_str="1d"):
     """Fetch crypto data from CoinGecko (free, no key needed)."""
+    cache_key = f"crypto_quote:{crypto_id}:{range_str}"
+    cached = cache_get(cache_key, quote_cache_ttl(range_str))
+    if cached:
+        return cached
     try:
         # Map range to CoinGecko days param
         days_map = {"1d": "1", "5d": "5", "1mo": "30", "3mo": "90", "6mo": "180", "1y": "365"}
@@ -3420,7 +3462,7 @@ def fetch_crypto_quote(crypto_id, range_str="1d"):
         change_pct = md.get("price_change_percentage_24h", 0) or 0
         symbol = coin.get("symbol", crypto_id).upper()
 
-        return {
+        return cache_set(cache_key, {
             "symbol": symbol,
             "name": coin.get("name", crypto_id),
             "type": "crypto",
@@ -3440,7 +3482,7 @@ def fetch_crypto_quote(crypto_id, range_str="1d"):
             "chart": chart_data,
             "valid": True,
             "coingecko_id": crypto_id,
-        }
+        })
     except Exception as e:
         log.warning(f"CoinGecko error [{crypto_id}]: {e}")
         return None
@@ -3449,15 +3491,18 @@ def fetch_crypto_quote(crypto_id, range_str="1d"):
 def resolve_crypto_id(symbol):
     """Resolve a crypto ticker to a CoinGecko ID."""
     sym = symbol.upper().strip()
+    cached = cache_get(f"crypto_id:{sym}", 86400)
+    if cached:
+        return cached
     if sym in CRYPTO_MAP:
-        return CRYPTO_MAP[sym]
+        return cache_set(f"crypto_id:{sym}", CRYPTO_MAP[sym])
     # Try searching CoinGecko
     try:
         resp = requests.get(f"{COINGECKO_URL}/search", params={"query": sym}, timeout=10)
         if resp.status_code == 200:
             coins = resp.json().get("coins", [])
             if coins:
-                return coins[0]["id"]
+                return cache_set(f"crypto_id:{sym}", coins[0]["id"])
     except Exception:
         pass
     return None
@@ -3469,12 +3514,18 @@ def get_indices():
     range_str = request.args.get("range", "1d")
     interval = request.args.get("interval", "5m")
     selected = load_indices_config()
+    cache_key = "indices:%s:%s:%s" % ("|".join(selected), range_str, interval)
+    cached = cache_get(cache_key, 15)
+    if cached:
+        return jsonify(cached)
     results = {}
     for sym in selected:
         data = fetch_yahoo_quote(sym, range_str, interval)
         if data:
             results[sym] = data
-    return jsonify({"indices": results})
+    payload = {"indices": results}
+    cache_set(cache_key, payload)
+    return jsonify(payload)
 
 
 @app.route("/api/market/indices/config")
@@ -3513,6 +3564,9 @@ SECTOR_ETFS = {
 @app.route("/api/market/sectors")
 def get_sectors():
     """Get sector performance data using sector ETFs."""
+    cached = cache_get("market:sectors", 60)
+    if cached:
+        return jsonify(cached)
     results = []
     for sym, name in SECTOR_ETFS.items():
         try:
@@ -3530,7 +3584,9 @@ def get_sectors():
             pass
     # Sort by absolute market cap (approximate via ETF AUM)
     results.sort(key=lambda x: abs(x.get("market_cap", 0)), reverse=True)
-    return jsonify({"sectors": results})
+    payload = {"sectors": results}
+    cache_set("market:sectors", payload)
+    return jsonify(payload)
 
 
 @app.route("/api/market/quote/<symbol>")
@@ -3558,6 +3614,10 @@ def get_quote(symbol):
 def get_watchlist():
     """Get watchlist with live quotes."""
     wl = load_watchlist()
+    cache_key = "watchlist:%s" % json.dumps(wl, sort_keys=True)
+    cached = cache_get(cache_key, 15)
+    if cached:
+        return jsonify(cached)
     quotes = {}
     errors = []
     for item in wl:
@@ -3577,7 +3637,9 @@ def get_watchlist():
                 quotes[sym] = data
             else:
                 errors.append(sym)
-    return jsonify({"watchlist": wl, "quotes": quotes, "errors": errors})
+    payload = {"watchlist": wl, "quotes": quotes, "errors": errors}
+    cache_set(cache_key, payload)
+    return jsonify(payload)
 
 
 @app.route("/api/market/watchlist", methods=["POST"])
@@ -3607,12 +3669,14 @@ def update_watchlist():
             wl.append({"symbol": sym, "type": "stock"})
 
         save_watchlist(wl)
+        cache_invalidate("watchlist:")
         return jsonify({"watchlist": wl, "status": "added"})
 
     elif data.get("remove"):
         sym = data["remove"].upper().strip()
         wl = [item for item in wl if item["symbol"] != sym]
         save_watchlist(wl)
+        cache_invalidate("watchlist:")
         return jsonify({"watchlist": wl, "status": "removed"})
 
     return jsonify({"watchlist": wl})
@@ -3625,6 +3689,11 @@ def get_market_news():
     """Fetch market news from configured sources. Optional ?symbol= to filter by ticker."""
     symbol = request.args.get("symbol", "").upper()
     sources = load_market_news_sources()
+    enabled_snapshot = json.dumps(sources, sort_keys=True)
+    cache_key = "market_news:%s:%s" % (symbol, enabled_snapshot)
+    cached = cache_get(cache_key, 60)
+    if cached:
+        return jsonify(cached)
     articles = []
 
     for src_id, src in sources.items():
@@ -3660,7 +3729,9 @@ def get_market_news():
         except Exception as e:
             log.debug(f"Market news error [{src_id}]: {e}")
 
-    return jsonify({"articles": articles[:30]})
+    payload = {"articles": articles[:30]}
+    cache_set(cache_key, payload)
+    return jsonify(payload)
 
 
 @app.route("/api/market/news-sources")
@@ -3677,6 +3748,7 @@ def update_market_news_sources():
         if src_id in sources:
             sources[src_id]["enabled"] = not sources[src_id].get("enabled", True)
             save_market_news_sources(sources)
+            cache_invalidate("market_news:")
     return jsonify({"sources": sources})
 
 
@@ -4043,6 +4115,9 @@ def fred_dashboard():
     api_key = config.get("fred_api_key", "")
     if not api_key:
         return jsonify({"error": "Add fred_api_key to config.json"}), 400
+    cached = cache_get("economy:fred_dashboard", 300)
+    if cached:
+        return jsonify(cached)
     indicators = {
         "FEDFUNDS": "Fed Funds Rate",
         "DFF": "Effective Fed Funds Rate",
@@ -4075,7 +4150,9 @@ def fred_dashboard():
                                     "date": current["date"]}
         except Exception:
             pass
-    return jsonify({"indicators": results})
+    payload = {"indicators": results}
+    cache_set("economy:fred_dashboard", payload)
+    return jsonify(payload)
 
 
 # Alpha Vantage — stock data with free key (25 req/day)
@@ -4118,13 +4195,17 @@ def alpha_vantage_quote(symbol):
 def binance_ticker(symbol):
     """Get 24h ticker data from Binance for a crypto pair."""
     try:
+        cache_key = "crypto:binance:%s" % symbol.upper()
+        cached = cache_get(cache_key, 15)
+        if cached:
+            return jsonify(cached)
         pair = symbol.upper() + "USDT"
         resp = requests.get(f"https://api.binance.com/api/v3/ticker/24hr",
                             params={"symbol": pair}, timeout=10)
         if resp.status_code != 200:
             return jsonify({"error": f"Binance: pair {pair} not found"}), 404
         d = resp.json()
-        return jsonify({
+        payload = {
             "symbol": symbol.upper(), "pair": pair,
             "price": round(float(d.get("lastPrice", 0)), 4),
             "change_24h": round(float(d.get("priceChange", 0)), 4),
@@ -4134,7 +4215,9 @@ def binance_ticker(symbol):
             "volume_24h": round(float(d.get("volume", 0)), 2),
             "quote_volume_24h": round(float(d.get("quoteVolume", 0)), 2),
             "trades_24h": int(d.get("count", 0)),
-        })
+        }
+        cache_set(cache_key, payload)
+        return jsonify(payload)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -4193,6 +4276,10 @@ def hackernews_top():
     """Get top Hacker News stories — useful for tech/startup/AI news."""
     try:
         limit = request.args.get("limit", 15, type=int)
+        cache_key = "news:hackernews:%s" % limit
+        cached = cache_get(cache_key, 120)
+        if cached:
+            return jsonify(cached)
         resp = requests.get("https://hacker-news.firebaseio.com/v0/topstories.json", timeout=10)
         if resp.status_code != 200:
             return jsonify({"error": "HN API unavailable"}), 500
@@ -4211,7 +4298,9 @@ def hackernews_top():
                         "by": s.get("by", ""),
                         "time": datetime.fromtimestamp(s.get("time", 0), tz=timezone.utc).isoformat(),
                     })
-        return jsonify({"stories": stories})
+        payload = {"stories": stories}
+        cache_set(cache_key, payload)
+        return jsonify(payload)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -4221,6 +4310,9 @@ def hackernews_top():
 def fear_greed_index():
     """Get CNN Fear & Greed Index — useful context for AI analysis."""
     try:
+        cached = cache_get("market:fear_greed", 120)
+        if cached:
+            return jsonify(cached)
         resp = requests.get("https://api.alternative.me/fng/?limit=7", timeout=10)
         if resp.status_code == 200:
             data = resp.json().get("data", [])
@@ -4231,7 +4323,9 @@ def fear_greed_index():
                     "label": d.get("value_classification", "Neutral"),
                     "timestamp": datetime.fromtimestamp(int(d.get("timestamp", 0)), tz=timezone.utc).isoformat(),
                 })
-            return jsonify({"fear_greed": results})
+            payload = {"fear_greed": results}
+            cache_set("market:fear_greed", payload)
+            return jsonify(payload)
         return jsonify({"error": "Fear & Greed API unavailable"}), 500
     except Exception as e:
         return jsonify({"error": str(e)}), 500

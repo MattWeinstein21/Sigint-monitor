@@ -64,6 +64,7 @@ var SRC = [
 var SM = {}; SRC.forEach(function(s){SM[s.id]=s;});
 
 function ago(iso){var s=Math.floor((Date.now()-new Date(iso))/1000);if(s<0)return"now";if(s<60)return s+"s";if(s<3600)return Math.floor(s/60)+"m";if(s<86400)return Math.floor(s/3600)+"h";return Math.floor(s/86400)+"d";}
+function fmtPubDate(a,tz){if(a.published_at_utc){try{return new Date(a.published_at_utc).toLocaleString("en-US",{timeZone:tz||"UTC",month:"short",day:"numeric",hour:"2-digit",minute:"2-digit",hour12:true});}catch(e){}}return a.published_at||"";}
 function F(url,opt){return fetch(API+url,opt).then(function(r){return r.json()});}
 
 function App(){
@@ -101,6 +102,8 @@ function App(){
   var[hoverIdx,sHoverIdx]=s(-1);
   var[clockTick,sClockTick]=s(0);
   var[userTz,sUserTz]=s(Intl.DateTimeFormat().resolvedOptions().timeZone||"America/New_York");
+  var tabCache=React.useRef({marketPrices:{},marketMeta:null,economy:null,analytics:null});
+  var cacheFresh=function(entry,ttl){return !!(entry&&entry.ts&&(Date.now()-entry.ts)<ttl)};
   // Chart zoom (indices into chart data array)
   var[zoomStart,sZoomStart]=s(0);
   var[zoomEnd,sZoomEnd]=s(-1); // -1 means show all
@@ -157,18 +160,23 @@ function App(){
   u(function(){var iv=setInterval(function(){sTk(function(t){return t+1})},10000);return function(){clearInterval(iv)}},[]);
   // Clock tick every second
   u(function(){var iv=setInterval(function(){sClockTick(function(t){return t+1})},1000);return function(){clearInterval(iv)}},[]);
-  // Market - faster polling (15s for prices, 60s for news/config)
-  u(function(){if(mv!=="market")return;
-    var loadPrices=function(){var iv2=rng==="1d"?"5m":rng==="5d"?"15m":"1d";F("/api/market/indices?range="+rng+"&interval="+iv2).then(function(d){if(d.indices)sIdx(d.indices)}).catch(function(){});F("/api/market/watchlist").then(function(d){if(d.watchlist)sWl(d.watchlist);if(d.quotes)sWq(d.quotes)}).catch(function(){})};
-    var loadMeta=function(){F("/api/market/news").then(function(d){if(d.articles)sMn(d.articles)}).catch(function(){});F("/api/market/news-sources").then(function(d){if(d.sources)sMns(d.sources)}).catch(function(){});F("/api/market/indices/config").then(function(d){if(d.available)sIdxCfg(d)}).catch(function(){});F("/api/market/sectors").then(function(d){if(d.sectors)sSectors(d.sectors)}).catch(function(){})};
-    loadPrices();loadMeta();
-    var iv1=setInterval(loadPrices,15000);var iv2=setInterval(loadMeta,60000);
-    return function(){clearInterval(iv1);clearInterval(iv2)}
+  // Market - cached tab load + staggered refresh to keep tab switches responsive
+  u(function(){if(mv!=="market")return;var dead=false;
+    var iv2=rng==="1d"?"5m":rng==="5d"?"15m":"1d";
+    var priceKey=rng+":"+iv2;
+    var applyPrices=function(d){if(dead||!d)return;if(d.indices)sIdx(d.indices);if(d.watchlist)sWl(d.watchlist);if(d.quotes)sWq(d.quotes)};
+    var applyMeta=function(d){if(dead||!d)return;if(d.articles)sMn(d.articles);if(d.sources)sMns(d.sources);if(d.available)sIdxCfg(d);if(d.sectors)sSectors(d.sectors)};
+    var loadPrices=function(force){var entry=tabCache.current.marketPrices[priceKey];if(!force&&cacheFresh(entry,12000)){applyPrices(entry.data);return;}Promise.all([F("/api/market/indices?range="+rng+"&interval="+iv2),F("/api/market/watchlist")]).then(function(res){var data={indices:res[0].indices||{},watchlist:res[1].watchlist||[],quotes:res[1].quotes||{}};tabCache.current.marketPrices[priceKey]={ts:Date.now(),data:data};applyPrices(data)}).catch(function(){})};
+    var loadMeta=function(force){var entry=tabCache.current.marketMeta;if(!force&&cacheFresh(entry,45000)){applyMeta(entry.data);return;}Promise.all([F("/api/market/news"),F("/api/market/news-sources"),F("/api/market/indices/config"),F("/api/market/sectors")]).then(function(res){var data={articles:res[0].articles||[],sources:res[1].sources||{},available:res[2].available||{},selected:res[2].selected||[],sectors:res[3].sectors||[]};tabCache.current.marketMeta={ts:Date.now(),data:data};applyMeta(data)}).catch(function(){})};
+    loadPrices(false);
+    setTimeout(function(){loadMeta(false)},0);
+    var iv1=setInterval(function(){loadPrices(true)},15000);var iv3=setInterval(function(){loadMeta(true)},60000);
+    return function(){dead=true;clearInterval(iv1);clearInterval(iv3)}
   },[mv,rng]);
   // Analytics
-  u(function(){if(mv!=="analytics")return;F("/api/data/accuracy").then(function(d){sAcd(d)}).catch(function(){})},[mv]);
+  u(function(){if(mv!=="analytics")return;var dead=false;var entry=tabCache.current.analytics;if(cacheFresh(entry,60000)&&entry.data){sAcd(entry.data);}else{F("/api/data/accuracy").then(function(d){if(dead)return;tabCache.current.analytics={ts:Date.now(),data:d};sAcd(d)}).catch(function(){})}return function(){dead=true}},[mv]);
   // Economy
-  u(function(){if(mv!=="economy")return;F("/api/market/fear-greed").then(function(d){if(d.fear_greed)sFg(d.fear_greed)}).catch(function(){});F("/api/economy/fred-dashboard").then(function(d){if(d.indicators)sFd(d.indicators)}).catch(function(){});F("/api/news/hackernews?limit=10").then(function(d){if(d.stories)sHn(d.stories)}).catch(function(){});F("/api/crypto/binance/BTC").then(function(d){if(!d.error)sBt(d)}).catch(function(){})},[mv]);
+  u(function(){if(mv!=="economy")return;var dead=false;var applyEconomy=function(d){if(dead||!d)return;if(d.fear_greed)sFg(d.fear_greed);if(d.indicators)sFd(d.indicators);if(d.stories)sHn(d.stories);if(d.btc&&!d.btc.error)sBt(d.btc)};var loadEconomy=function(force){var entry=tabCache.current.economy;if(!force&&cacheFresh(entry,60000)){applyEconomy(entry.data);return;}Promise.all([F("/api/economy/fred-dashboard"),F("/api/market/fear-greed"),F("/api/news/hackernews?limit=10"),F("/api/crypto/binance/BTC")]).then(function(res){var data={indicators:res[0].indicators||{},fear_greed:res[1].fear_greed||[],stories:res[2].stories||[],btc:res[3]||null};tabCache.current.economy={ts:Date.now(),data:data};applyEconomy(data)}).catch(function(){})};loadEconomy(false);var iv=setInterval(function(){loadEconomy(true)},60000);return function(){dead=true;clearInterval(iv)}},[mv]);
 
   // Sparkline
   var Sp=function(p){if(!p.data||p.data.length<2)return null;var v=p.data.map(function(d){return d.close});var mi=Math.min.apply(null,v),ma=Math.max.apply(null,v),r=ma-mi||1;var pts=v.map(function(val,i){return(i/(v.length-1))*p.width+","+(p.height-((val-mi)/r)*p.height)}).join(" ");return <svg width={p.width} height={p.height} style={{display:"block"}}><polyline points={pts} fill="none" stroke={p.color} strokeWidth="1.5"/></svg>};
@@ -510,7 +518,7 @@ function App(){
                   {!a.user_corrected&&<button className="b" onClick={function(e){e.stopPropagation();sCorrUrl(a.url);sCorrCtx("")}} style={{fontSize:9,padding:"2px 6px",background:"#14141F",color:"#AAA",border:"1px solid #2A2A35",borderRadius:3,marginLeft:4}}>✎ Correct</button>}
                   {a.user_corrected&&<span style={{fontSize:8,color:a.is_duplicate?"#FF9500":"#34C759"}}>{a.is_duplicate?"🔄 dup":"✓ corrected"}</span>}
                   <span style={{fontSize:10,color:"#444",marginLeft:"auto"}}>{ago(a.timestamp)}</span>
-                  {a.published_at&&<span style={{fontSize:9,color:"#555"}}>📅 {a.published_at}</span>}
+                  {(a.published_at_utc||a.published_at)&&<span style={{fontSize:9,color:"#555"}}>📅 {fmtPubDate(a,userTz)}</span>}
                 </div>
               </div>
             </div>})}

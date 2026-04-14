@@ -908,8 +908,8 @@ OLLAMA_CHAT_TIMEOUT = 30        # Chat should respond fast or fail fast
 OLLAMA_CHAT_NUM_PREDICT = 512   # Cap chat response length for speed
 OLLAMA_CHAT_TEMPERATURE = 0.3   # Low creativity for factual chat
 
-OLLAMA_ANALYSIS_TIMEOUT = 60    # Analysis can take longer
-OLLAMA_ANALYSIS_NUM_PREDICT = 1024  # Structured JSON needs more room
+OLLAMA_ANALYSIS_TIMEOUT = 90    # Analysis can take longer (structured JSON + retries)
+OLLAMA_ANALYSIS_NUM_PREDICT = 2048  # Thinking models need extra room for <think> tokens
 OLLAMA_ANALYSIS_TEMPERATURE = 0.1   # Very low for consistent JSON output
 
 
@@ -1850,8 +1850,12 @@ Respond with ONLY valid JSON (no other text):
 
 
 def parse_llm_response(raw_response):
-    """Parse and validate LLM JSON response with fallbacks."""
+    """Parse and validate LLM JSON response with fallbacks.
+    Handles thinking models (Qwen, DeepSeek R1) that emit <think>...</think> blocks."""
     text = raw_response.strip()
+
+    # Strip thinking model output — Qwen 3.5, DeepSeek R1 emit <think>...</think> before JSON
+    text = re.sub(r"<think>[\s\S]*?</think>", "", text).strip()
 
     # Strip markdown fences
     if text.startswith("```"):
@@ -3562,7 +3566,7 @@ def get_watchlist():
 
 @app.route("/api/market/watchlist", methods=["POST"])
 def update_watchlist():
-    """Add or remove symbols from watchlist with validation."""
+    """Add, remove, or reorder symbols from watchlist with validation."""
     data = request.get_json(silent=True) or {}
     wl = load_watchlist()
 
@@ -3574,7 +3578,18 @@ def update_watchlist():
             if item["symbol"] == sym:
                 return jsonify({"watchlist": wl, "status": "exists"})
 
-        # Validate the symbol actually exists
+        # Auto-detect: try stock first, then crypto
+        if atype == "auto":
+            test = fetch_yahoo_quote(sym, "1d", "5m")
+            if test:
+                atype = "stock"
+            else:
+                crypto_id = resolve_crypto_id(sym)
+                if crypto_id:
+                    atype = "crypto"
+                else:
+                    return jsonify({"error": f"'{sym}' not found as stock or crypto"}), 404
+
         if atype == "crypto":
             crypto_id = resolve_crypto_id(sym)
             if not crypto_id:
@@ -3595,7 +3610,46 @@ def update_watchlist():
         save_watchlist(wl)
         return jsonify({"watchlist": wl, "status": "removed"})
 
+    elif data.get("reorder"):
+        # Reorder watchlist to match provided symbol order
+        order = data["reorder"]
+        sym_map = {item["symbol"]: item for item in wl}
+        new_wl = []
+        for sym in order:
+            if sym in sym_map:
+                new_wl.append(sym_map[sym])
+        # Add any items not in the reorder list at the end
+        for item in wl:
+            if item["symbol"] not in order:
+                new_wl.append(item)
+        save_watchlist(new_wl)
+        return jsonify({"watchlist": new_wl, "status": "reordered"})
+
     return jsonify({"watchlist": wl})
+
+
+@app.route("/api/market/search")
+def market_search():
+    """Search for stocks and cryptos by name/ticker. Returns combined results with type tags."""
+    q = request.args.get("q", "").strip().upper()
+    if not q or len(q) < 1:
+        return jsonify({"results": []})
+    results = []
+    # Try stock lookup
+    try:
+        stock = fetch_yahoo_quote(q, "1d", "5m")
+        if stock:
+            results.append({"symbol": q, "name": stock.get("name", q), "type": "stock"})
+    except Exception:
+        pass
+    # Try crypto lookup
+    try:
+        crypto_id = resolve_crypto_id(q)
+        if crypto_id:
+            results.append({"symbol": q, "name": crypto_id.replace("-", " ").title(), "type": "crypto"})
+    except Exception:
+        pass
+    return jsonify({"results": results})
 
 
 # ─── Market News ──────────────────────────────────────────────────────────────

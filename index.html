@@ -69,10 +69,18 @@ function F(url,opt){return fetch(API+url,opt).then(function(r){return r.json()})
 
 function App(){
   var s=h,u=ue;
-  var[kw,sKw]=s([]);var[nk,sNk]=s("");var[al,sAl]=s([]);var[fi,sFi]=s("all");var[sf,sSf]=s("all");
+  var[kw,sKw]=s([]);var[nk,sNk]=s("");var[al,sAl]=s([]);var[fi,sFi]=s("all");
   var[mon,sMon]=s(true);var[cfg,sCfg]=s(false);var[es,sEs]=s(SRC.map(function(x){return x.id}));
+  // Multi-select filters (sets stored as arrays for ES5 compat)
+  var[sfSet,sSfSet]=s([]);   // severity: empty=all
+  var[stfSet,sStfSet]=s([]); // tone: empty=all
+  var[imfSet,sImfSet]=s([]); // impact: empty=all
+  var[tfMin,sTfMin]=s(0);    // time frame in minutes: 0=all
+  var[showFilters,sShowFilters]=s(false);
+  // Display toggles (which optional tags to show)
+  var[dShow,sDShow]=s({impact:true,tone:true,confidence:true,keyword:true,mixed:true});
   var[conn,sConn]=s(false);var[acc,sAcc]=s([]);var[nau,sNau]=s("");var[ae,sAe]=s("");
-  var[ref,sRef]=s(false);var[stf,sStf]=s("all");var[imf,sImf]=s("all");
+  var[ref,sRef]=s(false);
   var[ss,sSs]=s({});var[ct,sCt]=s("general");var[exp,sExp]=s(new Set());
   var[mv,sMv]=s("alerts");var[idx,sIdx]=s({});var[wl,sWl]=s([]);var[wq,sWq]=s({});
   var[ns,sNs]=s("");var[sel,sSel]=s(null);var[rng,sRng]=s("1d");
@@ -98,7 +106,7 @@ function App(){
   var[gcLoading,sGcLoading]=s(false);
   // Market enhancements
   var[sectors,sSectors]=s([]);
-  var[newsFilter,sNewsFilter]=s("all");
+  var[newsFilter,sNewsFilter]=s([]);  // empty = all
   var[hoverIdx,sHoverIdx]=s(-1);
   var[clockTick,sClockTick]=s(0);
   var[userTz,sUserTz]=s(Intl.DateTimeFormat().resolvedOptions().timeZone||"America/New_York");
@@ -107,9 +115,58 @@ function App(){
   // Chart zoom (indices into chart data array)
   var[zoomStart,sZoomStart]=s(0);
   var[zoomEnd,sZoomEnd]=s(-1); // -1 means show all
+  // Drag reorder
+  var dragRef=React.useRef({section:null,from:-1});
+  // Watchlist type filter: "all","stock","crypto"
+  var[wlFilter,sWlFilter]=s("all");
+  // Search suggestions
+  var[searchResults,sSearchResults]=s([]);
+  var searchTimer=React.useRef(null);
 
   var tt=function(m){sToast(m);setTimeout(function(){sToast("")},3000)};
   var te=function(id){sExp(function(p){var n=new Set(p);if(n.has(id))n.delete(id);else n.add(id);return n})};
+  // Multi-select toggle helper: toggles a value in an array
+  var tog=function(arr,setFn,val){setFn(arr.indexOf(val)===-1?arr.concat([val]):arr.filter(function(x){return x!==val}))};
+  // Display toggle helper
+  var dtog=function(key){sDShow(function(p){var n=Object.assign({},p);n[key]=!n[key];return n})};
+
+  // News category tagger — returns first matching category for an article title
+  var tagNews=function(title){
+    var t=(title||"").toLowerCase();
+    for(var i=1;i<NEWS_CATS.length;i++){
+      var cat=NEWS_CATS[i];
+      if(cat.kw&&cat.kw.some(function(k){return t.indexOf(k)!==-1}))return cat;
+    }
+    return null;
+  };
+  var NC_COLORS={stocks:"#5448C8",crypto:"#F7931A",bonds:"#16A085",forex:"#E74C3C",commodities:"#FF9500",energy:"#34C759",tech:"#1DA1F2",realestate:"#9B59B6",macro:"#E8E8ED"};
+
+  // Drag-and-drop handlers for reordering
+  var onDragStart=function(section,idx){return function(e){dragRef.current={section:section,from:idx};e.dataTransfer.effectAllowed="move"}};
+  var onDragOver=function(e){e.preventDefault();e.dataTransfer.dropEffect="move"};
+  var onDrop=function(section,toIdx){return function(e){
+    e.preventDefault();
+    var d=dragRef.current;if(!d||d.section!==section||d.from===toIdx)return;
+    if(section==="indices"&&idxCfg){
+      var arr=(idxCfg.selected||[]).slice();var item=arr.splice(d.from,1)[0];arr.splice(toIdx,0,item);
+      sIdxCfg(Object.assign({},idxCfg,{selected:arr}));
+      fetch(API+"/api/market/indices/config",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({selected:arr})}).catch(function(){});
+    }else if(section==="watchlist"){
+      var arr2=wl.slice();var item2=arr2.splice(d.from,1)[0];arr2.splice(toIdx,0,item2);
+      sWl(arr2);
+      fetch(API+"/api/market/watchlist",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({reorder:arr2.map(function(w){return w.symbol})})}).catch(function(){});
+    }
+    dragRef.current={section:null,from:-1};
+  }};
+
+  // Debounced search for unified watchlist add
+  var doSearch=function(q){
+    if(searchTimer.current)clearTimeout(searchTimer.current);
+    if(!q||q.length<1){sSearchResults([]);return}
+    searchTimer.current=setTimeout(function(){
+      F("/api/market/search?q="+encodeURIComponent(q)).then(function(d){if(d.results)sSearchResults(d.results)}).catch(function(){});
+    },300);
+  };
 
   var submitCorrection=function(impact){
     if(!corrUrl)return;
@@ -181,7 +238,14 @@ function App(){
   // Sparkline
   var Sp=function(p){if(!p.data||p.data.length<2)return null;var v=p.data.map(function(d){return d.close});var mi=Math.min.apply(null,v),ma=Math.max.apply(null,v),r=ma-mi||1;var pts=v.map(function(val,i){return(i/(v.length-1))*p.width+","+(p.height-((val-mi)/r)*p.height)}).join(" ");return <svg width={p.width} height={p.height} style={{display:"block"}}><polyline points={pts} fill="none" stroke={p.color} strokeWidth="1.5"/></svg>};
 
-  var filt=al.filter(function(a){if(fi!=="all"&&a.keyword!==fi)return false;if(sf!=="all"&&a.severity!==sf)return false;if(stf!=="all"&&(a.article_tone||a.sentiment)!==stf)return false;if(imf!=="all"&&(a.market_impact||"neutral")!==imf)return false;return es.includes(a.source)});
+  var filt=al.filter(function(a){
+    if(fi!=="all"&&a.keyword!==fi)return false;
+    if(sfSet.length>0&&sfSet.indexOf(a.severity)===-1)return false;
+    if(stfSet.length>0&&stfSet.indexOf(a.article_tone||a.sentiment||"neutral")===-1)return false;
+    if(imfSet.length>0&&imfSet.indexOf(a.market_impact||"neutral")===-1)return false;
+    if(tfMin>0){var ts=a.published_at_utc||a.timestamp;if(ts){var age=Date.now()-new Date(ts).getTime();if(age>tfMin*60000)return false}}
+    return es.includes(a.source)
+  });
 
   var iC={bullish:"#34C759",bearish:"#FF3B30",neutral:"#8E8E93"};
   var tC={positive:"#34C759",negative:"#FF3B30",neutral:"#8E8E93"};
@@ -230,11 +294,13 @@ function App(){
   ];
 
   var filteredNews=mn.filter(function(n){
-    if(newsFilter==="all")return true;
-    var cat=NEWS_CATS.find(function(c){return c.id===newsFilter});
-    if(!cat||!cat.kw)return true;
+    if(newsFilter.length===0)return true;
     var txt=(n.title||"").toLowerCase();
-    return cat.kw.some(function(k){return txt.indexOf(k)!==-1});
+    return newsFilter.some(function(catId){
+      var cat=NEWS_CATS.find(function(c){return c.id===catId});
+      if(!cat||!cat.kw)return false;
+      return cat.kw.some(function(k){return txt.indexOf(k)!==-1});
+    });
   });
 
   // Current time in user timezone
@@ -369,21 +435,23 @@ function App(){
       </div>}
 
     {/* HEADER */}
-    <div style={{borderBottom:"1px solid #1A1A25",padding:"14px 24px",display:"flex",alignItems:"center",justifyContent:"space-between",position:"sticky",top:0,background:"#0A0A0F",zIndex:10}}>
-      <div style={{display:"flex",alignItems:"center",gap:10}}>
+    <div style={{borderBottom:"1px solid #1A1A25",padding:"10px 20px",display:"flex",alignItems:"center",justifyContent:"space-between",position:"sticky",top:0,background:"#0A0A0F",zIndex:10}}>
+      <div style={{display:"flex",alignItems:"center",gap:10,flex:"0 0 auto"}}>
         <button className="b" onClick={function(){sCfg(!cfg)}} style={{background:cfg?"#2A2A35":"#14141F",color:"#AAA",padding:"6px 10px",borderRadius:6,fontSize:11}}>⚙</button>
         <div style={{width:10,height:10,borderRadius:"50%",background:mon?"#34C759":"#FF3B30",animation:mon?"pulse 2s infinite":"none"}}/>
         <span style={{fontFamily:"'Space Grotesk',sans-serif",fontWeight:700,fontSize:18}}>SIGINT</span>
         <span style={{fontSize:9,padding:"2px 8px",borderRadius:4,background:conn?"#1A2A1A":"#2A1A1A",color:conn?"#34C759":"#FF3B30",border:"1px solid "+(conn?"#34C75933":"#FF3B3033")}}>{conn?"● CONNECTED":"✕ DISCONNECTED"}</span>
       </div>
-      <div style={{display:"flex",gap:6,flexWrap:"wrap",alignItems:"center"}}>
-        {/* Market clock */}
-        <div style={{display:"flex",alignItems:"center",gap:6,padding:"4px 10px",borderRadius:6,background:"#0F0F18",border:"1px solid #1A1A25",marginRight:4}}>
-          <div style={{width:6,height:6,borderRadius:"50%",background:mClock.color,animation:mClock.open?"pulse 2s infinite":"none"}}/>
-          <span style={{fontSize:9,color:mClock.color,fontWeight:600}}>{mClock.text}</span>
-          <span style={{fontSize:8,color:"#555"}}>{mClock.countdown}</span>
-          <span style={{fontSize:9,color:"#666",fontFamily:"'Space Grotesk',sans-serif",marginLeft:4}}>{nowStr}</span>
+      {/* Market clock — centered */}
+      <div style={{flex:"1 1 auto",display:"flex",justifyContent:"center"}}>
+        <div style={{display:"flex",alignItems:"center",gap:8,padding:"6px 16px",borderRadius:8,background:"#0F0F18",border:"1px solid #1A1A25"}}>
+          <div style={{width:8,height:8,borderRadius:"50%",background:mClock.color,animation:mClock.open?"pulse 2s infinite":"none"}}/>
+          <span style={{fontSize:11,color:mClock.color,fontWeight:600}}>{mClock.text}</span>
+          <span style={{fontSize:10,color:"#666"}}>{mClock.countdown}</span>
+          <span style={{fontSize:11,color:"#888",fontFamily:"'Space Grotesk',sans-serif",fontWeight:500}}>{nowStr}</span>
         </div>
+      </div>
+      <div style={{display:"flex",gap:5,alignItems:"center",flex:"0 0 auto"}}>
         {["alerts","market","economy","analytics"].map(function(v){var lb={alerts:"📋 Alerts",market:"📊 Markets",economy:"🏛 Economy",analytics:"🎯 Accuracy"};return <button key={v} className="b" onClick={function(){sMv(v)}} style={{background:mv===v?"#5448C8":"#14141F",color:mv===v?"#fff":"#AAA",padding:"6px 12px",borderRadius:6,fontSize:11}}>{lb[v]}</button>})}
         <button className="b" onClick={function(){sRef(true);fetch(API+"/api/refresh",{method:"POST"}).then(function(){setTimeout(function(){F("/api/alerts?limit=300").then(function(d){if(d.alerts)sAl(d.alerts)}).catch(function(){});sRef(false)},3000)}).catch(function(){sRef(false)})}} style={{background:"#14141F",color:"#AAA",padding:"6px 12px",borderRadius:6,fontSize:11}}>{ref?"⟳...":"⟳"}</button>
         <button className="b" onClick={function(){sMon(!mon)}} style={{background:mon?"#1A2A1A":"#2A1A1A",color:mon?"#34C759":"#FF3B30",padding:"6px 12px",borderRadius:6,fontSize:11}}>{mon?"● LIVE":"■ STOP"}</button>
@@ -468,10 +536,48 @@ function App(){
             {[{l:"Total",v:al.length,c:"#5448C8"},{l:"Bullish",v:al.filter(function(a){return a.market_impact==="bullish"}).length,c:"#34C759"},{l:"Bearish",v:al.filter(function(a){return a.market_impact==="bearish"}).length,c:"#FF3B30"},{l:"Mixed",v:al.filter(function(a){return a.mixed_signals}).length,c:"#FF9500"},{l:"High",v:al.filter(function(a){return a.severity==="high"}).length,c:"#FF9500"},{l:"AI",v:al.filter(function(a){return a.ai_summary}).length,c:"#8B80F0"}].map(function(x,i){return <div key={i} style={{flex:1,padding:"8px 14px",background:"#0F0F18",borderRadius:i===0?"8px 0 0 8px":i===5?"0 8px 8px 0":0}}><div style={{fontSize:9,color:"#555",textTransform:"uppercase",letterSpacing:1.5}}>{x.l}</div><div style={{fontSize:22,fontWeight:700,color:x.c,fontFamily:"'Space Grotesk',sans-serif"}}>{x.v}</div></div>})}
           </div>
           <div style={{display:"flex",gap:8,padding:"10px 20px",borderBottom:"1px solid #1A1A25",flexWrap:"wrap",alignItems:"center"}}>
-            <select value={fi} onChange={function(e){sFi(e.target.value)}} style={{background:"#14141F",border:"1px solid #2A2A35",borderRadius:6,padding:"5px 8px",color:"#AAA",fontSize:11,outline:"none"}}><option value="all">All Keywords</option>{kw.map(function(k){return <option key={k} value={k}>{k}</option>})}</select>
-            <select value={sf} onChange={function(e){sSf(e.target.value)}} style={{background:"#14141F",border:"1px solid #2A2A35",borderRadius:6,padding:"5px 8px",color:"#AAA",fontSize:11,outline:"none"}}><option value="all">Severity</option><option value="high">High</option><option value="medium">Med</option><option value="low">Low</option></select>
-            <select value={stf} onChange={function(e){sStf(e.target.value)}} style={{background:"#14141F",border:"1px solid #2A2A35",borderRadius:6,padding:"5px 8px",color:"#AAA",fontSize:11,outline:"none"}}><option value="all">Tone</option><option value="positive">Positive</option><option value="neutral">Neutral</option><option value="negative">Negative</option></select>
-            <select value={imf} onChange={function(e){sImf(e.target.value)}} style={{background:"#14141F",border:"1px solid #2A2A35",borderRadius:6,padding:"5px 8px",color:"#AAA",fontSize:11,outline:"none"}}><option value="all">Impact</option><option value="bullish">Bullish</option><option value="neutral">Neutral</option><option value="bearish">Bearish</option></select>
+            {/* Filters dropdown */}
+            <div style={{position:"relative"}}>
+              <button className="b" onClick={function(){sShowFilters(!showFilters)}} style={{background:showFilters?"#2A2A35":(sfSet.length||stfSet.length||imfSet.length||tfMin||fi!=="all")?"#5448C8":"#14141F",color:(sfSet.length||stfSet.length||imfSet.length||tfMin||fi!=="all")?"#fff":"#AAA",padding:"5px 12px",borderRadius:6,fontSize:11,border:"1px solid #2A2A35"}}>
+                ☰ Filters{(sfSet.length+stfSet.length+imfSet.length+(tfMin?1:0)+(fi!=="all"?1:0))>0?" ("+(sfSet.length+stfSet.length+imfSet.length+(tfMin?1:0)+(fi!=="all"?1:0))+")":""}
+              </button>
+              {showFilters&&<div style={{position:"absolute",top:"100%",left:0,marginTop:4,background:"#14141F",border:"1px solid #2A2A35",borderRadius:8,padding:14,zIndex:50,width:300,boxShadow:"0 8px 24px rgba(0,0,0,0.5)",maxHeight:"70vh",overflowY:"auto"}}>
+                {/* Keywords */}
+                <div style={{fontSize:9,color:"#666",textTransform:"uppercase",letterSpacing:1,marginBottom:6,fontWeight:600}}>Keyword</div>
+                <div style={{display:"flex",gap:3,flexWrap:"wrap",marginBottom:12}}>
+                  <button className="b" onClick={function(){sFi("all")}} style={{fontSize:9,padding:"3px 8px",borderRadius:4,background:fi==="all"?"#5448C8":"#0A0A0F",color:fi==="all"?"#fff":"#555",border:"1px solid "+(fi==="all"?"#5448C833":"#1A1A25")}}>All</button>
+                  {kw.map(function(k){return <button key={k} className="b" onClick={function(){sFi(fi===k?"all":k)}} style={{fontSize:9,padding:"3px 8px",borderRadius:4,background:fi===k?"#8B80F0":"#0A0A0F",color:fi===k?"#fff":"#555",border:"1px solid "+(fi===k?"#8B80F033":"#1A1A25")}}>{k}</button>})}
+                </div>
+                {/* Time Frame */}
+                <div style={{fontSize:9,color:"#666",textTransform:"uppercase",letterSpacing:1,marginBottom:6,fontWeight:600}}>Time Frame</div>
+                <div style={{display:"flex",gap:3,flexWrap:"wrap",marginBottom:12}}>
+                  {[{v:0,l:"All"},{v:30,l:"30m"},{v:60,l:"1h"},{v:180,l:"3h"},{v:300,l:"5h"},{v:1440,l:"24h"},{v:2880,l:"48h"}].map(function(t){return <button key={t.v} className="b" onClick={function(){sTfMin(t.v)}} style={{fontSize:9,padding:"3px 8px",borderRadius:4,background:tfMin===t.v?"#5448C8":"#0A0A0F",color:tfMin===t.v?"#fff":"#555",border:"1px solid "+(tfMin===t.v?"#5448C833":"#1A1A25")}}>{t.l}</button>})}
+                </div>
+                {/* Severity */}
+                <div style={{fontSize:9,color:"#666",textTransform:"uppercase",letterSpacing:1,marginBottom:6,fontWeight:600}}>Severity</div>
+                <div style={{display:"flex",gap:4,marginBottom:12}}>
+                  {["high","medium","low"].map(function(v){var on=sfSet.indexOf(v)!==-1;return <button key={v} className="b" onClick={function(){tog(sfSet,sSfSet,v)}} style={{fontSize:9,padding:"3px 8px",borderRadius:4,background:on?svC[v]+"25":"#0A0A0F",color:on?svC[v]:"#555",border:"1px solid "+(on?svC[v]+"55":"#1A1A25")}}>{v}</button>})}
+                </div>
+                {/* Tone */}
+                <div style={{fontSize:9,color:"#666",textTransform:"uppercase",letterSpacing:1,marginBottom:6,fontWeight:600}}>Tone</div>
+                <div style={{display:"flex",gap:4,marginBottom:12}}>
+                  {["positive","neutral","negative"].map(function(v){var on=stfSet.indexOf(v)!==-1;var c2=tC[v]||"#8E8E93";return <button key={v} className="b" onClick={function(){tog(stfSet,sStfSet,v)}} style={{fontSize:9,padding:"3px 8px",borderRadius:4,background:on?c2+"25":"#0A0A0F",color:on?c2:"#555",border:"1px solid "+(on?c2+"55":"#1A1A25")}}>{v}</button>})}
+                </div>
+                {/* Impact */}
+                <div style={{fontSize:9,color:"#666",textTransform:"uppercase",letterSpacing:1,marginBottom:6,fontWeight:600}}>Impact</div>
+                <div style={{display:"flex",gap:4,marginBottom:12}}>
+                  {["bullish","neutral","bearish"].map(function(v){var on=imfSet.indexOf(v)!==-1;var c2=iC[v]||"#8E8E93";return <button key={v} className="b" onClick={function(){tog(imfSet,sImfSet,v)}} style={{fontSize:9,padding:"3px 8px",borderRadius:4,background:on?c2+"25":"#0A0A0F",color:on?c2:"#555",border:"1px solid "+(on?c2+"55":"#1A1A25")}}>{v}</button>})}
+                </div>
+                {/* Display toggles */}
+                <div style={{fontSize:9,color:"#666",textTransform:"uppercase",letterSpacing:1,marginBottom:6,fontWeight:600}}>Display</div>
+                <div style={{display:"flex",gap:4,flexWrap:"wrap",marginBottom:8}}>
+                  {[{k:"impact",l:"Impact"},{k:"tone",l:"Tone"},{k:"confidence",l:"Conf %"},{k:"keyword",l:"Keyword"},{k:"mixed",l:"Mixed"}].map(function(d){return <button key={d.k} className="b" onClick={function(){dtog(d.k)}} style={{fontSize:8,padding:"2px 6px",borderRadius:3,background:dShow[d.k]?"#1A2A1A":"#0A0A0F",color:dShow[d.k]?"#34C759":"#444",border:"1px solid "+(dShow[d.k]?"#34C75933":"#1A1A25")}}>{d.l}</button>})}
+                </div>
+                {/* Clear all */}
+                <button className="b" onClick={function(){sSfSet([]);sStfSet([]);sImfSet([]);sTfMin(0);sFi("all")}} style={{width:"100%",fontSize:9,padding:"4px",borderRadius:4,background:"#0A0A0F",color:"#555",border:"1px solid #1A1A25",marginTop:4}}>Clear All Filters</button>
+              </div>}
+            </div>
+            <span style={{fontSize:9,color:"#444"}}>{filt.length} alerts{fi!=="all"?" · "+fi:""}{tfMin>0?" · "+[{v:30,l:"30m"},{v:60,l:"1h"},{v:180,l:"3h"},{v:300,l:"5h"},{v:1440,l:"24h"},{v:2880,l:"48h"}].filter(function(t){return t.v===tfMin}).map(function(t){return t.l})[0]:""}</span>
           </div>
           <div style={{flex:1,overflowY:"auto"}}>
             {filt.length===0&&<div style={{textAlign:"center",padding:60,color:"#333"}}><div style={{fontSize:32,marginBottom:8}}>◎</div><div style={{fontSize:13}}>{conn?"No alerts":"Connecting..."}</div></div>}
@@ -497,27 +603,29 @@ function App(){
                   </button>
                   {isX&&<div style={{marginTop:2}}>
                     <div style={{fontSize:11,color:"#BBB",lineHeight:1.6,padding:"8px 10px",background:"#0F0F18",borderRadius:6,borderLeft:"2px solid "+ic+"66"}}>{a.summary}</div>
-                    <div style={{marginTop:8}}>
+                    {/* Per-alert chat — narrowed to 65% */}
+                    <div style={{maxWidth:"65%",marginTop:8}}>
                       {(ch[a.id]||[]).map(function(m,i){return <div key={i} className="cm" style={{display:"flex",justifyContent:m.role==="user"?"flex-end":"flex-start",marginBottom:6}}><div style={{maxWidth:"85%",padding:"6px 10px",borderRadius:m.role==="user"?"8px 8px 2px 8px":"8px 8px 8px 2px",background:m.role==="user"?"#5448C8":"#0A0A14",color:m.role==="user"?"#fff":"#AAA",fontSize:10,lineHeight:1.5,border:m.role==="user"?"none":"1px solid #1A1A25"}}>{m.role==="ai"&&<span style={{fontSize:8,color:"#8B80F0",marginRight:4}}>🤖</span>}{m.text}</div></div>})}
                       {cl===a.id&&<div className="cm" style={{display:"flex",marginBottom:6}}><div style={{padding:"6px 10px",borderRadius:"8px 8px 8px 2px",background:"#0A0A14",border:"1px solid #1A1A25",fontSize:10,color:"#8B80F0"}}>🤖 <span className="thk">Thinking</span></div></div>}
                       <div style={{display:"flex",gap:4,marginTop:4}}>
-                        <input value={ci[a.id]||""} onChange={function(e){sCi(function(p){var n=Object.assign({},p);n[a.id]=e.target.value;return n})}} onKeyDown={function(e){if(e.key==="Enter"){var q=(ci[a.id]||"").trim();if(!q)return;sCi(function(p){var n=Object.assign({},p);n[a.id]="";return n});sCl(a.id);sCh(function(p){var n=Object.assign({},p);n[a.id]=(p[a.id]||[]).concat([{role:"user",text:q}]);return n});var hist=ch[a.id]||[];fetch(API+"/api/chat",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({alert_id:a.id,question:q,history:hist})}).then(function(r){return r.json()}).then(function(d){sCh(function(p){var n=Object.assign({},p);n[a.id]=(p[a.id]||[]).concat([{role:"ai",text:d.answer||d.error||"No response"}]);return n});sCl(null)}).catch(function(){sCh(function(p){var n=Object.assign({},p);n[a.id]=(p[a.id]||[]).concat([{role:"ai",text:"Failed"}]);return n});sCl(null)})}}} placeholder="Ask..." disabled={cl===a.id} style={{flex:1,background:"#14141F",border:"1px solid #2A2A35",borderRadius:6,padding:"5px 8px",color:"#E8E8ED",fontSize:10,outline:"none",opacity:cl===a.id?0.5:1}}/>
+                        <input value={ci[a.id]||""} onChange={function(e){sCi(function(p){var n=Object.assign({},p);n[a.id]=e.target.value;return n})}} onKeyDown={function(e){if(e.key==="Enter"){var q=(ci[a.id]||"").trim();if(!q)return;sCi(function(p){var n=Object.assign({},p);n[a.id]="";return n});sCl(a.id);sCh(function(p){var n=Object.assign({},p);n[a.id]=(p[a.id]||[]).concat([{role:"user",text:q}]);return n});var hist=ch[a.id]||[];fetch(API+"/api/chat",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({alert_id:a.id,question:q,history:hist})}).then(function(r){return r.json()}).then(function(d){sCh(function(p){var n=Object.assign({},p);n[a.id]=(p[a.id]||[]).concat([{role:"ai",text:d.answer||d.error||"No response"}]);return n});sCl(null)}).catch(function(){sCh(function(p){var n=Object.assign({},p);n[a.id]=(p[a.id]||[]).concat([{role:"ai",text:"Failed"}]);return n});sCl(null)})}}} placeholder="Ask about this article..." disabled={cl===a.id} style={{flex:1,background:"#14141F",border:"1px solid #2A2A35",borderRadius:6,padding:"5px 8px",color:"#E8E8ED",fontSize:10,outline:"none",opacity:cl===a.id?0.5:1}}/>
                         <button className="b" onClick={function(){var q=(ci[a.id]||"").trim();if(!q)return;sCi(function(p){var n=Object.assign({},p);n[a.id]="";return n});sCl(a.id);sCh(function(p){var n=Object.assign({},p);n[a.id]=(p[a.id]||[]).concat([{role:"user",text:q}]);return n});var hist=ch[a.id]||[];fetch(API+"/api/chat",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({alert_id:a.id,question:q,history:hist})}).then(function(r){return r.json()}).then(function(d){sCh(function(p){var n=Object.assign({},p);n[a.id]=(p[a.id]||[]).concat([{role:"ai",text:d.answer||d.error||"No response"}]);return n});sCl(null)}).catch(function(){sCh(function(p){var n=Object.assign({},p);n[a.id]=(p[a.id]||[]).concat([{role:"ai",text:"Failed"}]);return n});sCl(null)})}} disabled={cl===a.id} style={{background:"#5448C8",color:"#fff",padding:"5px 10px",borderRadius:6,fontSize:10}}>Ask</button>
                       </div>
                     </div>
                   </div>}
                 </div>}
+                {/* Alert detail tags — respects display toggles */}
                 <div style={{display:"flex",gap:5,alignItems:"center",flexWrap:"wrap"}}>
-                  <span style={{fontSize:10,padding:"2px 8px",borderRadius:3,color:ic,background:ic+"15",border:"1px solid "+ic+"33",fontWeight:600}}>{im==="bullish"?"📈 BULLISH":im==="bearish"?"📉 BEARISH":"➡️ NEUTRAL"}</span>
-                  <span style={{fontSize:9,padding:"1px 6px",borderRadius:3,color:tc2,background:tc2+"10"}}>tone:{tn}</span>
-                  {a.mixed_signals&&<span style={{fontSize:8,padding:"1px 5px",borderRadius:3,background:"#FF950015",color:"#FF9500"}}>⚡mix</span>}
-                  {a.confidence!=null&&<span style={{fontSize:9,color:"#555"}}>{Math.round(a.confidence*100)}%</span>}
+                  {dShow.impact&&<span style={{fontSize:10,padding:"2px 8px",borderRadius:3,color:ic,background:ic+"15",border:"1px solid "+ic+"33",fontWeight:600}}>{im==="bullish"?"📈 BULLISH":im==="bearish"?"📉 BEARISH":"➡️ NEUTRAL"}</span>}
+                  {dShow.tone&&<span style={{fontSize:9,padding:"1px 6px",borderRadius:3,color:tc2,background:tc2+"10"}}>tone:{tn}</span>}
+                  {dShow.mixed&&a.mixed_signals&&<span style={{fontSize:8,padding:"1px 5px",borderRadius:3,background:"#FF950015",color:"#FF9500"}}>⚡mix</span>}
+                  {dShow.confidence&&a.confidence!=null&&<span style={{fontSize:9,color:"#555"}}>{Math.round(a.confidence*100)}%</span>}
                   <span style={{fontSize:10,background:"#1A1A25",padding:"2px 6px",borderRadius:3,color:sr.color}}>{a.source_name||sr.name}</span>
-                  <span style={{fontSize:10,background:"#5448C820",padding:"2px 6px",borderRadius:3,color:"#8B80F0"}}>{a.keyword}</span>
+                  {dShow.keyword&&<span style={{fontSize:10,background:"#5448C820",padding:"2px 6px",borderRadius:3,color:"#8B80F0"}}>{a.keyword}</span>}
                   {a.url&&<a href={a.url} target="_blank" rel="noopener noreferrer" className="sl">↗</a>}
                   {!a.user_corrected&&<button className="b" onClick={function(e){e.stopPropagation();sCorrUrl(a.url);sCorrCtx("")}} style={{fontSize:9,padding:"2px 6px",background:"#14141F",color:"#AAA",border:"1px solid #2A2A35",borderRadius:3,marginLeft:4}}>✎ Correct</button>}
                   {a.user_corrected&&<span style={{fontSize:8,color:a.is_duplicate?"#FF9500":"#34C759"}}>{a.is_duplicate?"🔄 dup":"✓ corrected"}</span>}
-                  <span style={{fontSize:10,color:"#444",marginLeft:"auto"}}>{ago(a.timestamp)}</span>
+                  <span style={{fontSize:10,color:"#444",marginLeft:"auto"}}>{ago(a.published_at_utc||a.timestamp)}</span>
                   {(a.published_at_utc||a.published_at)&&<span style={{fontSize:9,color:"#555"}}>📅 {fmtPubDate(a,userTz)}</span>}
                 </div>
               </div>
@@ -537,19 +645,36 @@ function App(){
               {Object.keys(idxCfg.available||{}).map(function(sym){var isOn=(idxCfg.selected||[]).indexOf(sym)!==-1;return <button key={sym} className="b" onClick={function(){var cur=idxCfg.selected||[];var nxt=isOn?cur.filter(function(x){return x!==sym}):cur.concat([sym]);if(nxt.length===0)return;fetch(API+"/api/market/indices/config",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({selected:nxt})}).then(function(r){return r.json()}).then(function(d){if(d.selected){sIdxCfg(Object.assign({},idxCfg,{selected:d.selected}));var iv2=rng==="1d"?"5m":rng==="5d"?"15m":"1d";F("/api/market/indices?range="+rng+"&interval="+iv2).then(function(d2){if(d2.indices)sIdx(d2.indices)});tt("Indices updated")}}).catch(function(){})}} style={{padding:"4px 8px",borderRadius:4,fontSize:9,background:isOn?"#1A2A1A":"#14141F",color:isOn?"#34C759":"#555",border:"1px solid "+(isOn?"#34C75933":"#2A2A35")}}>{(idxCfg.available||{})[sym]||sym}</button>})}
             </div>
           </div>}
+          {/* Indices grid — draggable */}
           <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(200px,1fr))",gap:10,marginBottom:24}}>
-            {Object.keys(idx).map(function(sym){var q=idx[sym];var up=q.change>=0;return <div key={sym} style={{background:"#0F0F18",borderRadius:8,padding:14,border:"1px solid #1A1A25"}}><div style={{display:"flex",justifyContent:"space-between",marginBottom:6}}><span style={{fontSize:11,fontWeight:600,color:"#E8E8ED"}}>{q.name||sym}</span></div><div style={{fontSize:20,fontWeight:700,color:"#E8E8ED",fontFamily:"'Space Grotesk',sans-serif"}}>{"$"+(q.price||0).toLocaleString()}</div><div style={{fontSize:12,color:up?"#34C759":"#FF3B30",fontWeight:600,marginBottom:8}}>{up?"▲":"▼"} {q.change} ({q.change_pct}%)</div><Sp data={q.chart} width={180} height={40} color={up?"#34C759":"#FF3B30"}/></div>})}
+            {(idxCfg&&idxCfg.selected?idxCfg.selected:[]).map(function(sym,i){var q=idx[sym];if(!q)return null;var up=q.change>=0;return <div key={sym} draggable="true" onDragStart={onDragStart("indices",i)} onDragOver={onDragOver} onDrop={onDrop("indices",i)} style={{background:"#0F0F18",borderRadius:8,padding:14,border:"1px solid #1A1A25",cursor:"grab"}}><div style={{display:"flex",justifyContent:"space-between",marginBottom:6}}><span style={{fontSize:11,fontWeight:600,color:"#E8E8ED"}}>{q.name||sym}</span><span style={{fontSize:8,color:"#444"}}>⠿</span></div><div style={{fontSize:20,fontWeight:700,color:"#E8E8ED",fontFamily:"'Space Grotesk',sans-serif"}}>{"$"+(q.price||0).toLocaleString()}</div><div style={{fontSize:12,color:up?"#34C759":"#FF3B30",fontWeight:600,marginBottom:8}}>{up?"▲":"▼"} {q.change} ({q.change_pct}%)</div><Sp data={q.chart} width={180} height={40} color={up?"#34C759":"#FF3B30"}/></div>}).filter(Boolean)}
           </div>
           <div style={{display:"flex",gap:6,marginBottom:16}}>{[["1d","1D"],["5d","5D"],["1mo","1M"],["3mo","3M"],["6mo","6M"],["1y","1Y"]].map(function(p){return <button key={p[0]} className="b" onClick={function(){sRng(p[0])}} style={{background:rng===p[0]?"#5448C8":"#14141F",color:rng===p[0]?"#fff":"#AAA",padding:"4px 12px",borderRadius:4,fontSize:10}}>{p[1]}</button>})}</div>
-          <div style={{fontSize:10,fontWeight:600,color:"#666",letterSpacing:2,marginBottom:12,textTransform:"uppercase"}}>Watchlist</div>
-          <div style={{display:"flex",gap:6,marginBottom:8,flexWrap:"wrap",alignItems:"center"}}>
-            <div style={{display:"flex",borderRadius:6,overflow:"hidden",border:"1px solid #2A2A35"}}><button className="b" onClick={function(){sAt("stock")}} style={{padding:"6px 12px",fontSize:11,background:at==="stock"?"#5448C8":"#14141F",color:at==="stock"?"#fff":"#AAA",borderRadius:0}}>Stock</button><button className="b" onClick={function(){sAt("crypto")}} style={{padding:"6px 12px",fontSize:11,background:at==="crypto"?"#F7931A":"#14141F",color:at==="crypto"?"#fff":"#AAA",borderRadius:0}}>Crypto</button></div>
-            <input value={ns} onChange={function(e){sNs(e.target.value.toUpperCase());sAde("")}} onKeyDown={function(e){if(e.key==="Enter"){var sym=ns.trim().toUpperCase();if(!sym)return;sAdg(true);sAde("");fetch(API+"/api/market/watchlist",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({add:sym,type:at})}).then(function(r){return r.json()}).then(function(d){if(d.error){sAde(d.error);sAdg(false);return}if(d.watchlist)sWl(d.watchlist);sNs("");sAdg(false);tt("Added "+sym)}).catch(function(){sAdg(false)})}}} placeholder={at==="crypto"?"BTC,ETH...":"AAPL,TSLA..."} style={{flex:1,maxWidth:200,background:"#14141F",border:"1px solid #2A2A35",borderRadius:6,padding:"6px 10px",color:"#E8E8ED",fontSize:12,outline:"none"}}/>
-            <button className="b" onClick={function(){var sym=ns.trim().toUpperCase();if(!sym)return;sAdg(true);sAde("");fetch(API+"/api/market/watchlist",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({add:sym,type:at})}).then(function(r){return r.json()}).then(function(d){if(d.error){sAde(d.error);sAdg(false);return}if(d.watchlist)sWl(d.watchlist);sNs("");sAdg(false);tt("Added "+sym)}).catch(function(){sAdg(false)})}} disabled={adg} style={{background:"#5448C8",color:"#fff",padding:"6px 14px",borderRadius:6,fontSize:12,opacity:adg?0.5:1}}>+</button>
+          {/* Watchlist header + type filter */}
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
+            <div style={{fontSize:10,fontWeight:600,color:"#666",letterSpacing:2,textTransform:"uppercase"}}>Watchlist</div>
+            <div style={{display:"flex",gap:3}}>
+              {[{v:"all",l:"All"},{v:"stock",l:"Stocks"},{v:"crypto",l:"Crypto"}].map(function(f){return <button key={f.v} className="b" onClick={function(){sWlFilter(f.v)}} style={{fontSize:9,padding:"3px 8px",borderRadius:4,background:wlFilter===f.v?"#5448C8":"#14141F",color:wlFilter===f.v?"#fff":"#555",border:"1px solid "+(wlFilter===f.v?"#5448C833":"#2A2A35")}}>{f.l}</button>})}
+            </div>
+          </div>
+          {/* Unified search — no stock/crypto toggle */}
+          <div style={{position:"relative",marginBottom:10}}>
+            <div style={{display:"flex",gap:6}}>
+              <input value={ns} onChange={function(e){var v=e.target.value.toUpperCase();sNs(v);sAde("");doSearch(v)}} onKeyDown={function(e){if(e.key==="Enter"){var sym=ns.trim().toUpperCase();if(!sym)return;sAdg(true);sAde("");fetch(API+"/api/market/watchlist",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({add:sym,type:"auto"})}).then(function(r){return r.json()}).then(function(d){if(d.error){sAde(d.error);sAdg(false);return}if(d.watchlist)sWl(d.watchlist);sNs("");sAdg(false);sSearchResults([]);tt("Added "+sym)}).catch(function(){sAdg(false)})}}} placeholder="Search ticker or coin..." style={{flex:1,maxWidth:260,background:"#14141F",border:"1px solid #2A2A35",borderRadius:6,padding:"6px 10px",color:"#E8E8ED",fontSize:12,outline:"none"}}/>
+              <button className="b" onClick={function(){var sym=ns.trim().toUpperCase();if(!sym)return;sAdg(true);sAde("");fetch(API+"/api/market/watchlist",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({add:sym,type:"auto"})}).then(function(r){return r.json()}).then(function(d){if(d.error){sAde(d.error);sAdg(false);return}if(d.watchlist)sWl(d.watchlist);sNs("");sAdg(false);sSearchResults([]);tt("Added "+sym)}).catch(function(){sAdg(false)})}} disabled={adg} style={{background:"#5448C8",color:"#fff",padding:"6px 14px",borderRadius:6,fontSize:12,opacity:adg?0.5:1}}>+</button>
+            </div>
+            {/* Search suggestions dropdown */}
+            {searchResults.length>0&&ns.length>0&&<div style={{position:"absolute",top:"100%",left:0,marginTop:2,background:"#14141F",border:"1px solid #2A2A35",borderRadius:6,width:260,maxHeight:200,overflowY:"auto",zIndex:40,boxShadow:"0 4px 12px rgba(0,0,0,0.4)"}}>
+              {searchResults.slice(0,8).map(function(r,i){return <div key={i} className="st" onClick={function(){sAdg(true);sAde("");fetch(API+"/api/market/watchlist",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({add:r.symbol,type:r.type||"stock"})}).then(function(rr){return rr.json()}).then(function(d){if(d.error){sAde(d.error);sAdg(false);return}if(d.watchlist)sWl(d.watchlist);sNs("");sAdg(false);sSearchResults([]);tt("Added "+r.symbol)}).catch(function(){sAdg(false)})}} style={{padding:"6px 10px",display:"flex",justifyContent:"space-between",alignItems:"center",cursor:"pointer",borderBottom:"1px solid #1A1A25"}}>
+                <div><span style={{fontSize:11,fontWeight:600,color:"#E8E8ED"}}>{r.symbol}</span><span style={{fontSize:9,color:"#555",marginLeft:6}}>{r.name}</span></div>
+                <span style={{fontSize:8,padding:"1px 5px",borderRadius:3,background:r.type==="crypto"?"#F7931A20":"#5448C820",color:r.type==="crypto"?"#F7931A":"#5448C8"}}>{r.type==="crypto"?"₿ Crypto":"Stock"}</span>
+              </div>})}
+            </div>}
           </div>
           {ade&&<div style={{fontSize:10,color:"#FF3B30",marginBottom:10}}>{ade}</div>}
+          {/* Watchlist grid — draggable, filtered by type */}
           <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(280px,1fr))",gap:10,marginBottom:24}}>
-            {wl.map(function(item){var sym=item.symbol,q=wq[sym];if(!q)return <div key={sym} style={{background:"#0F0F18",borderRadius:8,padding:14,border:"1px solid #1A1A25",display:"flex",justifyContent:"space-between",alignItems:"center"}}><span style={{color:"#555",fontSize:11}}>{sym} — loading...</span><span className="kt" onClick={function(){fetch(API+"/api/market/watchlist",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({remove:sym})}).then(function(r){return r.json()}).then(function(d){if(d.watchlist)sWl(d.watchlist)}).catch(function(){});sWq(function(p){var n=Object.assign({},p);delete n[sym];return n})}} style={{fontSize:10,color:"#FF3B30",padding:"2px 6px",cursor:"pointer"}}>✕</span></div>;var up=q.change>=0;return <div key={sym} className="st" onClick={function(){sDetailSym(sym);sSn([]);sZoomStart(0);sZoomEnd(-1);sHoverIdx(-1);var atype=item.type||"stock";var iv2=rng==="1d"?"5m":rng==="5d"?"15m":"1d";F("/api/market/quote/"+sym+"?type="+atype+"&range="+rng+"&interval="+iv2).then(function(d){if(d.quote)sWq(function(p){var n=Object.assign({},p);n[sym]=d.quote;return n})}).catch(function(){});F("/api/market/news?symbol="+sym).then(function(d){if(d.articles)sSn(d.articles)}).catch(function(){})}} style={{background:"#0F0F18",borderRadius:8,padding:14,border:"1px solid #1A1A25",cursor:"pointer"}}><div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}><div><span style={{fontSize:14,fontWeight:700,color:"#E8E8ED"}}>{q.type==="crypto"?"₿ ":""}{sym}</span><span style={{fontSize:10,color:"#555",marginLeft:6}}>{q.name}</span></div><span className="kt" onClick={function(e){e.stopPropagation();fetch(API+"/api/market/watchlist",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({remove:sym})}).then(function(r){return r.json()}).then(function(d){if(d.watchlist)sWl(d.watchlist)}).catch(function(){});sWq(function(p){var n=Object.assign({},p);delete n[sym];return n})}} style={{fontSize:10,color:"#555"}}>✕</span></div><div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",marginBottom:8}}><span style={{fontSize:20,fontWeight:700,color:"#E8E8ED",fontFamily:"'Space Grotesk',sans-serif"}}>{"$"+(q.price||0).toLocaleString()}</span><span style={{fontSize:12,color:up?"#34C759":"#FF3B30",fontWeight:600}}>{up?"▲":"▼"} {q.change} ({q.change_pct}%)</span></div><Sp data={q.chart} width={250} height={50} color={up?"#34C759":"#FF3B30"}/></div>})}
+            {wl.map(function(item,i){if(wlFilter!=="all"&&(item.type||"stock")!==wlFilter)return null;var sym=item.symbol,q=wq[sym];if(!q)return <div key={sym} draggable="true" onDragStart={onDragStart("watchlist",i)} onDragOver={onDragOver} onDrop={onDrop("watchlist",i)} style={{background:"#0F0F18",borderRadius:8,padding:14,border:"1px solid #1A1A25",display:"flex",justifyContent:"space-between",alignItems:"center"}}><span style={{color:"#555",fontSize:11}}>{sym} — loading...</span><span className="kt" onClick={function(){fetch(API+"/api/market/watchlist",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({remove:sym})}).then(function(r){return r.json()}).then(function(d){if(d.watchlist)sWl(d.watchlist)}).catch(function(){});sWq(function(p){var n=Object.assign({},p);delete n[sym];return n})}} style={{fontSize:10,color:"#FF3B30",padding:"2px 6px",cursor:"pointer"}}>✕</span></div>;var up=q.change>=0;return <div key={sym} draggable="true" onDragStart={onDragStart("watchlist",i)} onDragOver={onDragOver} onDrop={onDrop("watchlist",i)} className="st" onClick={function(){sDetailSym(sym);sSn([]);sZoomStart(0);sZoomEnd(-1);sHoverIdx(-1);var atype=item.type||"stock";var iv2=rng==="1d"?"5m":rng==="5d"?"15m":"1d";F("/api/market/quote/"+sym+"?type="+atype+"&range="+rng+"&interval="+iv2).then(function(d){if(d.quote)sWq(function(p){var n=Object.assign({},p);n[sym]=d.quote;return n})}).catch(function(){});F("/api/market/news?symbol="+sym).then(function(d){if(d.articles)sSn(d.articles)}).catch(function(){})}} style={{background:"#0F0F18",borderRadius:8,padding:14,border:"1px solid #1A1A25",cursor:"pointer"}}><div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}><div><span style={{fontSize:14,fontWeight:700,color:"#E8E8ED"}}>{q.type==="crypto"?"₿ ":""}{sym}</span><span style={{fontSize:10,color:"#555",marginLeft:6}}>{q.name}</span><span style={{fontSize:7,padding:"1px 4px",borderRadius:2,marginLeft:4,background:(item.type||"stock")==="crypto"?"#F7931A20":"#5448C815",color:(item.type||"stock")==="crypto"?"#F7931A":"#8B80F0"}}>{(item.type||"stock")==="crypto"?"Crypto":"Stock"}</span></div><div style={{display:"flex",gap:6,alignItems:"center"}}><span style={{fontSize:8,color:"#444"}}>⠿</span><span className="kt" onClick={function(e){e.stopPropagation();fetch(API+"/api/market/watchlist",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({remove:sym})}).then(function(r){return r.json()}).then(function(d){if(d.watchlist)sWl(d.watchlist)}).catch(function(){});sWq(function(p){var n=Object.assign({},p);delete n[sym];return n})}} style={{fontSize:10,color:"#555"}}>✕</span></div></div><div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",marginBottom:8}}><span style={{fontSize:20,fontWeight:700,color:"#E8E8ED",fontFamily:"'Space Grotesk',sans-serif"}}>{"$"+(q.price||0).toLocaleString()}</span><span style={{fontSize:12,color:up?"#34C759":"#FF3B30",fontWeight:600}}>{up?"▲":"▼"} {q.change} ({q.change_pct}%)</span></div><Sp data={q.chart} width={250} height={50} color={up?"#34C759":"#FF3B30"}/></div>}).filter(Boolean)}
           </div>
           {/* Sector Heatmap */}
           {sectors.length>0&&<div style={{marginBottom:24}}>
@@ -569,13 +694,26 @@ function App(){
             </div>
           </div>}
 
-          {/* Market News with Category Filter */}
+          {/* Market News with Category Filter + Source toggles with "All" */}
           <div style={{fontSize:10,fontWeight:600,color:"#666",letterSpacing:2,marginBottom:8,textTransform:"uppercase"}}>Market News</div>
           <div style={{display:"flex",gap:3,flexWrap:"wrap",marginBottom:8}}>
-            {NEWS_CATS.map(function(cat){return <button key={cat.id} className="b" onClick={function(){sNewsFilter(cat.id)}} style={{fontSize:8,padding:"3px 8px",borderRadius:4,background:newsFilter===cat.id?"#5448C8":"#14141F",color:newsFilter===cat.id?"#fff":"#555",border:"1px solid "+(newsFilter===cat.id?"#5448C833":"#2A2A35")}}>{cat.label}</button>})}
+            <button className="b" onClick={function(){sNewsFilter([])}} style={{fontSize:8,padding:"3px 8px",borderRadius:4,background:newsFilter.length===0?"#5448C8":"#14141F",color:newsFilter.length===0?"#fff":"#555",border:"1px solid "+(newsFilter.length===0?"#5448C833":"#2A2A35")}}>All</button>
+            {NEWS_CATS.slice(1).map(function(cat){var on=newsFilter.indexOf(cat.id)!==-1;return <button key={cat.id} className="b" onClick={function(){if(on){var nxt=newsFilter.filter(function(x){return x!==cat.id});sNewsFilter(nxt)}else{sNewsFilter(newsFilter.concat([cat.id]))}}} style={{fontSize:8,padding:"3px 8px",borderRadius:4,background:on?(NC_COLORS[cat.id]||"#5448C8")+"30":"#14141F",color:on?(NC_COLORS[cat.id]||"#5448C8"):"#555",border:"1px solid "+(on?(NC_COLORS[cat.id]||"#5448C8")+"55":"#2A2A35")}}>{cat.label}</button>})}
           </div>
-          <div style={{display:"flex",gap:4,flexWrap:"wrap",marginBottom:8}}>{Object.keys(mns).map(function(id){var s2=mns[id];return <button key={id} className="b" onClick={function(){fetch(API+"/api/market/news-sources",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({toggle:id})}).then(function(r){return r.json()}).then(function(d){if(d.sources)sMns(d.sources)}).catch(function(){})}} style={{fontSize:7,padding:"2px 5px",borderRadius:3,background:s2.enabled?"#1A2A1A":"#14141F",color:s2.enabled?"#34C759":"#555"}}>{s2.name}</button>})}</div>
-          {filteredNews.length>0?filteredNews.slice(0,20).map(function(n,i){return <a key={i} href={n.url} target="_blank" rel="noopener noreferrer" style={{display:"flex",justifyContent:"space-between",gap:10,padding:"8px 10px",background:"#0F0F18",borderRadius:6,border:"1px solid #1A1A25",textDecoration:"none",marginBottom:6}}><div style={{flex:1,fontSize:12,color:"#E8E8ED",lineHeight:1.3}}>{n.title}</div><div style={{textAlign:"right",flexShrink:0}}><div style={{fontSize:9,color:"#5448C8"}}>{n.source}</div><div style={{fontSize:8,color:"#555"}}>{n.published_at}</div></div></a>}):<div style={{color:"#555",fontSize:11,padding:20,textAlign:"center"}}>No {newsFilter} news found</div>}
+          <div style={{display:"flex",gap:4,flexWrap:"wrap",marginBottom:8}}>
+            {Object.keys(mns).map(function(id){var s2=mns[id];return <button key={id} className="b" onClick={function(){fetch(API+"/api/market/news-sources",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({toggle:id})}).then(function(r){return r.json()}).then(function(d){if(d.sources)sMns(d.sources)}).catch(function(){})}} style={{fontSize:7,padding:"2px 5px",borderRadius:3,background:s2.enabled?"#1A2A1A":"#14141F",color:s2.enabled?"#34C759":"#555"}}>{s2.name}</button>})}
+          </div>
+          {/* News articles with category tags */}
+          {filteredNews.length>0?filteredNews.slice(0,20).map(function(n,i){var cat=tagNews(n.title);return <a key={i} href={n.url} target="_blank" rel="noopener noreferrer" style={{display:"flex",justifyContent:"space-between",gap:10,padding:"8px 10px",background:"#0F0F18",borderRadius:6,border:"1px solid #1A1A25",textDecoration:"none",marginBottom:6}}>
+            <div style={{flex:1}}>
+              <div style={{fontSize:12,color:"#E8E8ED",lineHeight:1.3,marginBottom:3}}>{n.title}</div>
+              {cat&&<span style={{fontSize:7,padding:"1px 5px",borderRadius:3,background:(NC_COLORS[cat.id]||"#555")+"20",color:NC_COLORS[cat.id]||"#555"}}>{cat.label}</span>}
+            </div>
+            <div style={{textAlign:"right",flexShrink:0}}>
+              <div style={{fontSize:9,color:"#5448C8"}}>{n.source}</div>
+              <div style={{fontSize:8,color:"#555"}}>{n.published_at}</div>
+            </div>
+          </a>}):<div style={{color:"#555",fontSize:11,padding:20,textAlign:"center"}}>No matching news found</div>}
         </div>}
 
         {/* ═══ ECONOMY ═══ */}

@@ -1193,31 +1193,6 @@ def record_duplicate_skip(source_id):
                 _source_stats[source_id].get("total_duplicates_skipped", 0) + 1
 
 
-@app.route("/api/data/source-stats")
-def get_source_stats():
-    """Get per-source polling statistics for analysis."""
-    with _source_stats_lock:
-        # Add computed fields
-        enriched = {}
-        for sid, s in _source_stats.items():
-            entry = dict(s)
-            if entry["total_polls"] > 0:
-                entry["alerts_per_poll"] = round(entry["total_alerts"] / entry["total_polls"], 2)
-                entry["error_rate"] = round(entry["total_errors"] / entry["total_polls"] * 100, 1)
-            else:
-                entry["alerts_per_poll"] = 0
-                entry["error_rate"] = 0
-            # Recent activity: alerts in last 6 hours
-            now = datetime.now(timezone.utc)
-            recent = 0
-            for h in range(6):
-                hk = (now - timedelta(hours=h)).strftime("%Y-%m-%d %H")
-                recent += s.get("alerts_by_hour", {}).get(hk, 0)
-            entry["alerts_last_6h"] = recent
-            enriched[sid] = entry
-        return jsonify({"source_stats": enriched})
-
-
 _load_source_stats()
 
 
@@ -4360,6 +4335,31 @@ def apply_recalibration():
                          json.dumps(applied))
 
     return jsonify({"status": "applied", "adjustments": applied, "sets": sets})
+
+
+# ─── Source Polling Stats Endpoint ────────────────────────────────────────────
+
+@app.route("/api/data/source-stats")
+def get_source_stats():
+    """Get per-source polling statistics for analysis."""
+    with _source_stats_lock:
+        enriched = {}
+        for sid, s in _source_stats.items():
+            entry = dict(s)
+            if entry["total_polls"] > 0:
+                entry["alerts_per_poll"] = round(entry["total_alerts"] / entry["total_polls"], 2)
+                entry["error_rate"] = round(entry["total_errors"] / entry["total_polls"] * 100, 1)
+            else:
+                entry["alerts_per_poll"] = 0
+                entry["error_rate"] = 0
+            now = datetime.now(timezone.utc)
+            recent = 0
+            for h in range(6):
+                hk = (now - timedelta(hours=h)).strftime("%Y-%m-%d %H")
+                recent += s.get("alerts_by_hour", {}).get(hk, 0)
+            entry["alerts_last_6h"] = recent
+            enriched[sid] = entry
+        return jsonify({"source_stats": enriched})
 
 
 # ─── External Data APIs ───────────────────────────────────────────────────────

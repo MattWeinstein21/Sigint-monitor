@@ -2783,15 +2783,15 @@ def monitor_loop():
             interval = config.get("poll_interval_seconds", 120)
             _max_article_age_hours = config.get("max_article_age_hours", 4)
 
-            # Ollama config — analysis lane for background enrichment
+            # Ollama config — both lanes
             analysis_url, analysis_model = get_ollama_lane(config, "analysis")
+            chat_url, chat_model = get_ollama_lane(config, "chat")
             store.ollama_url = analysis_url
             store.ollama_model = analysis_model
             # Chat lane config for worker 2 (uses chat model for analysis when idle)
             store.ollama_chat_url = chat_url
             store.ollama_chat_model = chat_model
             # Log both lanes for observability
-            chat_url, chat_model = get_ollama_lane(config, "chat")
             ollama_status = f"Analysis: {analysis_model}@{analysis_url}" if analysis_url else "Analysis: off"
             if chat_url != analysis_url or chat_model != analysis_model:
                 ollama_status += f" | Chat: {chat_model}@{chat_url}"

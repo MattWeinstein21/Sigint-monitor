@@ -1955,6 +1955,11 @@ def ollama_analyze(text, ollama_url, model="llama3", keyword=""):
     if macro:
         trend_ctx += f"MACRO CONTEXT: {macro}\n\n"
 
+    # Add Wikipedia background context for entities (supplementary, not primary)
+    wiki_ctx = build_wiki_context(text, keyword=keyword)
+    if wiki_ctx:
+        trend_ctx += wiki_ctx
+
     for attempt in range(3):
         try:
             prompt = OLLAMA_PROMPT.format(
@@ -3248,6 +3253,11 @@ def general_chat():
 
     context_str = "\n".join(context_parts) if context_parts else "No article data available yet."
 
+    # Add Wikipedia context for key terms in the question (supplementary)
+    wiki_ctx = build_wiki_context(question, keyword="")
+    if wiki_ctx:
+        context_str += "\n" + wiki_ctx
+
     # Conversation history — reduced from 10 to 5
     conv_text = ""
     for msg in history[-5:]:
@@ -4464,6 +4474,209 @@ def fear_greed_index():
         return jsonify({"error": "Fear & Greed API unavailable"}), 500
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+# ─── CoinGecko Trending & Global Metrics (no key needed) ─────────────────────
+
+@app.route("/api/crypto/trending")
+def crypto_trending():
+    """Get trending coins from CoinGecko — most searched in last 24h."""
+    try:
+        resp = requests.get(f"{COINGECKO_URL}/search/trending", timeout=10)
+        if resp.status_code != 200:
+            return jsonify({"error": "CoinGecko trending unavailable"}), 500
+        data = resp.json()
+        coins = []
+        for item in data.get("coins", [])[:10]:
+            c = item.get("item", {})
+            coins.append({
+                "id": c.get("id", ""),
+                "symbol": c.get("symbol", "").upper(),
+                "name": c.get("name", ""),
+                "market_cap_rank": c.get("market_cap_rank"),
+                "price_btc": c.get("price_btc", 0),
+                "score": c.get("score", 0),
+                "thumb": c.get("thumb", ""),
+            })
+        return jsonify({"trending": coins})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/crypto/global")
+def crypto_global():
+    """Get global crypto market metrics from CoinGecko."""
+    try:
+        resp = requests.get(f"{COINGECKO_URL}/global", timeout=10)
+        if resp.status_code != 200:
+            return jsonify({"error": "CoinGecko global unavailable"}), 500
+        data = resp.json().get("data", {})
+        return jsonify({
+            "total_market_cap": data.get("total_market_cap", {}).get("usd", 0),
+            "total_volume": data.get("total_volume", {}).get("usd", 0),
+            "btc_dominance": round(data.get("market_cap_percentage", {}).get("btc", 0), 1),
+            "eth_dominance": round(data.get("market_cap_percentage", {}).get("eth", 0), 1),
+            "active_cryptos": data.get("active_cryptocurrencies", 0),
+            "markets": data.get("markets", 0),
+            "market_cap_change_24h": round(data.get("market_cap_change_percentage_24h_usd", 0), 2),
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ─── SEC EDGAR Filing Search & Recent Filings ────────────────────────────────
+
+SEC_EFTS_URL = "https://efts.sec.gov/LATEST/search-index"
+SEC_FULLTEXT_URL = "https://efts.sec.gov/LATEST/search-index"
+SEC_EDGAR_HEADERS = {"User-Agent": "SIGINT Monitor sigint@local", "Accept": "application/json"}
+
+
+@app.route("/api/sec/search")
+def sec_search():
+    """Search SEC EDGAR for filings by company name, ticker, or keyword."""
+    q = request.args.get("q", "").strip()
+    forms = request.args.get("forms", "8-K,10-K,10-Q,S-1,4")
+    limit = request.args.get("limit", 15, type=int)
+    if not q:
+        return jsonify({"filings": []})
+    try:
+        resp = requests.get("https://efts.sec.gov/LATEST/search-index", params={
+            "q": q, "forms": forms, "dateRange": "custom",
+            "startdt": (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%d"),
+            "enddt": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        }, headers=SEC_EDGAR_HEADERS, timeout=10)
+        if resp.status_code != 200:
+            return jsonify({"filings": [], "error": f"EDGAR returned {resp.status_code}"})
+        data = resp.json()
+        filings = []
+        for hit in data.get("hits", {}).get("hits", [])[:limit]:
+            src = hit.get("_source", {})
+            # Build a direct filing URL
+            file_num = src.get("file_num", "")
+            accession = hit.get("_id", "").replace("-", "")
+            filing_url = f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={file_num}&type={src.get('form_type','')}&dateb=&owner=include&count=10"
+            # Try to build a direct document link
+            if accession:
+                acc_formatted = accession[:10] + "-" + accession[10:12] + "-" + accession[12:]
+                filing_url = f"https://www.sec.gov/Archives/edgar/data/{src.get('file_num', '').replace('-', '')}/{accession}/0000000000-00-000000-index.htm"
+                # Simpler: use EDGAR viewer
+                filing_url = f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&company={requests.utils.quote(src.get('entity_name', ''))}&CIK=&type={src.get('form_type','')}&dateb=&owner=include&count=5&search_text=&action=getcompany"
+
+            filings.append({
+                "form_type": src.get("form_type", ""),
+                "entity": src.get("entity_name", ""),
+                "filed_date": src.get("file_date", ""),
+                "description": src.get("display_names", [""])[0] if src.get("display_names") else "",
+                "url": filing_url,
+            })
+        return jsonify({"filings": filings, "query": q})
+    except Exception as e:
+        return jsonify({"filings": [], "error": str(e)})
+
+
+@app.route("/api/sec/recent")
+def sec_recent():
+    """Get recent SEC filings for watchlist tickers."""
+    wl = load_watchlist()
+    tickers = [item["symbol"] for item in wl if item.get("type", "stock") == "stock"]
+    if not tickers:
+        return jsonify({"filings": []})
+    all_filings = []
+    for ticker in tickers[:8]:
+        try:
+            resp = requests.get("https://efts.sec.gov/LATEST/search-index", params={
+                "q": f'"{ticker}"', "forms": "8-K,10-K,10-Q",
+                "dateRange": "custom",
+                "startdt": (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%d"),
+                "enddt": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+            }, headers=SEC_EDGAR_HEADERS, timeout=8)
+            if resp.status_code != 200:
+                continue
+            for hit in resp.json().get("hits", {}).get("hits", [])[:3]:
+                src = hit.get("_source", {})
+                entity = src.get("entity_name", "")
+                form_type = src.get("form_type", "")
+                filed = src.get("file_date", "")
+                search_url = f"https://www.sec.gov/cgi-bin/browse-edgar?company={requests.utils.quote(entity)}&CIK=&type={form_type}&dateb=&owner=include&count=5&search_text=&action=getcompany"
+                all_filings.append({
+                    "ticker": ticker,
+                    "form_type": form_type,
+                    "entity": entity,
+                    "filed_date": filed,
+                    "url": search_url,
+                })
+        except Exception:
+            pass
+    # Sort by date descending
+    all_filings.sort(key=lambda x: x.get("filed_date", ""), reverse=True)
+    return jsonify({"filings": all_filings[:20]})
+
+
+# ─── Wikipedia Context API ───────────────────────────────────────────────────
+# Used as supplementary context for AI analysis — NOT a primary data source.
+# Provides entity descriptions, historical context, and background for better inferences.
+
+WIKI_API = "https://en.wikipedia.org/api/rest_v1"
+_wiki_cache = {}  # Simple in-memory cache: {term: {data, ts}}
+WIKI_CACHE_TTL = 3600  # 1 hour
+
+
+def wiki_summary(term):
+    """Fetch a short Wikipedia summary for entity context. Returns string or empty."""
+    if not term or len(term) < 2:
+        return ""
+    term_key = term.lower().strip()
+    # Check cache
+    cached = _wiki_cache.get(term_key)
+    if cached and (time.time() - cached["ts"]) < WIKI_CACHE_TTL:
+        return cached["data"]
+    try:
+        resp = requests.get(
+            f"{WIKI_API}/page/summary/{requests.utils.quote(term)}",
+            headers={"User-Agent": "SIGINT Monitor/1.0"},
+            timeout=5,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            extract = data.get("extract", "")[:300]
+            _wiki_cache[term_key] = {"data": extract, "ts": time.time()}
+            return extract
+    except Exception:
+        pass
+    _wiki_cache[term_key] = {"data": "", "ts": time.time()}
+    return ""
+
+
+def build_wiki_context(text, keyword=""):
+    """Extract key entities from text and fetch Wikipedia context for AI enrichment.
+    Returns a short context block or empty string. Lightweight — max 2 lookups."""
+    entities = extract_entities(text)
+    # Prioritize: keyword, then first extracted entity
+    terms = []
+    if keyword and len(keyword) > 3:
+        terms.append(keyword)
+    for ent in entities[:3]:
+        if ent not in terms and len(ent) > 3:
+            terms.append(ent)
+    if not terms:
+        return ""
+    parts = []
+    for term in terms[:2]:  # Max 2 Wikipedia lookups per article
+        summary = wiki_summary(term)
+        if summary:
+            parts.append(f"- {term}: {summary}")
+    if parts:
+        return "BACKGROUND CONTEXT (Wikipedia):\n" + "\n".join(parts) + "\n\n"
+    return ""
+
+
+@app.route("/api/wiki/summary/<term>")
+def wiki_summary_endpoint(term):
+    """Get Wikipedia summary for a term — useful for entity context."""
+    summary = wiki_summary(term)
+    if summary:
+        return jsonify({"term": term, "summary": summary})
+    return jsonify({"term": term, "summary": "", "error": "Not found"}), 404
 
 
 _monitor_started = False

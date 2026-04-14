@@ -884,6 +884,7 @@ DEFAULT_CONFIG = {
     "truthsocial_enabled": True,
     "rss_enabled": True,
     "whitehouse_enabled": True,
+    "sec_edgar_enabled": True,
 }
 
 
@@ -2503,6 +2504,100 @@ def poll_whitehouse(keywords):
         log.warning(f"White House scrape error: {e}")
 
 
+# ─── SEC EDGAR Filing Monitor ────────────────────────────────────────────────
+# Uses EDGAR's full-text search ATOM feed — no library needed, fits existing feedparser model.
+# Monitors watchlist tickers for new 8-K, 10-K, 10-Q filings.
+
+SEC_EDGAR_SEARCH = "https://efts.sec.gov/LATEST/search-index"
+SEC_FILING_TYPES = {"8-K", "10-K", "10-Q", "8-K/A", "10-K/A", "10-Q/A", "S-1", "4"}
+_sec_seen_urls = set()
+
+
+def poll_sec_edgar(keywords):
+    """Poll SEC EDGAR for new filings from watchlist tickers and keyword-matched companies."""
+    global _sec_seen_urls
+    wl = load_watchlist()
+    # Only check stock tickers (not crypto)
+    tickers = [item["symbol"] for item in wl if item.get("type", "stock") == "stock"]
+    if not tickers:
+        return
+
+    for ticker in tickers[:10]:  # Cap to avoid rate limiting
+        try:
+            resp = requests.get(
+                "https://efts.sec.gov/LATEST/search-index",
+                params={
+                    "q": f'"{ticker}"',
+                    "dateRange": "custom",
+                    "startdt": (datetime.now(timezone.utc) - timedelta(hours=24)).strftime("%Y-%m-%d"),
+                    "enddt": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+                    "forms": "8-K,10-K,10-Q",
+                },
+                headers={"User-Agent": "SIGINT Monitor matthew@sigint.local", "Accept": "application/json"},
+                timeout=10,
+            )
+            if resp.status_code != 200:
+                continue
+
+            data = resp.json()
+            hits = data.get("hits", {}).get("hits", [])
+
+            for hit in hits[:5]:
+                source = hit.get("_source", {})
+                filing_url = f"https://www.sec.gov/Archives/edgar/data/{source.get('file_num', '')}"
+                form_type = source.get("form_type", "")
+                entity = source.get("entity_name", "")
+                filed_date = source.get("file_date", "")
+                title = f"SEC {form_type}: {entity} ({ticker})"
+
+                # Dedup
+                dedup_key = f"{ticker}:{form_type}:{filed_date}"
+                if dedup_key in _sec_seen_urls:
+                    continue
+                _sec_seen_urls.add(dedup_key)
+
+                # Parse date
+                pub_dt = None
+                if filed_date:
+                    try:
+                        pub_dt = datetime.strptime(filed_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                    except Exception:
+                        pass
+
+                # Determine severity based on filing type
+                severity = "high" if form_type in ("8-K", "8-K/A") else "medium"
+
+                # Match against keywords
+                combined = f"{entity} {ticker} {form_type}".lower()
+                matched_kw = ""
+                for kw in keywords:
+                    if kw.lower() in combined:
+                        matched_kw = kw
+                        break
+                if not matched_kw:
+                    matched_kw = ticker.lower()
+
+                snippet = f"{form_type} filed by {entity} on {filed_date}"
+
+                store.add(
+                    source_id="sec_edgar",
+                    source_name="SEC EDGAR",
+                    title=title,
+                    url=filing_url,
+                    snippet=snippet,
+                    keyword=matched_kw,
+                    severity=severity,
+                    published_at=pub_dt,
+                )
+
+        except Exception as e:
+            log.debug(f"SEC EDGAR poll error [{ticker}]: {e}")
+
+    # Trim seen set to prevent memory growth
+    if len(_sec_seen_urls) > 500:
+        _sec_seen_urls = set(list(_sec_seen_urls)[-200:])
+
+
 def poll_truthsocial(keywords, accounts):
     """
     Poll Truth Social for each monitored account via RSSHub proxy.
@@ -2687,6 +2782,9 @@ def monitor_loop():
 
             if config.get("whitehouse_enabled", True):
                 poll_whitehouse(keywords)
+
+            if config.get("sec_edgar_enabled", True):
+                poll_sec_edgar(keywords)
 
             if config.get("truthsocial_enabled", True) and ts_accounts:
                 poll_truthsocial(keywords, ts_accounts)
@@ -3206,7 +3304,17 @@ def general_chat():
 # ─── Market Data API ──────────────────────────────────────────────────────────
 
 YAHOO_QUOTE_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+YAHOO_SEARCH_URL = "https://query2.finance.yahoo.com/v1/finance/search"
 COINGECKO_URL = "https://api.coingecko.com/api/v3"
+
+# yfinance — optional but recommended: pip install yfinance
+try:
+    import yfinance as yf
+    _HAS_YFINANCE = True
+    log.info("yfinance available — using for market data")
+except ImportError:
+    _HAS_YFINANCE = False
+    log.info("yfinance not installed — using raw Yahoo API (pip install yfinance for better reliability)")
 
 # Stored watchlist — items are {"symbol": "NVDA", "type": "stock"} or {"symbol": "bitcoin", "type": "crypto"}
 WATCHLIST_PATH = Path("watchlist.json")
@@ -3305,7 +3413,77 @@ def save_market_news_sources(sources):
 
 
 def fetch_yahoo_quote(symbol, range_str="1d", interval="5m"):
-    """Fetch quote and chart data from Yahoo Finance."""
+    """Fetch quote + chart. Uses yfinance if installed, raw API as fallback."""
+    if _HAS_YFINANCE:
+        result = _fetch_yahoo_yfinance(symbol, range_str, interval)
+        if result:
+            return result
+    return _fetch_yahoo_raw(symbol, range_str, interval)
+
+
+def _fetch_yahoo_yfinance(symbol, range_str="1d", interval="5m"):
+    """Fetch via yfinance library — more reliable, adds fundamentals."""
+    try:
+        ticker = yf.Ticker(symbol)
+        hist = ticker.history(period=range_str, interval=interval)
+        if hist.empty:
+            return None
+
+        chart_data = []
+        for ts, row in hist.iterrows():
+            chart_data.append({
+                "time": ts.isoformat(),
+                "open": round(float(row.get("Open", row.get("Close", 0))), 2),
+                "high": round(float(row.get("High", row.get("Close", 0))), 2),
+                "low": round(float(row.get("Low", row.get("Close", 0))), 2),
+                "close": round(float(row["Close"]), 2),
+                "volume": int(row.get("Volume", 0)),
+            })
+        if not chart_data:
+            return None
+
+        fi = ticker.fast_info if hasattr(ticker, "fast_info") else {}
+        current = chart_data[-1]["close"]
+        prev_close = round(float(getattr(fi, "previous_close", 0) or chart_data[0]["open"]), 2)
+        change = round(current - prev_close, 2) if prev_close else 0
+        change_pct = round((change / prev_close * 100), 2) if prev_close else 0
+
+        try:
+            info = ticker.info or {}
+        except Exception:
+            info = {}
+
+        return {
+            "symbol": symbol.upper(),
+            "name": info.get("shortName", info.get("longName", symbol)),
+            "type": "stock",
+            "price": current,
+            "prev_close": prev_close,
+            "change": change,
+            "change_pct": change_pct,
+            "currency": info.get("currency", "USD"),
+            "exchange": info.get("exchange", ""),
+            "market_state": "",
+            "day_high": round(float(getattr(fi, "day_high", 0) or 0), 2),
+            "day_low": round(float(getattr(fi, "day_low", 0) or 0), 2),
+            "volume": int(getattr(fi, "last_volume", 0) or 0),
+            "market_cap": int(getattr(fi, "market_cap", 0) or 0),
+            "fifty_two_wk_high": round(float(getattr(fi, "year_high", 0) or 0), 2),
+            "fifty_two_wk_low": round(float(getattr(fi, "year_low", 0) or 0), 2),
+            "sector": info.get("sector", ""),
+            "industry": info.get("industry", ""),
+            "pe_ratio": info.get("trailingPE"),
+            "eps": info.get("trailingEps"),
+            "chart": chart_data,
+            "valid": True,
+        }
+    except Exception as e:
+        log.debug(f"yfinance error [{symbol}]: {e}")
+        return None
+
+
+def _fetch_yahoo_raw(symbol, range_str="1d", interval="5m"):
+    """Fetch from raw Yahoo chart API (fallback when yfinance unavailable)."""
     try:
         headers = {"User-Agent": "Mozilla/5.0"}
         params = {"range": range_str, "interval": interval, "includePrePost": "true"}
@@ -3364,7 +3542,7 @@ def fetch_yahoo_quote(symbol, range_str="1d", interval="5m"):
             "valid": True,
         }
     except Exception as e:
-        log.warning(f"Yahoo Finance error [{symbol}]: {e}")
+        log.warning(f"Yahoo Finance raw API error [{symbol}]: {e}")
         return None
 
 
@@ -3630,26 +3808,43 @@ def update_watchlist():
 
 @app.route("/api/market/search")
 def market_search():
-    """Search for stocks and cryptos by name/ticker. Returns combined results with type tags."""
-    q = request.args.get("q", "").strip().upper()
+    """Search for stocks and cryptos by name/ticker using Yahoo Finance search API + CoinGecko."""
+    q = request.args.get("q", "").strip()
     if not q or len(q) < 1:
         return jsonify({"results": []})
     results = []
-    # Try stock lookup
+    seen = set()
+
+    # Yahoo Finance search API — returns stocks, ETFs, indices, futures
     try:
-        stock = fetch_yahoo_quote(q, "1d", "5m")
-        if stock:
-            results.append({"symbol": q, "name": stock.get("name", q), "type": "stock"})
+        resp = requests.get(YAHOO_SEARCH_URL, params={
+            "q": q, "quotesCount": 6, "newsCount": 0, "enableNavLinks": "false"
+        }, headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
+        if resp.status_code == 200:
+            for quote in resp.json().get("quotes", []):
+                sym = quote.get("symbol", "").upper()
+                if sym and sym not in seen:
+                    seen.add(sym)
+                    qtype = quote.get("quoteType", "").lower()
+                    atype = "crypto" if qtype == "cryptocurrency" else "stock"
+                    results.append({
+                        "symbol": sym,
+                        "name": quote.get("shortname", quote.get("longname", sym)),
+                        "type": atype,
+                        "exchange": quote.get("exchange", ""),
+                    })
     except Exception:
         pass
-    # Try crypto lookup
+
+    # CoinGecko search — catches crypto that Yahoo might miss
     try:
-        crypto_id = resolve_crypto_id(q)
-        if crypto_id:
-            results.append({"symbol": q, "name": crypto_id.replace("-", " ").title(), "type": "crypto"})
+        crypto_id = resolve_crypto_id(q.upper())
+        if crypto_id and q.upper() not in seen:
+            results.append({"symbol": q.upper(), "name": crypto_id.replace("-", " ").title(), "type": "crypto"})
     except Exception:
         pass
-    return jsonify({"results": results})
+
+    return jsonify({"results": results[:8]})
 
 
 # ─── Market News ──────────────────────────────────────────────────────────────

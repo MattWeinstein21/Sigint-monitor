@@ -1128,6 +1128,99 @@ def parse_account_url(url):
     return None, None
 
 
+# ─── Source Polling Stats ─────────────────────────────────────────────────────
+# Tracks per-source polling performance: polls, alerts, errors, timing.
+# Persisted to source_stats.json so data survives restarts.
+
+SOURCE_STATS_PATH = Path("source_stats.json")
+_source_stats_lock = threading.Lock()
+_source_stats = {}
+
+
+def _load_source_stats():
+    global _source_stats
+    if SOURCE_STATS_PATH.exists():
+        try:
+            _source_stats = json.loads(SOURCE_STATS_PATH.read_text())
+        except Exception:
+            _source_stats = {}
+
+
+def _save_source_stats():
+    try:
+        SOURCE_STATS_PATH.write_text(json.dumps(_source_stats, indent=2))
+    except Exception:
+        pass
+
+
+def record_poll(source_id, alerts_found=0, error=None):
+    """Record a poll attempt for a source. Called after each poll function."""
+    with _source_stats_lock:
+        if source_id not in _source_stats:
+            _source_stats[source_id] = {
+                "total_polls": 0, "total_alerts": 0, "total_errors": 0,
+                "total_duplicates_skipped": 0,
+                "last_poll": None, "last_alert": None, "last_error": None,
+                "last_error_msg": None,
+                "alerts_by_hour": {},  # "YYYY-MM-DD HH" -> count
+            }
+        s = _source_stats[source_id]
+        s["total_polls"] += 1
+        now_iso = datetime.now(timezone.utc).isoformat()
+        s["last_poll"] = now_iso
+        if error:
+            s["total_errors"] += 1
+            s["last_error"] = now_iso
+            s["last_error_msg"] = str(error)[:200]
+        if alerts_found > 0:
+            s["total_alerts"] += alerts_found
+            s["last_alert"] = now_iso
+            hour_key = datetime.now(timezone.utc).strftime("%Y-%m-%d %H")
+            s["alerts_by_hour"][hour_key] = s["alerts_by_hour"].get(hour_key, 0) + alerts_found
+            # Trim old hourly data (keep last 72 hours)
+            if len(s["alerts_by_hour"]) > 72:
+                keys = sorted(s["alerts_by_hour"].keys())
+                for k in keys[:-72]:
+                    del s["alerts_by_hour"][k]
+        _save_source_stats()
+
+
+def record_duplicate_skip(source_id):
+    """Record when a duplicate alert is skipped for a source."""
+    with _source_stats_lock:
+        if source_id in _source_stats:
+            _source_stats[source_id]["total_duplicates_skipped"] = \
+                _source_stats[source_id].get("total_duplicates_skipped", 0) + 1
+
+
+@app.route("/api/data/source-stats")
+def get_source_stats():
+    """Get per-source polling statistics for analysis."""
+    with _source_stats_lock:
+        # Add computed fields
+        enriched = {}
+        for sid, s in _source_stats.items():
+            entry = dict(s)
+            if entry["total_polls"] > 0:
+                entry["alerts_per_poll"] = round(entry["total_alerts"] / entry["total_polls"], 2)
+                entry["error_rate"] = round(entry["total_errors"] / entry["total_polls"] * 100, 1)
+            else:
+                entry["alerts_per_poll"] = 0
+                entry["error_rate"] = 0
+            # Recent activity: alerts in last 6 hours
+            now = datetime.now(timezone.utc)
+            recent = 0
+            for h in range(6):
+                hk = (now - timedelta(hours=h)).strftime("%Y-%m-%d %H")
+                recent += s.get("alerts_by_hour", {}).get(hk, 0)
+            entry["alerts_last_6h"] = recent
+            enriched[sid] = entry
+        return jsonify({"source_stats": enriched})
+
+
+_load_source_stats()
+
+
 class AlertStore:
     """Thread-safe in-memory alert store with deduplication and async AI enrichment."""
 
@@ -1490,6 +1583,8 @@ class AlertStore:
             if len(self.alerts) > self.max_alerts:
                 self.alerts = self.alerts[: self.max_alerts]
 
+            # Track per individual source
+            record_poll(source_id, alerts_found=1)
             log_article(alert, "")
 
             tickers_str = f" [{','.join(affected_tickers)}]" if affected_tickers else ""
@@ -2804,22 +2899,33 @@ def monitor_loop():
             log.info(f"Monitor cycle — {len(keywords)} kw, age≤{_max_article_age_hours}h, {len(x_accounts)} X, {len(ts_accounts)} TS | {ollama_status}")
             log.info("── Polling cycle start ──")
 
+            def _tracked_poll(source_id, fn, *args):
+                """Run a poll function and record stats."""
+                before = len(store.alerts)
+                try:
+                    fn(*args)
+                    after = len(store.alerts)
+                    record_poll(source_id, alerts_found=max(0, after - before))
+                except Exception as e:
+                    record_poll(source_id, error=e)
+                    log.warning(f"Poll error [{source_id}]: {e}")
+
             if config.get("rss_enabled", True):
-                poll_rss(keywords)
+                _tracked_poll("rss_all", poll_rss, keywords)
 
             if config.get("newsapi_key"):
-                poll_newsapi(keywords, config["newsapi_key"])
+                _tracked_poll("newsapi", poll_newsapi, keywords, config["newsapi_key"])
 
             if config.get("whitehouse_enabled", True):
-                poll_whitehouse(keywords)
+                _tracked_poll("whitehouse", poll_whitehouse, keywords)
 
             # SEC filings are shown in Markets tab via /api/sec/recent, not as alerts
 
             if config.get("truthsocial_enabled", True) and ts_accounts:
-                poll_truthsocial(keywords, ts_accounts)
+                _tracked_poll("truthsocial", poll_truthsocial, keywords, ts_accounts)
 
             if x_accounts:
-                poll_twitter(keywords, config.get("twitter_bearer_token", ""), x_accounts)
+                _tracked_poll("x_twitter", poll_twitter, keywords, config.get("twitter_bearer_token", ""), x_accounts)
 
             log.info(f"── Cycle complete — {len(store.alerts)} total alerts ──")
 

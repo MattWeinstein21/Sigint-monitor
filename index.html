@@ -121,6 +121,8 @@ function App(){
   var[secSearching,sSecSearching]=s(false);
   // Alerts: source type filter
   var[srcType,sSrcType]=s("all"); // "all","news","social"
+  var ALERTS_PER_PAGE=30;
+  var[alertPage,sAlertPage]=s(0);
   // Markets: collapsible sections
   var[mCollapsed,sMCollapsed]=s({indices:false,watchlist:false,sectors:false,sec:false});
   var togC=function(k){sMCollapsed(function(p){var n=Object.assign({},p);n[k]=!n[k];return n})};
@@ -614,7 +616,8 @@ function App(){
           </div>
           <div style={{flex:1,overflowY:"auto"}}>
             {filt.length===0&&<div style={{textAlign:"center",padding:60,color:"#333"}}><div style={{fontSize:32,marginBottom:8}}>◎</div><div style={{fontSize:13}}>{conn?"No alerts":"Connecting..."}</div></div>}
-            {filt.map(function(a){var sr=SM[a.source]||{icon:"?",name:a.source_name||a.source,color:"#888"};var tn=a.article_tone||a.sentiment||"neutral";var im=a.market_impact||"neutral";var ic=iC[im]||"#8E8E93";var tc2=tC[tn]||"#8E8E93";var isX=exp.has(a.id);return <div key={a.id} className="arow" style={{display:"flex",gap:12,padding:"12px 20px",borderBottom:"1px solid #111118",borderLeft:"3px solid "+ic+"44"}}>
+            {function(){var totalAlertPages=Math.ceil(filt.length/ALERTS_PER_PAGE);var safePage=Math.min(alertPage,Math.max(0,totalAlertPages-1));var pageAlerts=filt.slice(safePage*ALERTS_PER_PAGE,(safePage+1)*ALERTS_PER_PAGE);return <div>
+            {pageAlerts.map(function(a){var sr=SM[a.source]||{icon:"?",name:a.source_name||a.source,color:"#888"};var tn=a.article_tone||a.sentiment||"neutral";var im=a.market_impact||"neutral";var ic=iC[im]||"#8E8E93";var tc2=tC[tn]||"#8E8E93";var isX=exp.has(a.id);return <div key={a.id} className="arow" style={{display:"flex",gap:12,padding:"12px 20px",borderBottom:"1px solid #111118",borderLeft:"3px solid "+ic+"44"}}>
               <div style={{display:"flex",flexDirection:"column",alignItems:"center",gap:4,width:40,flexShrink:0,paddingTop:2}}>
                 <div style={{width:8,height:8,borderRadius:"50%",background:svC[a.severity]||"#888"}}/>
                 <span style={{fontSize:16}}>{sr.icon}</span>
@@ -663,6 +666,12 @@ function App(){
                 </div>
               </div>
             </div>})}
+            {totalAlertPages>1&&<div style={{display:"flex",justifyContent:"center",gap:6,padding:"12px 0",borderTop:"1px solid #111118"}}>
+              <button className="b" onClick={function(){sAlertPage(Math.max(0,safePage-1))}} disabled={safePage===0} style={{padding:"4px 12px",borderRadius:4,fontSize:10,background:"#14141F",color:safePage===0?"#333":"#AAA",border:"1px solid #2A2A35"}}>← Prev</button>
+              <span style={{fontSize:10,color:"#555",padding:"4px 8px"}}>{(safePage+1)+" / "+totalAlertPages}</span>
+              <button className="b" onClick={function(){sAlertPage(Math.min(totalAlertPages-1,safePage+1))}} disabled={safePage>=totalAlertPages-1} style={{padding:"4px 12px",borderRadius:4,fontSize:10,background:"#14141F",color:safePage>=totalAlertPages-1?"#333":"#AAA",border:"1px solid #2A2A35"}}>Next →</button>
+            </div>}
+            </div>}()}
           </div>
         </div>}
 

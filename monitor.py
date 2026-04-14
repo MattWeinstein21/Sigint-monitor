@@ -1139,11 +1139,17 @@ class AlertStore:
         # Analysis lane config (set from config.json on each monitor_loop cycle)
         self.ollama_url = ""
         self.ollama_model = "llama3"
+        # Chat lane config (used by worker 2 when chat is idle)
+        self.ollama_chat_url = ""
+        self.ollama_chat_model = "llama3"
         self._ai_queue = []
         self._ai_lock = threading.Lock()
-        # Start the AI worker thread
-        self._ai_thread = threading.Thread(target=self._ai_worker, daemon=True)
+        # Worker 1: analysis lane (always runs, yields to chat)
+        self._ai_thread = threading.Thread(target=self._ai_worker, args=("analysis",), daemon=True)
         self._ai_thread.start()
+        # Worker 2: chat lane model for analysis (only when chat is idle)
+        self._ai_thread2 = threading.Thread(target=self._ai_worker, args=("chat_assist",), daemon=True)
+        self._ai_thread2.start()
 
     def _hash(self, source_id, title, url):
         dedupe_basis = url.strip() if url else f"{source_id}:{title.strip().lower()}"
@@ -1165,16 +1171,24 @@ class AlertStore:
                 return True, alert["id"]
         return False, None
 
-    def _ai_worker(self):
-        """Background worker that processes AI enrichment jobs.
-        Yields to active chat requests to keep interactive chat responsive."""
+    def _ai_worker(self, role="analysis"):
+        """Background worker for AI enrichment.
+        role='analysis': uses analysis lane, yields only during active chat.
+        role='chat_assist': uses chat lane model for analysis, pauses entirely during chat."""
         while True:
-            # Yield to active chat — don't start a new Ollama generation while chat is in progress
             with _chat_active_lock:
                 chat_busy = _chat_active > 0
-            if chat_busy:
-                time.sleep(1)
-                continue
+
+            if role == "chat_assist":
+                # Chat-assist worker: only runs when chat is completely idle
+                if chat_busy or not self.ollama_chat_url:
+                    time.sleep(2)
+                    continue
+            else:
+                # Analysis worker: yields briefly during chat, doesn't fully stop
+                if chat_busy:
+                    time.sleep(1)
+                    continue
 
             job = None
             with self._ai_lock:
@@ -1182,9 +1196,12 @@ class AlertStore:
                     job = self._ai_queue.pop(0)
             if job:
                 try:
+                    # Choose which model to use based on role
+                    if role == "chat_assist":
+                        job["_use_chat_lane"] = True
                     self._enrich_with_ai(job)
                 except Exception as e:
-                    log.warning(f"AI enrichment error: {e}")
+                    log.warning(f"AI enrichment error ({role}): {e}")
             else:
                 time.sleep(2)
 
@@ -1230,7 +1247,12 @@ class AlertStore:
                              "word_sentiment": word_result["article_tone"],
                              "word_market_impact": word_result["market_impact"]}, article_text)
 
-        if not self.ollama_url:
+        # Determine which Ollama lane to use
+        use_chat = job.get("_use_chat_lane", False)
+        active_url = self.ollama_chat_url if use_chat else self.ollama_url
+        active_model = self.ollama_chat_model if use_chat else self.ollama_model
+
+        if not active_url:
             with self.lock:
                 for a in self.alerts:
                     if a["id"] == alert_id:
@@ -1240,7 +1262,7 @@ class AlertStore:
 
         # Phase 2: Run Ollama
         llm_result, raw_response, success = ollama_analyze(
-            analysis_text, self.ollama_url, self.ollama_model, keyword=keyword
+            analysis_text, active_url, active_model, keyword=keyword
         )
 
         with self.lock:
@@ -2765,6 +2787,9 @@ def monitor_loop():
             analysis_url, analysis_model = get_ollama_lane(config, "analysis")
             store.ollama_url = analysis_url
             store.ollama_model = analysis_model
+            # Chat lane config for worker 2 (uses chat model for analysis when idle)
+            store.ollama_chat_url = chat_url
+            store.ollama_chat_model = chat_model
             # Log both lanes for observability
             chat_url, chat_model = get_ollama_lane(config, "chat")
             ollama_status = f"Analysis: {analysis_model}@{analysis_url}" if analysis_url else "Analysis: off"
@@ -2788,8 +2813,7 @@ def monitor_loop():
             if config.get("whitehouse_enabled", True):
                 poll_whitehouse(keywords)
 
-            if config.get("sec_edgar_enabled", True):
-                poll_sec_edgar(keywords)
+            # SEC filings are shown in Markets tab via /api/sec/recent, not as alerts
 
             if config.get("truthsocial_enabled", True) and ts_accounts:
                 poll_truthsocial(keywords, ts_accounts)

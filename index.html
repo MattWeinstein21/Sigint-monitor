@@ -50,7 +50,6 @@ var SRC = [
   {id:"yahoo_finance",name:"Yahoo Finance",icon:"▶",color:"#7B0099"},
   {id:"google_news",name:"Google News",icon:"◎",color:"#4285F4"},
   {id:"whitehouse",name:"White House",icon:"🏛",color:"#3C3B6E"},
-  {id:"sec_edgar",name:"SEC",icon:"📋",color:"#002868"},
   {id:"federal_register",name:"Fed Register",icon:"📜",color:"#B22234"},
   {id:"congress",name:"Congress",icon:"⚖",color:"#002868"},
   {id:"fed_reserve",name:"Fed Reserve",icon:"🏦",color:"#1B4D3E"},
@@ -60,7 +59,6 @@ var SRC = [
   {id:"coindesk",name:"CoinDesk",icon:"₿",color:"#F7931A"},
   {id:"cointelegraph",name:"CoinTelegraph",icon:"₿",color:"#27AE60"},
   {id:"newsapi",name:"NewsAPI",icon:"📰",color:"#E74C3C"},
-  {id:"sec_edgar",name:"SEC EDGAR",icon:"📋",color:"#002868"},
 ];
 var SM = {}; SRC.forEach(function(s){SM[s.id]=s;});
 
@@ -85,6 +83,7 @@ function App(){
   var[ss,sSs]=s({});var[ct,sCt]=s("general");var[exp,sExp]=s(new Set());
   var[mv,sMv]=s("alerts");var[idx,sIdx]=s({});var[wl,sWl]=s([]);var[wq,sWq]=s({});
   var[ns,sNs]=s("");var[sel,sSel]=s(null);var[rng,sRng]=s("1d");
+  var[modalRng,sModalRng]=s("1d"); // separate range for stock detail modal
   var[ci,sCi]=s({});var[ch,sCh]=s({});var[cl,sCl]=s(null);
   var[toast,sToast]=s("");var[nsn,sNsn]=s("");var[iaw,sIaw]=s({});
   var[acd,sAcd]=s(null);var[at,sAt]=s("stock");var[ade,sAde]=s("");var[adg,sAdg]=s(false);
@@ -123,8 +122,13 @@ function App(){
   // Alerts: source type filter
   var[srcType,sSrcType]=s("all"); // "all","news","social"
   // Markets: collapsible sections
-  var[mCollapsed,sMCollapsed]=s({indices:false,watchlist:false,sectors:false,sec:false,news:false});
+  var[mCollapsed,sMCollapsed]=s({indices:false,watchlist:false,sectors:false,sec:false});
   var togC=function(k){sMCollapsed(function(p){var n=Object.assign({},p);n[k]=!n[k];return n})};
+  // Market news pagination
+  var[newsPage,sNewsPage]=s(0);
+  var NEWS_PER_PAGE=20;
+  // SEC dismiss tracking
+  var[secDismissed,sSecDismissed]=s([]);
   // Modal resize guard
   var modalMouseDown=React.useRef(false);
   var tabCache=React.useRef({marketPrices:{},marketMeta:null,economy:null,analytics:null});
@@ -368,7 +372,7 @@ function App(){
                 <button className="b" onClick={function(){sChartType("line")}} style={{padding:"5px 14px",borderRadius:4,fontSize:10,background:chartType==="line"?"#5448C8":"#0A0A0F",color:chartType==="line"?"#fff":"#AAA"}}>Line</button>
                 <button className="b" onClick={function(){sChartType("candle")}} style={{padding:"5px 14px",borderRadius:4,fontSize:10,background:chartType==="candle"?"#5448C8":"#0A0A0F",color:chartType==="candle"?"#fff":"#AAA"}}>Candlestick</button>
                 <div style={{marginLeft:"auto",display:"flex",gap:4}}>
-                  {[["1d","1D"],["5d","5D"],["1mo","1M"],["3mo","3M"],["6mo","6M"],["1y","1Y"]].map(function(p){return <button key={p[0]} className="b" onClick={function(){sRng(p[0]);sZoomStart(0);sZoomEnd(-1);sHoverIdx(-1);var item=wl.find(function(w){return w.symbol===detailSym});var atype=item?item.type:"stock";var iv2=p[0]==="1d"?"5m":p[0]==="5d"?"15m":"1d";F("/api/market/quote/"+detailSym+"?type="+atype+"&range="+p[0]+"&interval="+iv2).then(function(d){if(d.quote)sWq(function(pr){var n=Object.assign({},pr);n[detailSym]=d.quote;return n})}).catch(function(){})}} style={{padding:"4px 10px",borderRadius:4,fontSize:10,background:rng===p[0]?"#5448C8":"#0A0A0F",color:rng===p[0]?"#fff":"#555"}}>{p[1]}</button>})}
+                  {[["1d","1D"],["5d","5D"],["1mo","1M"],["3mo","3M"],["6mo","6M"],["1y","1Y"]].map(function(p){return <button key={p[0]} className="b" onClick={function(){sModalRng(p[0]);sZoomStart(0);sZoomEnd(-1);sHoverIdx(-1);var item=wl.find(function(w){return w.symbol===detailSym});var atype=item?item.type:"stock";var iv2=p[0]==="1d"?"5m":p[0]==="5d"?"15m":"1d";F("/api/market/quote/"+detailSym+"?type="+atype+"&range="+p[0]+"&interval="+iv2).then(function(d){if(d.quote)sWq(function(pr){var n=Object.assign({},pr);n[detailSym]=d.quote;return n})}).catch(function(){})}} style={{padding:"4px 10px",borderRadius:4,fontSize:10,background:modalRng===p[0]?"#5448C8":"#0A0A0F",color:modalRng===p[0]?"#fff":"#555"}}>{p[1]}</button>})}
                 </div>
               </div>
               {/* Interactive chart with crosshair + zoom */}
@@ -507,7 +511,7 @@ function App(){
                 <input value={nau} onChange={function(e){sNau(e.target.value);sAe("")}} onKeyDown={function(e){if(e.key==="Enter"&&nau.trim()){fetch(API+"/api/accounts",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({url:nau.trim()})}).then(function(r){return r.json()}).then(function(d){if(d.error)sAe(d.error);else{sAcc(d.accounts||[]);sNau("");sAe("")}}).catch(function(){})}}} placeholder="profile URL..." style={{flex:1,background:"#14141F",border:"1px solid #2A2A35",borderRadius:6,padding:"6px 10px",color:"#E8E8ED",fontSize:11,outline:"none"}}/>
               </div>
               {ae&&<div style={{fontSize:10,color:"#FF3B30",marginBottom:6}}>{ae}</div>}
-              {acc.map(function(a){return <div key={a.platform+a.username} style={{display:"flex",alignItems:"center",gap:8,padding:"5px 8px",borderRadius:6,background:"#14141F",marginBottom:4}}><span style={{fontSize:11,color:"#CCC",flex:1}}>@{a.username}</span><span className="kt" onClick={function(){fetch(API+"/api/accounts",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({remove:a.platform+":"+a.username})}).then(function(r){return r.json()}).then(function(d){if(d.accounts)sAcc(d.accounts)}).catch(function(){})}} style={{fontSize:10,color:"#555",cursor:"pointer"}}>✕</span></div>})}
+              {acc.map(function(a){var pIcon=a.platform==="x"?"𝕏":a.platform==="truthsocial"?"📢":a.platform==="reddit"?"🔴":"👤";var pColor=a.platform==="x"?"#1DA1F2":a.platform==="truthsocial"?"#5448C8":a.platform==="reddit"?"#FF4500":"#888";return <div key={a.platform+a.username} style={{display:"flex",alignItems:"center",gap:8,padding:"5px 8px",borderRadius:6,background:"#14141F",marginBottom:4}}><span style={{fontSize:12}}>{pIcon}</span><span style={{fontSize:9,color:pColor,fontWeight:600}}>{a.platform}</span><span style={{fontSize:11,color:"#CCC",flex:1}}>@{a.username}</span><span className="kt" onClick={function(){fetch(API+"/api/accounts",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({remove:a.platform+":"+a.username})}).then(function(r){return r.json()}).then(function(d){if(d.accounts)sAcc(d.accounts)}).catch(function(){})}} style={{fontSize:10,color:"#555",cursor:"pointer"}}>✕</span></div>})}
             </div>}
             {ct==="signals"&&<div>
               <div style={{fontSize:10,fontWeight:600,color:"#666",letterSpacing:2,marginBottom:10,textTransform:"uppercase"}}>Signal Word Sets</div>
@@ -541,8 +545,11 @@ function App(){
               </div>
             </div>}
             {ct==="sources"&&<div>
-              <div style={{fontSize:10,fontWeight:600,color:"#666",letterSpacing:2,marginBottom:10,textTransform:"uppercase"}}>Sources ({es.length}/{SRC.length})</div>
-              {SRC.map(function(s2){return <div key={s2.id} className="st" onClick={function(){sEs(function(p){return p.includes(s2.id)?p.filter(function(x){return x!==s2.id}):p.concat([s2.id])})}} style={{display:"flex",alignItems:"center",gap:10,padding:"6px 8px",borderRadius:6,background:es.includes(s2.id)?"#14141F":"transparent",opacity:es.includes(s2.id)?1:0.35,marginBottom:2}}><div style={{width:8,height:8,borderRadius:"50%",background:es.includes(s2.id)?s2.color:"#333"}}/><span style={{fontSize:12}}>{s2.icon} {s2.name}</span></div>})}
+              <div style={{fontSize:10,fontWeight:600,color:"#666",letterSpacing:2,marginBottom:8,textTransform:"uppercase"}}>📰 News Sources</div>
+              {SRC.filter(function(s2){return SOCIAL_SOURCES.indexOf(s2.id)===-1}).map(function(s2){return <div key={s2.id} className="st" onClick={function(){sEs(function(p){return p.includes(s2.id)?p.filter(function(x){return x!==s2.id}):p.concat([s2.id])})}} style={{display:"flex",alignItems:"center",gap:10,padding:"5px 8px",borderRadius:6,background:es.includes(s2.id)?"#14141F":"transparent",opacity:es.includes(s2.id)?1:0.35,marginBottom:2}}><div style={{width:8,height:8,borderRadius:"50%",background:es.includes(s2.id)?s2.color:"#333"}}/><span style={{fontSize:11}}>{s2.icon} {s2.name}</span></div>})}
+              <div style={{fontSize:10,fontWeight:600,color:"#666",letterSpacing:2,marginBottom:8,marginTop:16,textTransform:"uppercase"}}>📢 Social Sources</div>
+              {SRC.filter(function(s2){return SOCIAL_SOURCES.indexOf(s2.id)!==-1}).map(function(s2){return <div key={s2.id} className="st" onClick={function(){sEs(function(p){return p.includes(s2.id)?p.filter(function(x){return x!==s2.id}):p.concat([s2.id])})}} style={{display:"flex",alignItems:"center",gap:10,padding:"5px 8px",borderRadius:6,background:es.includes(s2.id)?"#14141F":"transparent",opacity:es.includes(s2.id)?1:0.35,marginBottom:2}}><div style={{width:8,height:8,borderRadius:"50%",background:es.includes(s2.id)?s2.color:"#333"}}/><span style={{fontSize:11}}>{s2.icon} {s2.name}</span></div>})}
+              <div style={{fontSize:9,color:"#444",marginTop:12}}>Enabled: {es.length}/{SRC.length}</div>
             </div>}
           </div>
         </div>
@@ -668,6 +675,13 @@ function App(){
             </div>
             <button className="b" onClick={function(){sShowIdxPick(!showIdxPick)}} style={{fontSize:10,color:"#555",background:"none",padding:"2px 6px"}}>⚙ customize</button>
           </div>
+          {mCollapsed.indices&&<div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:16}}>
+            {(idxCfg&&idxCfg.selected?idxCfg.selected:[]).map(function(sym){var q=idx[sym];if(!q)return null;var up=q.change>=0;return <div key={sym} style={{background:"#0F0F18",borderRadius:6,padding:"6px 10px",border:"1px solid #1A1A25",display:"flex",alignItems:"center",gap:8}}>
+              <span style={{fontSize:10,fontWeight:600,color:"#AAA"}}>{sym.replace("^","")}</span>
+              <span style={{fontSize:12,fontWeight:700,color:"#E8E8ED",fontFamily:"'Space Grotesk',sans-serif"}}>{"$"+(q.price||0).toLocaleString()}</span>
+              <span style={{fontSize:10,color:up?"#34C759":"#FF3B30",fontWeight:600}}>{up?"▲":"▼"}{q.change_pct}%</span>
+            </div>}).filter(Boolean)}
+          </div>}
           {!mCollapsed.indices&&<div>
           {showIdxPick&&idxCfg&&<div style={{background:"#0F0F18",borderRadius:8,padding:12,border:"1px solid #1A1A25",marginBottom:12}}>
             <div style={{fontSize:9,color:"#666",marginBottom:8,textTransform:"uppercase"}}>Select indices to display</div>
@@ -691,6 +705,13 @@ function App(){
               {[{v:"all",l:"All"},{v:"stock",l:"Stocks"},{v:"crypto",l:"Crypto"}].map(function(f){return <button key={f.v} className="b" onClick={function(){sWlFilter(f.v)}} style={{fontSize:9,padding:"3px 8px",borderRadius:4,background:wlFilter===f.v?"#5448C8":"#14141F",color:wlFilter===f.v?"#fff":"#555",border:"1px solid "+(wlFilter===f.v?"#5448C833":"#2A2A35")}}>{f.l}</button>})}
             </div>
           </div>
+          {mCollapsed.watchlist&&<div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:16}}>
+            {wl.map(function(item){if(wlFilter!=="all"&&(item.type||"stock")!==wlFilter)return null;var sym=item.symbol,q=wq[sym];if(!q)return null;var up=q.change>=0;return <div key={sym} className="st" onClick={function(){sDetailSym(sym);sModalRng("1d");sSn([]);sZoomStart(0);sZoomEnd(-1);sHoverIdx(-1);F("/api/market/quote/"+sym+"?type="+(item.type||"stock")+"&range=1d&interval=5m").then(function(d){if(d.quote)sWq(function(p){var n=Object.assign({},p);n[sym]=d.quote;return n})}).catch(function(){})}} style={{background:"#0F0F18",borderRadius:6,padding:"6px 10px",border:"1px solid #1A1A25",display:"flex",alignItems:"center",gap:8,cursor:"pointer"}}>
+              <span style={{fontSize:10,fontWeight:700,color:"#E8E8ED"}}>{(item.type||"stock")==="crypto"?"₿ ":""}{sym}</span>
+              <span style={{fontSize:12,fontWeight:700,color:"#E8E8ED",fontFamily:"'Space Grotesk',sans-serif"}}>{"$"+(q.price||0).toLocaleString()}</span>
+              <span style={{fontSize:10,color:up?"#34C759":"#FF3B30",fontWeight:600}}>{up?"▲":"▼"}{q.change_pct}%</span>
+            </div>}).filter(Boolean)}
+          </div>}
           {!mCollapsed.watchlist&&<div>
           {/* Unified search — no stock/crypto toggle */}
           <div style={{position:"relative",marginBottom:10}}>
@@ -709,7 +730,7 @@ function App(){
           {ade&&<div style={{fontSize:10,color:"#FF3B30",marginBottom:10}}>{ade}</div>}
           {/* Watchlist grid — draggable, filtered by type */}
           <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(280px,1fr))",gap:10,marginBottom:24}}>
-            {wl.map(function(item,i){if(wlFilter!=="all"&&(item.type||"stock")!==wlFilter)return null;var sym=item.symbol,q=wq[sym];if(!q)return <div key={sym} draggable="true" onDragStart={onDragStart("watchlist",i)} onDragOver={onDragOver} onDrop={onDrop("watchlist",i)} style={{background:"#0F0F18",borderRadius:8,padding:14,border:"1px solid #1A1A25",display:"flex",justifyContent:"space-between",alignItems:"center"}}><span style={{color:"#555",fontSize:11}}>{sym} — loading...</span><span className="kt" onClick={function(){fetch(API+"/api/market/watchlist",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({remove:sym})}).then(function(r){return r.json()}).then(function(d){if(d.watchlist)sWl(d.watchlist)}).catch(function(){});sWq(function(p){var n=Object.assign({},p);delete n[sym];return n})}} style={{fontSize:10,color:"#FF3B30",padding:"2px 6px",cursor:"pointer"}}>✕</span></div>;var up=q.change>=0;return <div key={sym} draggable="true" onDragStart={onDragStart("watchlist",i)} onDragOver={onDragOver} onDrop={onDrop("watchlist",i)} className="st" onClick={function(){sDetailSym(sym);sSn([]);sZoomStart(0);sZoomEnd(-1);sHoverIdx(-1);var atype=item.type||"stock";var iv2=rng==="1d"?"5m":rng==="5d"?"15m":"1d";F("/api/market/quote/"+sym+"?type="+atype+"&range="+rng+"&interval="+iv2).then(function(d){if(d.quote)sWq(function(p){var n=Object.assign({},p);n[sym]=d.quote;return n})}).catch(function(){});F("/api/market/news?symbol="+sym).then(function(d){if(d.articles)sSn(d.articles)}).catch(function(){})}} style={{background:"#0F0F18",borderRadius:8,padding:14,border:"1px solid #1A1A25",cursor:"pointer"}}><div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}><div><span style={{fontSize:14,fontWeight:700,color:"#E8E8ED"}}>{q.type==="crypto"?"₿ ":""}{sym}</span><span style={{fontSize:10,color:"#555",marginLeft:6}}>{q.name}</span><span style={{fontSize:7,padding:"1px 4px",borderRadius:2,marginLeft:4,background:(item.type||"stock")==="crypto"?"#F7931A20":"#5448C815",color:(item.type||"stock")==="crypto"?"#F7931A":"#8B80F0"}}>{(item.type||"stock")==="crypto"?"Crypto":"Stock"}</span></div><div style={{display:"flex",gap:6,alignItems:"center"}}><span style={{fontSize:8,color:"#444"}}>⠿</span><span className="kt" onClick={function(e){e.stopPropagation();fetch(API+"/api/market/watchlist",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({remove:sym})}).then(function(r){return r.json()}).then(function(d){if(d.watchlist)sWl(d.watchlist)}).catch(function(){});sWq(function(p){var n=Object.assign({},p);delete n[sym];return n})}} style={{fontSize:10,color:"#555"}}>✕</span></div></div><div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",marginBottom:8}}><span style={{fontSize:20,fontWeight:700,color:"#E8E8ED",fontFamily:"'Space Grotesk',sans-serif"}}>{"$"+(q.price||0).toLocaleString()}</span><span style={{fontSize:12,color:up?"#34C759":"#FF3B30",fontWeight:600}}>{up?"▲":"▼"} {q.change} ({q.change_pct}%)</span></div><Sp data={q.chart} width={250} height={50} color={up?"#34C759":"#FF3B30"}/></div>}).filter(Boolean)}
+            {wl.map(function(item,i){if(wlFilter!=="all"&&(item.type||"stock")!==wlFilter)return null;var sym=item.symbol,q=wq[sym];if(!q)return <div key={sym} draggable="true" onDragStart={onDragStart("watchlist",i)} onDragOver={onDragOver} onDrop={onDrop("watchlist",i)} style={{background:"#0F0F18",borderRadius:8,padding:14,border:"1px solid #1A1A25",display:"flex",justifyContent:"space-between",alignItems:"center"}}><span style={{color:"#555",fontSize:11}}>{sym} — loading...</span><span className="kt" onClick={function(){fetch(API+"/api/market/watchlist",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({remove:sym})}).then(function(r){return r.json()}).then(function(d){if(d.watchlist)sWl(d.watchlist)}).catch(function(){});sWq(function(p){var n=Object.assign({},p);delete n[sym];return n})}} style={{fontSize:10,color:"#FF3B30",padding:"2px 6px",cursor:"pointer"}}>✕</span></div>;var up=q.change>=0;return <div key={sym} draggable="true" onDragStart={onDragStart("watchlist",i)} onDragOver={onDragOver} onDrop={onDrop("watchlist",i)} className="st" onClick={function(){sDetailSym(sym);sSn([]);sZoomStart(0);sZoomEnd(-1);sHoverIdx(-1);sModalRng("1d");var atype=item.type||"stock";F("/api/market/quote/"+sym+"?type="+atype+"&range=1d&interval=5m").then(function(d){if(d.quote)sWq(function(p){var n=Object.assign({},p);n[sym]=d.quote;return n})}).catch(function(){});F("/api/market/news?symbol="+sym).then(function(d){if(d.articles)sSn(d.articles)}).catch(function(){})}} style={{background:"#0F0F18",borderRadius:8,padding:14,border:"1px solid #1A1A25",cursor:"pointer"}}><div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}><div><span style={{fontSize:14,fontWeight:700,color:"#E8E8ED"}}>{q.type==="crypto"?"₿ ":""}{sym}</span><span style={{fontSize:10,color:"#555",marginLeft:6}}>{q.name}</span><span style={{fontSize:7,padding:"1px 4px",borderRadius:2,marginLeft:4,background:(item.type||"stock")==="crypto"?"#F7931A20":"#5448C815",color:(item.type||"stock")==="crypto"?"#F7931A":"#8B80F0"}}>{(item.type||"stock")==="crypto"?"Crypto":"Stock"}</span></div><div style={{display:"flex",gap:6,alignItems:"center"}}><span style={{fontSize:8,color:"#444"}}>⠿</span><span className="kt" onClick={function(e){e.stopPropagation();fetch(API+"/api/market/watchlist",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({remove:sym})}).then(function(r){return r.json()}).then(function(d){if(d.watchlist)sWl(d.watchlist)}).catch(function(){});sWq(function(p){var n=Object.assign({},p);delete n[sym];return n})}} style={{fontSize:10,color:"#555"}}>✕</span></div></div><div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",marginBottom:8}}><span style={{fontSize:20,fontWeight:700,color:"#E8E8ED",fontFamily:"'Space Grotesk',sans-serif"}}>{"$"+(q.price||0).toLocaleString()}</span><span style={{fontSize:12,color:up?"#34C759":"#FF3B30",fontWeight:600}}>{up?"▲":"▼"} {q.change} ({q.change_pct}%)</span></div><Sp data={q.chart} width={250} height={50} color={up?"#34C759":"#FF3B30"}/></div>}).filter(Boolean)}
           </div>
           </div>}
           {/* Sector Heatmap — collapsible */}
@@ -761,44 +782,50 @@ function App(){
               </a>})}
             </div>}
             {/* Recent watchlist filings */}
-            {secFilings.length>0?<div>
+            {function(){var visFilings=secFilings.filter(function(f){return secDismissed.indexOf(f.ticker+":"+f.form_type+":"+f.filed_date)===-1});return visFilings.length>0?<div>
               <div style={{fontSize:9,color:"#666",marginBottom:6}}>Recent filings from watchlist</div>
-              {secFilings.map(function(f,i){var fc=f.form_type==="8-K"||f.form_type==="8-K/A"?"#FF3B30":f.form_type==="10-K"||f.form_type==="10-K/A"?"#5448C8":"#FF9500";return <a key={i} href={f.url} target="_blank" rel="noopener noreferrer" style={{display:"flex",alignItems:"center",gap:10,padding:"6px 10px",background:"#0F0F18",borderRadius:6,border:"1px solid #1A1A25",textDecoration:"none",marginBottom:4}}>
+              {visFilings.map(function(f,i){var fc=f.form_type==="8-K"||f.form_type==="8-K/A"?"#FF3B30":f.form_type==="10-K"||f.form_type==="10-K/A"?"#5448C8":"#FF9500";var dk=f.ticker+":"+f.form_type+":"+f.filed_date;return <div key={i} style={{display:"flex",alignItems:"center",gap:10,padding:"6px 10px",background:"#0F0F18",borderRadius:6,border:"1px solid #1A1A25",marginBottom:4}}>
                 <span style={{fontSize:9,padding:"2px 6px",borderRadius:3,background:fc+"20",color:fc,fontWeight:600,flexShrink:0}}>{f.form_type}</span>
                 <span style={{fontSize:10,fontWeight:600,color:"#8B80F0",flexShrink:0}}>{f.ticker}</span>
                 <div style={{flex:1,fontSize:11,color:"#AAA"}}>{f.entity}</div>
                 <div style={{fontSize:9,color:"#555",flexShrink:0}}>{f.filed_date}</div>
-                <span style={{fontSize:9,color:"#5A8FD4",flexShrink:0}}>↗</span>
-              </a>})}
-            </div>:<div style={{fontSize:10,color:"#444",padding:10}}>No recent filings from watchlist tickers</div>}
+                <a href={f.url} target="_blank" rel="noopener noreferrer" style={{fontSize:9,color:"#5A8FD4",flexShrink:0,textDecoration:"none"}}>↗</a>
+                <span className="kt" onClick={function(){sSecDismissed(function(p){return p.concat([dk])})}} style={{fontSize:9,color:"#555",cursor:"pointer",flexShrink:0}}>✕</span>
+              </div>})}
+            </div>:<div style={{fontSize:10,color:"#444",padding:10}}>No recent filings from watchlist tickers</div>}()}
             </div>}
           </div>
 
-          {/* Market News — collapsible */}
-          <div style={{display:"flex",alignItems:"center",gap:6,cursor:"pointer",marginBottom:mCollapsed.news?16:8}} onClick={function(){togC("news")}}>
-            <span style={{fontSize:8,transform:mCollapsed.news?"rotate(0)":"rotate(90deg)",display:"inline-block",transition:"transform 0.2s",color:"#555"}}>▶</span>
-            <span style={{fontSize:10,fontWeight:600,color:"#666",letterSpacing:2,textTransform:"uppercase"}}>Market News</span>
-          </div>
-          {!mCollapsed.news&&<div>
+          {/* Market News — paginated */}
+          <div style={{fontSize:10,fontWeight:600,color:"#666",letterSpacing:2,marginBottom:8,textTransform:"uppercase"}}>Market News</div>
           <div style={{display:"flex",gap:3,flexWrap:"wrap",marginBottom:8}}>
-            <button className="b" onClick={function(){sNewsFilter([])}} style={{fontSize:8,padding:"3px 8px",borderRadius:4,background:newsFilter.length===0?"#5448C8":"#14141F",color:newsFilter.length===0?"#fff":"#555",border:"1px solid "+(newsFilter.length===0?"#5448C833":"#2A2A35")}}>All</button>
-            {NEWS_CATS.slice(1).map(function(cat){var on=newsFilter.indexOf(cat.id)!==-1;return <button key={cat.id} className="b" onClick={function(){if(on){var nxt=newsFilter.filter(function(x){return x!==cat.id});sNewsFilter(nxt)}else{sNewsFilter(newsFilter.concat([cat.id]))}}} style={{fontSize:8,padding:"3px 8px",borderRadius:4,background:on?(NC_COLORS[cat.id]||"#5448C8")+"30":"#14141F",color:on?(NC_COLORS[cat.id]||"#5448C8"):"#555",border:"1px solid "+(on?(NC_COLORS[cat.id]||"#5448C8")+"55":"#2A2A35")}}>{cat.label}</button>})}
+            <button className="b" onClick={function(){sNewsFilter([]);sNewsPage(0)}} style={{fontSize:8,padding:"3px 8px",borderRadius:4,background:newsFilter.length===0?"#5448C8":"#14141F",color:newsFilter.length===0?"#fff":"#555",border:"1px solid "+(newsFilter.length===0?"#5448C833":"#2A2A35")}}>All</button>
+            {NEWS_CATS.slice(1).map(function(cat){var on=newsFilter.indexOf(cat.id)!==-1;return <button key={cat.id} className="b" onClick={function(){sNewsPage(0);if(on){var nxt=newsFilter.filter(function(x){return x!==cat.id});sNewsFilter(nxt)}else{sNewsFilter(newsFilter.concat([cat.id]))}}} style={{fontSize:8,padding:"3px 8px",borderRadius:4,background:on?(NC_COLORS[cat.id]||"#5448C8")+"30":"#14141F",color:on?(NC_COLORS[cat.id]||"#5448C8"):"#555",border:"1px solid "+(on?(NC_COLORS[cat.id]||"#5448C8")+"55":"#2A2A35")}}>{cat.label}</button>})}
           </div>
           <div style={{display:"flex",gap:4,flexWrap:"wrap",marginBottom:8}}>
             {Object.keys(mns).map(function(id){var s2=mns[id];return <button key={id} className="b" onClick={function(){fetch(API+"/api/market/news-sources",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({toggle:id})}).then(function(r){return r.json()}).then(function(d){if(d.sources)sMns(d.sources)}).catch(function(){})}} style={{fontSize:7,padding:"2px 5px",borderRadius:3,background:s2.enabled?"#1A2A1A":"#14141F",color:s2.enabled?"#34C759":"#555"}}>{s2.name}</button>})}
           </div>
-          {/* News articles with category tags */}
-          {filteredNews.length>0?filteredNews.slice(0,20).map(function(n,i){var cat=tagNews(n.title);return <a key={i} href={n.url} target="_blank" rel="noopener noreferrer" style={{display:"flex",justifyContent:"space-between",gap:10,padding:"8px 10px",background:"#0F0F18",borderRadius:6,border:"1px solid #1A1A25",textDecoration:"none",marginBottom:6}}>
-            <div style={{flex:1}}>
-              <div style={{fontSize:12,color:"#E8E8ED",lineHeight:1.3,marginBottom:3}}>{n.title}</div>
-              {cat&&<span style={{fontSize:7,padding:"1px 5px",borderRadius:3,background:(NC_COLORS[cat.id]||"#555")+"20",color:NC_COLORS[cat.id]||"#555"}}>{cat.label}</span>}
-            </div>
-            <div style={{textAlign:"right",flexShrink:0}}>
-              <div style={{fontSize:9,color:"#5448C8"}}>{n.source}</div>
-              <div style={{fontSize:8,color:"#555"}}>{n.published_at}</div>
-            </div>
-          </a>}):<div style={{color:"#555",fontSize:11,padding:20,textAlign:"center"}}>No matching news found</div>}
-          </div>}
+          {function(){
+            var totalPages=Math.ceil(filteredNews.length/NEWS_PER_PAGE);
+            var pageItems=filteredNews.slice(newsPage*NEWS_PER_PAGE,(newsPage+1)*NEWS_PER_PAGE);
+            return <div>
+              {pageItems.length>0?pageItems.map(function(n,i){var cat=tagNews(n.title);return <a key={i} href={n.url} target="_blank" rel="noopener noreferrer" style={{display:"flex",justifyContent:"space-between",gap:10,padding:"8px 10px",background:"#0F0F18",borderRadius:6,border:"1px solid #1A1A25",textDecoration:"none",marginBottom:6}}>
+                <div style={{flex:1}}>
+                  <div style={{fontSize:12,color:"#E8E8ED",lineHeight:1.3,marginBottom:3}}>{n.title}</div>
+                  {cat&&<span style={{fontSize:7,padding:"1px 5px",borderRadius:3,background:(NC_COLORS[cat.id]||"#555")+"20",color:NC_COLORS[cat.id]||"#555"}}>{cat.label}</span>}
+                </div>
+                <div style={{textAlign:"right",flexShrink:0}}>
+                  <div style={{fontSize:9,color:"#5448C8"}}>{n.source}</div>
+                  <div style={{fontSize:8,color:"#555"}}>{n.published_at}</div>
+                </div>
+              </a>}):<div style={{color:"#555",fontSize:11,padding:20,textAlign:"center"}}>No matching news found</div>}
+              {totalPages>1&&<div style={{display:"flex",justifyContent:"center",gap:6,padding:"12px 0"}}>
+                <button className="b" onClick={function(){sNewsPage(Math.max(0,newsPage-1))}} disabled={newsPage===0} style={{padding:"4px 12px",borderRadius:4,fontSize:10,background:"#14141F",color:newsPage===0?"#333":"#AAA",border:"1px solid #2A2A35"}}>← Prev</button>
+                <span style={{fontSize:10,color:"#555",padding:"4px 8px"}}>{(newsPage+1)+" / "+totalPages}</span>
+                <button className="b" onClick={function(){sNewsPage(Math.min(totalPages-1,newsPage+1))}} disabled={newsPage>=totalPages-1} style={{padding:"4px 12px",borderRadius:4,fontSize:10,background:"#14141F",color:newsPage>=totalPages-1?"#333":"#AAA",border:"1px solid #2A2A35"}}>Next →</button>
+              </div>}
+            </div>;
+          }()}
         </div>}
 
         {/* ═══ ECONOMY ═══ */}

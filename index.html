@@ -91,9 +91,10 @@ function App(){
   var[mn,sMn]=s([]);var[sn,sSn]=s([]);var[mns,sMns]=s({});
   var[fg,sFg]=s(null);var[fd,sFd]=s(null);var[hn,sHn]=s([]);var[bt,sBt]=s(null);
   var[tk,sTk]=s(0);
-  // Correction modal
+  // Correction modal — two-step: select then submit
   var[corrUrl,sCorrUrl]=s(null);
   var[corrCtx,sCorrCtx]=s("");
+  var[corrPick,sCorrPick]=s("");  // selected impact before submit
   // Indices config
   var[idxCfg,sIdxCfg]=s(null);
   var[showIdxPick,sShowIdxPick]=s(false);
@@ -119,6 +120,13 @@ function App(){
   var[secQuery,sSecQuery]=s("");
   var[secResults,sSecResults]=s([]);
   var[secSearching,sSecSearching]=s(false);
+  // Alerts: source type filter
+  var[srcType,sSrcType]=s("all"); // "all","news","social"
+  // Markets: collapsible sections
+  var[mCollapsed,sMCollapsed]=s({indices:false,watchlist:false,sectors:false,sec:false,news:false});
+  var togC=function(k){sMCollapsed(function(p){var n=Object.assign({},p);n[k]=!n[k];return n})};
+  // Modal resize guard
+  var modalMouseDown=React.useRef(false);
   var tabCache=React.useRef({marketPrices:{},marketMeta:null,economy:null,analytics:null});
   var cacheFresh=function(entry,ttl){return !!(entry&&entry.ts&&(Date.now()-entry.ts)<ttl)};
   // Chart zoom (indices into chart data array)
@@ -189,7 +197,7 @@ function App(){
           else{up.market_impact=impact;var tm={bullish:"positive",bearish:"negative",neutral:"neutral"};up.article_tone=tm[impact]||"neutral";up.sentiment=up.article_tone}
           return up;
         })});
-        sCorrUrl(null);sCorrCtx("");
+        sCorrUrl(null);sCorrCtx("");sCorrPick("");
       }
     }).catch(function(){tt("Failed")});
   };
@@ -247,12 +255,15 @@ function App(){
   // Sparkline
   var Sp=function(p){if(!p.data||p.data.length<2)return null;var v=p.data.map(function(d){return d.close});var mi=Math.min.apply(null,v),ma=Math.max.apply(null,v),r=ma-mi||1;var pts=v.map(function(val,i){return(i/(v.length-1))*p.width+","+(p.height-((val-mi)/r)*p.height)}).join(" ");return <svg width={p.width} height={p.height} style={{display:"block"}}><polyline points={pts} fill="none" stroke={p.color} strokeWidth="1.5"/></svg>};
 
+  var SOCIAL_SOURCES=["truthsocial","x_twitter","reddit"];
   var filt=al.filter(function(a){
     if(fi!=="all"&&a.keyword!==fi)return false;
     if(sfSet.length>0&&sfSet.indexOf(a.severity)===-1)return false;
     if(stfSet.length>0&&stfSet.indexOf(a.article_tone||a.sentiment||"neutral")===-1)return false;
     if(imfSet.length>0&&imfSet.indexOf(a.market_impact||"neutral")===-1)return false;
     if(tfMin>0){var ts=a.published_at_utc||a.timestamp;if(ts){var age=Date.now()-new Date(ts).getTime();if(age>tfMin*60000)return false}}
+    if(srcType==="social"&&SOCIAL_SOURCES.indexOf(a.source)===-1)return false;
+    if(srcType==="news"&&SOCIAL_SOURCES.indexOf(a.source)!==-1)return false;
     return es.includes(a.source)
   });
 
@@ -318,26 +329,27 @@ function App(){
   return <div style={{minHeight:"100vh"}}>
     {toast&&<div style={{position:"fixed",top:20,right:20,zIndex:100,background:"#1A2A1A",color:"#34C759",padding:"10px 18px",borderRadius:8,fontSize:12,border:"1px solid #34C75933",animation:"slideIn 0.3s ease-out"}}>{toast}</div>}
 
-      {/* Correction Modal */}
-      {corrUrl&&<div style={{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.7)",zIndex:200,display:"flex",alignItems:"center",justifyContent:"center"}} onClick={function(){sCorrUrl(null);sCorrCtx("")}}>
+      {/* Correction Modal — two-step: select classification, then submit */}
+      {corrUrl&&<div style={{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.7)",zIndex:200,display:"flex",alignItems:"center",justifyContent:"center"}} onClick={function(){sCorrUrl(null);sCorrCtx("");sCorrPick("")}}>
         <div style={{background:"#14141F",borderRadius:12,padding:24,border:"1px solid #2A2A35",width:380,maxWidth:"90vw"}} onClick={function(e){e.stopPropagation()}}>
           <div style={{fontSize:12,fontWeight:600,color:"#E8E8ED",marginBottom:16}}>Correct Classification</div>
-          <div style={{fontSize:10,color:"#555",marginBottom:12}}>What is the correct market impact?</div>
-          <div style={{display:"flex",gap:8,marginBottom:16}}>
-            <button className="b" onClick={function(){submitCorrection("bullish")}} style={{flex:1,padding:"10px",borderRadius:8,background:"#34C75915",color:"#34C759",border:"1px solid #34C75933",fontSize:12,fontWeight:600}}>📈 Bullish</button>
-            <button className="b" onClick={function(){submitCorrection("neutral")}} style={{flex:1,padding:"10px",borderRadius:8,background:"#8E8E9315",color:"#8E8E93",border:"1px solid #8E8E9333",fontSize:12,fontWeight:600}}>➡️ Neutral</button>
-            <button className="b" onClick={function(){submitCorrection("bearish")}} style={{flex:1,padding:"10px",borderRadius:8,background:"#FF3B3015",color:"#FF3B30",border:"1px solid #FF3B3033",fontSize:12,fontWeight:600}}>📉 Bearish</button>
+          <div style={{fontSize:10,color:"#555",marginBottom:12}}>Select the correct market impact:</div>
+          <div style={{display:"flex",gap:8,marginBottom:12}}>
+            {[{v:"bullish",icon:"📈",c:"#34C759"},{v:"neutral",icon:"➡️",c:"#8E8E93"},{v:"bearish",icon:"📉",c:"#FF3B30"}].map(function(o){var sel=corrPick===o.v;return <button key={o.v} className="b" onClick={function(){sCorrPick(o.v)}} style={{flex:1,padding:"10px",borderRadius:8,background:sel?o.c+"30":o.c+"15",color:o.c,border:"2px solid "+(sel?o.c:o.c+"33"),fontSize:12,fontWeight:600}}>{o.icon} {o.v.charAt(0).toUpperCase()+o.v.slice(1)}</button>})}
           </div>
-          <button className="b" onClick={function(){submitCorrection("duplicate")}} style={{width:"100%",padding:"8px",borderRadius:6,background:"#FF950010",color:"#FF9500",border:"1px solid #FF950033",fontSize:11,marginBottom:16}}>🔄 Mark as Duplicate</button>
+          <button className="b" onClick={function(){sCorrPick(corrPick==="duplicate"?"":"duplicate")}} style={{width:"100%",padding:"8px",borderRadius:6,background:corrPick==="duplicate"?"#FF950030":"#FF950010",color:"#FF9500",border:"2px solid "+(corrPick==="duplicate"?"#FF9500":"#FF950033"),fontSize:11,marginBottom:12}}>🔄 Mark as Duplicate</button>
           <div style={{fontSize:10,color:"#555",marginBottom:6}}>Why? (optional — helps AI learn)</div>
           <textarea value={corrCtx} onChange={function(e){sCorrCtx(e.target.value)}} placeholder={"e.g. Oil price surge is bearish for equities due to inflation pressure..."} rows={3} style={{width:"100%",background:"#0A0A0F",border:"1px solid #2A2A35",borderRadius:6,padding:"8px",color:"#E8E8ED",fontSize:11,outline:"none",resize:"vertical",fontFamily:"inherit"}}/>
-          <button className="b" onClick={function(){sCorrUrl(null);sCorrCtx("")}} style={{marginTop:12,width:"100%",padding:"8px",borderRadius:6,background:"transparent",color:"#555",border:"1px solid #2A2A35",fontSize:11}}>Cancel</button>
+          <div style={{display:"flex",gap:8,marginTop:12}}>
+            <button className="b" onClick={function(){sCorrUrl(null);sCorrCtx("");sCorrPick("")}} style={{flex:1,padding:"8px",borderRadius:6,background:"transparent",color:"#555",border:"1px solid #2A2A35",fontSize:11}}>Cancel</button>
+            <button className="b" onClick={function(){if(corrPick)submitCorrection(corrPick)}} disabled={!corrPick} style={{flex:1,padding:"8px",borderRadius:6,background:corrPick?"#5448C8":"#2A2A35",color:corrPick?"#fff":"#555",fontSize:11,fontWeight:600,opacity:corrPick?1:0.5}}>Submit</button>
+          </div>
         </div>
       </div>}
 
-      {/* Stock Detail Popup */}
-      {detailSym&&wq[detailSym]&&<div style={{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.7)",zIndex:200,display:"flex",alignItems:"center",justifyContent:"center"}} onClick={function(){sDetailSym(null);sHoverIdx(-1)}}>
-        <div style={{background:"#14141F",borderRadius:12,padding:24,border:"1px solid #2A2A35",width:700,maxWidth:"95vw",maxHeight:"90vh",overflowY:"auto",resize:"both",overflow:"auto",minWidth:400,minHeight:300}} onClick={function(e){e.stopPropagation()}}>
+      {/* Stock Detail Popup — mousedown guard prevents close during resize */}
+      {detailSym&&wq[detailSym]&&<div style={{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.7)",zIndex:200,display:"flex",alignItems:"center",justifyContent:"center"}} onMouseDown={function(e){if(e.target===e.currentTarget)modalMouseDown.current=true}} onMouseUp={function(e){if(e.target===e.currentTarget&&modalMouseDown.current){sDetailSym(null);sHoverIdx(-1)}modalMouseDown.current=false}} onClick={function(){}}>
+        <div style={{background:"#14141F",borderRadius:12,padding:24,border:"1px solid #2A2A35",width:700,maxWidth:"95vw",maxHeight:"90vh",overflowY:"auto",resize:"both",overflow:"auto",minWidth:400,minHeight:300}} onMouseDown={function(){modalMouseDown.current=false}}>
           {function(){
             var q=wq[detailSym];if(!q)return null;var up=q.change>=0;
             var cd=q.chart||[];
@@ -582,8 +594,13 @@ function App(){
                 <div style={{display:"flex",gap:4,flexWrap:"wrap",marginBottom:8}}>
                   {[{k:"impact",l:"Impact"},{k:"tone",l:"Tone"},{k:"confidence",l:"Conf %"},{k:"keyword",l:"Keyword"},{k:"mixed",l:"Mixed"}].map(function(d){return <button key={d.k} className="b" onClick={function(){dtog(d.k)}} style={{fontSize:8,padding:"2px 6px",borderRadius:3,background:dShow[d.k]?"#1A2A1A":"#0A0A0F",color:dShow[d.k]?"#34C759":"#444",border:"1px solid "+(dShow[d.k]?"#34C75933":"#1A1A25")}}>{d.l}</button>})}
                 </div>
+                {/* Source type */}
+                <div style={{fontSize:9,color:"#666",textTransform:"uppercase",letterSpacing:1,marginBottom:6,fontWeight:600}}>Source Type</div>
+                <div style={{display:"flex",gap:4,marginBottom:8}}>
+                  {[{v:"all",l:"All"},{v:"news",l:"📰 News"},{v:"social",l:"📢 Social"}].map(function(o){return <button key={o.v} className="b" onClick={function(){sSrcType(o.v)}} style={{fontSize:9,padding:"3px 8px",borderRadius:4,background:srcType===o.v?"#5448C8":"#0A0A0F",color:srcType===o.v?"#fff":"#555",border:"1px solid "+(srcType===o.v?"#5448C833":"#1A1A25")}}>{o.l}</button>})}
+                </div>
                 {/* Clear all */}
-                <button className="b" onClick={function(){sSfSet([]);sStfSet([]);sImfSet([]);sTfMin(0);sFi("all")}} style={{width:"100%",fontSize:9,padding:"4px",borderRadius:4,background:"#0A0A0F",color:"#555",border:"1px solid #1A1A25",marginTop:4}}>Clear All Filters</button>
+                <button className="b" onClick={function(){sSfSet([]);sStfSet([]);sImfSet([]);sTfMin(0);sFi("all");sSrcType("all")}} style={{width:"100%",fontSize:9,padding:"4px",borderRadius:4,background:"#0A0A0F",color:"#555",border:"1px solid #1A1A25",marginTop:4}}>Clear All Filters</button>
               </div>}
             </div>
             <span style={{fontSize:9,color:"#444"}}>{filt.length} alerts{fi!=="all"?" · "+fi:""}{tfMin>0?" · "+[{v:30,l:"30m"},{v:60,l:"1h"},{v:180,l:"3h"},{v:300,l:"5h"},{v:1440,l:"24h"},{v:2880,l:"48h"}].filter(function(t){return t.v===tfMin}).map(function(t){return t.l})[0]:""}</span>
@@ -610,10 +627,10 @@ function App(){
                     {a.ai_summary&&<span style={{fontSize:8,background:"#5448C820",color:"#8B80F0",padding:"1px 4px",borderRadius:3}}>🤖</span>}
                     {a.ai_processing&&!a.ai_summary&&<span className="thk" style={{fontSize:8,color:"#FF9500"}}>🤖 Analyzing</span>}
                   </button>
-                  {isX&&<div style={{marginTop:2}}>
+                  {isX&&<div style={{marginTop:2,maxWidth:"65%"}}>
                     <div style={{fontSize:11,color:"#BBB",lineHeight:1.6,padding:"8px 10px",background:"#0F0F18",borderRadius:6,borderLeft:"2px solid "+ic+"66"}}>{a.summary}</div>
-                    {/* Per-alert chat — narrowed to 65% */}
-                    <div style={{maxWidth:"65%",marginTop:8}}>
+                    {/* Per-alert chat */}
+                    <div style={{marginTop:8}}>
                       {(ch[a.id]||[]).map(function(m,i){return <div key={i} className="cm" style={{display:"flex",justifyContent:m.role==="user"?"flex-end":"flex-start",marginBottom:6}}><div style={{maxWidth:"85%",padding:"6px 10px",borderRadius:m.role==="user"?"8px 8px 2px 8px":"8px 8px 8px 2px",background:m.role==="user"?"#5448C8":"#0A0A14",color:m.role==="user"?"#fff":"#AAA",fontSize:10,lineHeight:1.5,border:m.role==="user"?"none":"1px solid #1A1A25"}}>{m.role==="ai"&&<span style={{fontSize:8,color:"#8B80F0",marginRight:4}}>🤖</span>}{m.text}</div></div>})}
                       {cl===a.id&&<div className="cm" style={{display:"flex",marginBottom:6}}><div style={{padding:"6px 10px",borderRadius:"8px 8px 8px 2px",background:"#0A0A14",border:"1px solid #1A1A25",fontSize:10,color:"#8B80F0"}}>🤖 <span className="thk">Thinking</span></div></div>}
                       <div style={{display:"flex",gap:4,marginTop:4}}>
@@ -644,10 +661,14 @@ function App(){
 
         {/* ═══ MARKETS ═══ */}
         {mv==="market"&&<div style={{flex:1,overflowY:"auto",padding:20}}>
-          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
-            <div style={{fontSize:10,fontWeight:600,color:"#666",letterSpacing:2,textTransform:"uppercase"}}>Indices</div>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:mCollapsed.indices?16:12}}>
+            <div style={{display:"flex",alignItems:"center",gap:6,cursor:"pointer"}} onClick={function(){togC("indices")}}>
+              <span style={{fontSize:8,transform:mCollapsed.indices?"rotate(0)":"rotate(90deg)",display:"inline-block",transition:"transform 0.2s",color:"#555"}}>▶</span>
+              <span style={{fontSize:10,fontWeight:600,color:"#666",letterSpacing:2,textTransform:"uppercase"}}>Indices</span>
+            </div>
             <button className="b" onClick={function(){sShowIdxPick(!showIdxPick)}} style={{fontSize:10,color:"#555",background:"none",padding:"2px 6px"}}>⚙ customize</button>
           </div>
+          {!mCollapsed.indices&&<div>
           {showIdxPick&&idxCfg&&<div style={{background:"#0F0F18",borderRadius:8,padding:12,border:"1px solid #1A1A25",marginBottom:12}}>
             <div style={{fontSize:9,color:"#666",marginBottom:8,textTransform:"uppercase"}}>Select indices to display</div>
             <div style={{display:"flex",flexWrap:"wrap",gap:6}}>
@@ -659,13 +680,18 @@ function App(){
             {(idxCfg&&idxCfg.selected?idxCfg.selected:[]).map(function(sym,i){var q=idx[sym];if(!q)return null;var up=q.change>=0;return <div key={sym} draggable="true" onDragStart={onDragStart("indices",i)} onDragOver={onDragOver} onDrop={onDrop("indices",i)} style={{background:"#0F0F18",borderRadius:8,padding:14,border:"1px solid #1A1A25",cursor:"grab"}}><div style={{display:"flex",justifyContent:"space-between",marginBottom:6}}><span style={{fontSize:11,fontWeight:600,color:"#E8E8ED"}}>{q.name||sym}</span><span style={{fontSize:8,color:"#444"}}>⠿</span></div><div style={{fontSize:20,fontWeight:700,color:"#E8E8ED",fontFamily:"'Space Grotesk',sans-serif"}}>{"$"+(q.price||0).toLocaleString()}</div><div style={{fontSize:12,color:up?"#34C759":"#FF3B30",fontWeight:600,marginBottom:8}}>{up?"▲":"▼"} {q.change} ({q.change_pct}%)</div><Sp data={q.chart} width={180} height={40} color={up?"#34C759":"#FF3B30"}/></div>}).filter(Boolean)}
           </div>
           <div style={{display:"flex",gap:6,marginBottom:16}}>{[["1d","1D"],["5d","5D"],["1mo","1M"],["3mo","3M"],["6mo","6M"],["1y","1Y"]].map(function(p){return <button key={p[0]} className="b" onClick={function(){sRng(p[0])}} style={{background:rng===p[0]?"#5448C8":"#14141F",color:rng===p[0]?"#fff":"#AAA",padding:"4px 12px",borderRadius:4,fontSize:10}}>{p[1]}</button>})}</div>
-          {/* Watchlist header + type filter */}
-          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
-            <div style={{fontSize:10,fontWeight:600,color:"#666",letterSpacing:2,textTransform:"uppercase"}}>Watchlist</div>
+          </div>}
+          {/* Watchlist header + type filter — collapsible */}
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:mCollapsed.watchlist?16:12}}>
+            <div style={{display:"flex",alignItems:"center",gap:6,cursor:"pointer"}} onClick={function(){togC("watchlist")}}>
+              <span style={{fontSize:8,transform:mCollapsed.watchlist?"rotate(0)":"rotate(90deg)",display:"inline-block",transition:"transform 0.2s",color:"#555"}}>▶</span>
+              <span style={{fontSize:10,fontWeight:600,color:"#666",letterSpacing:2,textTransform:"uppercase"}}>Watchlist</span>
+            </div>
             <div style={{display:"flex",gap:3}}>
               {[{v:"all",l:"All"},{v:"stock",l:"Stocks"},{v:"crypto",l:"Crypto"}].map(function(f){return <button key={f.v} className="b" onClick={function(){sWlFilter(f.v)}} style={{fontSize:9,padding:"3px 8px",borderRadius:4,background:wlFilter===f.v?"#5448C8":"#14141F",color:wlFilter===f.v?"#fff":"#555",border:"1px solid "+(wlFilter===f.v?"#5448C833":"#2A2A35")}}>{f.l}</button>})}
             </div>
           </div>
+          {!mCollapsed.watchlist&&<div>
           {/* Unified search — no stock/crypto toggle */}
           <div style={{position:"relative",marginBottom:10}}>
             <div style={{display:"flex",gap:6}}>
@@ -685,10 +711,14 @@ function App(){
           <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(280px,1fr))",gap:10,marginBottom:24}}>
             {wl.map(function(item,i){if(wlFilter!=="all"&&(item.type||"stock")!==wlFilter)return null;var sym=item.symbol,q=wq[sym];if(!q)return <div key={sym} draggable="true" onDragStart={onDragStart("watchlist",i)} onDragOver={onDragOver} onDrop={onDrop("watchlist",i)} style={{background:"#0F0F18",borderRadius:8,padding:14,border:"1px solid #1A1A25",display:"flex",justifyContent:"space-between",alignItems:"center"}}><span style={{color:"#555",fontSize:11}}>{sym} — loading...</span><span className="kt" onClick={function(){fetch(API+"/api/market/watchlist",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({remove:sym})}).then(function(r){return r.json()}).then(function(d){if(d.watchlist)sWl(d.watchlist)}).catch(function(){});sWq(function(p){var n=Object.assign({},p);delete n[sym];return n})}} style={{fontSize:10,color:"#FF3B30",padding:"2px 6px",cursor:"pointer"}}>✕</span></div>;var up=q.change>=0;return <div key={sym} draggable="true" onDragStart={onDragStart("watchlist",i)} onDragOver={onDragOver} onDrop={onDrop("watchlist",i)} className="st" onClick={function(){sDetailSym(sym);sSn([]);sZoomStart(0);sZoomEnd(-1);sHoverIdx(-1);var atype=item.type||"stock";var iv2=rng==="1d"?"5m":rng==="5d"?"15m":"1d";F("/api/market/quote/"+sym+"?type="+atype+"&range="+rng+"&interval="+iv2).then(function(d){if(d.quote)sWq(function(p){var n=Object.assign({},p);n[sym]=d.quote;return n})}).catch(function(){});F("/api/market/news?symbol="+sym).then(function(d){if(d.articles)sSn(d.articles)}).catch(function(){})}} style={{background:"#0F0F18",borderRadius:8,padding:14,border:"1px solid #1A1A25",cursor:"pointer"}}><div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}><div><span style={{fontSize:14,fontWeight:700,color:"#E8E8ED"}}>{q.type==="crypto"?"₿ ":""}{sym}</span><span style={{fontSize:10,color:"#555",marginLeft:6}}>{q.name}</span><span style={{fontSize:7,padding:"1px 4px",borderRadius:2,marginLeft:4,background:(item.type||"stock")==="crypto"?"#F7931A20":"#5448C815",color:(item.type||"stock")==="crypto"?"#F7931A":"#8B80F0"}}>{(item.type||"stock")==="crypto"?"Crypto":"Stock"}</span></div><div style={{display:"flex",gap:6,alignItems:"center"}}><span style={{fontSize:8,color:"#444"}}>⠿</span><span className="kt" onClick={function(e){e.stopPropagation();fetch(API+"/api/market/watchlist",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({remove:sym})}).then(function(r){return r.json()}).then(function(d){if(d.watchlist)sWl(d.watchlist)}).catch(function(){});sWq(function(p){var n=Object.assign({},p);delete n[sym];return n})}} style={{fontSize:10,color:"#555"}}>✕</span></div></div><div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",marginBottom:8}}><span style={{fontSize:20,fontWeight:700,color:"#E8E8ED",fontFamily:"'Space Grotesk',sans-serif"}}>{"$"+(q.price||0).toLocaleString()}</span><span style={{fontSize:12,color:up?"#34C759":"#FF3B30",fontWeight:600}}>{up?"▲":"▼"} {q.change} ({q.change_pct}%)</span></div><Sp data={q.chart} width={250} height={50} color={up?"#34C759":"#FF3B30"}/></div>}).filter(Boolean)}
           </div>
-          {/* Sector Heatmap */}
+          </div>}
+          {/* Sector Heatmap — collapsible */}
           {sectors.length>0&&<div style={{marginBottom:24}}>
-            <div style={{fontSize:10,fontWeight:600,color:"#666",letterSpacing:2,marginBottom:10,textTransform:"uppercase"}}>Market Sectors</div>
-            <div style={{display:"flex",flexWrap:"wrap",gap:3}}>
+            <div style={{display:"flex",alignItems:"center",gap:6,cursor:"pointer",marginBottom:mCollapsed.sectors?0:10}} onClick={function(){togC("sectors")}}>
+              <span style={{fontSize:8,transform:mCollapsed.sectors?"rotate(0)":"rotate(90deg)",display:"inline-block",transition:"transform 0.2s",color:"#555"}}>▶</span>
+              <span style={{fontSize:10,fontWeight:600,color:"#666",letterSpacing:2,textTransform:"uppercase"}}>Market Sectors</span>
+            </div>
+            {!mCollapsed.sectors&&<div style={{display:"flex",flexWrap:"wrap",gap:3}}>
               {sectors.map(function(sec){
                 var pct=sec.change_pct||0;
                 var bg=pct>1?"#1A3A1A":pct>0.3?"#152A15":pct>-0.3?"#1A1A25":pct>-1?"#2A1515":"#3A1A1A";
@@ -700,14 +730,18 @@ function App(){
                   <div style={{fontSize:8,color:"#555"}}>{sec.symbol}</div>
                 </div>;
               })}
-            </div>
+            </div>}
           </div>}
 
-          {/* SEC Filings — recent + search */}
+          {/* SEC Filings — collapsible */}
           <div style={{marginBottom:24}}>
-            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
-              <div style={{fontSize:10,fontWeight:600,color:"#666",letterSpacing:2,textTransform:"uppercase"}}>SEC Filings</div>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:mCollapsed.sec?0:10}}>
+              <div style={{display:"flex",alignItems:"center",gap:6,cursor:"pointer"}} onClick={function(){togC("sec")}}>
+                <span style={{fontSize:8,transform:mCollapsed.sec?"rotate(0)":"rotate(90deg)",display:"inline-block",transition:"transform 0.2s",color:"#555"}}>▶</span>
+                <span style={{fontSize:10,fontWeight:600,color:"#666",letterSpacing:2,textTransform:"uppercase"}}>SEC Filings</span>
+              </div>
             </div>
+            {!mCollapsed.sec&&<div>
             <div style={{display:"flex",gap:6,marginBottom:10}}>
               <input value={secQuery} onChange={function(e){sSecQuery(e.target.value)}} onKeyDown={function(e){if(e.key==="Enter"&&secQuery.trim()){sSecSearching(true);F("/api/sec/search?q="+encodeURIComponent(secQuery.trim())).then(function(d){sSecResults(d.filings||[]);sSecSearching(false)}).catch(function(){sSecSearching(false)})}}} placeholder="Search SEC filings (ticker, company, keyword)..." style={{flex:1,maxWidth:320,background:"#14141F",border:"1px solid #2A2A35",borderRadius:6,padding:"6px 10px",color:"#E8E8ED",fontSize:11,outline:"none"}}/>
               <button className="b" onClick={function(){if(!secQuery.trim())return;sSecSearching(true);F("/api/sec/search?q="+encodeURIComponent(secQuery.trim())).then(function(d){sSecResults(d.filings||[]);sSecSearching(false)}).catch(function(){sSecSearching(false)})}} disabled={secSearching} style={{background:"#5448C8",color:"#fff",padding:"6px 12px",borderRadius:6,fontSize:11,opacity:secSearching?0.5:1}}>{secSearching?"...":"Search"}</button>
@@ -737,10 +771,15 @@ function App(){
                 <span style={{fontSize:9,color:"#5A8FD4",flexShrink:0}}>↗</span>
               </a>})}
             </div>:<div style={{fontSize:10,color:"#444",padding:10}}>No recent filings from watchlist tickers</div>}
+            </div>}
           </div>
 
-          {/* Market News with Category Filter + Source toggles */}
-          <div style={{fontSize:10,fontWeight:600,color:"#666",letterSpacing:2,marginBottom:8,textTransform:"uppercase"}}>Market News</div>
+          {/* Market News — collapsible */}
+          <div style={{display:"flex",alignItems:"center",gap:6,cursor:"pointer",marginBottom:mCollapsed.news?16:8}} onClick={function(){togC("news")}}>
+            <span style={{fontSize:8,transform:mCollapsed.news?"rotate(0)":"rotate(90deg)",display:"inline-block",transition:"transform 0.2s",color:"#555"}}>▶</span>
+            <span style={{fontSize:10,fontWeight:600,color:"#666",letterSpacing:2,textTransform:"uppercase"}}>Market News</span>
+          </div>
+          {!mCollapsed.news&&<div>
           <div style={{display:"flex",gap:3,flexWrap:"wrap",marginBottom:8}}>
             <button className="b" onClick={function(){sNewsFilter([])}} style={{fontSize:8,padding:"3px 8px",borderRadius:4,background:newsFilter.length===0?"#5448C8":"#14141F",color:newsFilter.length===0?"#fff":"#555",border:"1px solid "+(newsFilter.length===0?"#5448C833":"#2A2A35")}}>All</button>
             {NEWS_CATS.slice(1).map(function(cat){var on=newsFilter.indexOf(cat.id)!==-1;return <button key={cat.id} className="b" onClick={function(){if(on){var nxt=newsFilter.filter(function(x){return x!==cat.id});sNewsFilter(nxt)}else{sNewsFilter(newsFilter.concat([cat.id]))}}} style={{fontSize:8,padding:"3px 8px",borderRadius:4,background:on?(NC_COLORS[cat.id]||"#5448C8")+"30":"#14141F",color:on?(NC_COLORS[cat.id]||"#5448C8"):"#555",border:"1px solid "+(on?(NC_COLORS[cat.id]||"#5448C8")+"55":"#2A2A35")}}>{cat.label}</button>})}
@@ -759,6 +798,7 @@ function App(){
               <div style={{fontSize:8,color:"#555"}}>{n.published_at}</div>
             </div>
           </a>}):<div style={{color:"#555",fontSize:11,padding:20,textAlign:"center"}}>No matching news found</div>}
+          </div>}
         </div>}
 
         {/* ═══ ECONOMY ═══ */}

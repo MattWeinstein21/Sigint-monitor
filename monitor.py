@@ -4551,20 +4551,16 @@ def sec_search():
         filings = []
         for hit in data.get("hits", {}).get("hits", [])[:limit]:
             src = hit.get("_source", {})
-            # Build a direct filing URL
             file_num = src.get("file_num", "")
-            accession = hit.get("_id", "").replace("-", "")
-            filing_url = f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={file_num}&type={src.get('form_type','')}&dateb=&owner=include&count=10"
-            # Try to build a direct document link
-            if accession:
-                acc_formatted = accession[:10] + "-" + accession[10:12] + "-" + accession[12:]
-                filing_url = f"https://www.sec.gov/Archives/edgar/data/{src.get('file_num', '').replace('-', '')}/{accession}/0000000000-00-000000-index.htm"
-                # Simpler: use EDGAR viewer
-                filing_url = f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&company={requests.utils.quote(src.get('entity_name', ''))}&CIK=&type={src.get('form_type','')}&dateb=&owner=include&count=5&search_text=&action=getcompany"
+            form_type = src.get("form_type", "")
+            entity = src.get("entity_name", "")
+            # Use file_num or entity for EDGAR company lookup
+            cik = file_num if file_num else requests.utils.quote(entity)
+            filing_url = f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={cik}&type={form_type}&dateb=&owner=include&count=10&search_text=&action=getcompany"
 
             filings.append({
-                "form_type": src.get("form_type", ""),
-                "entity": src.get("entity_name", ""),
+                "form_type": form_type,
+                "entity": entity,
                 "filed_date": src.get("file_date", ""),
                 "description": src.get("display_names", [""])[0] if src.get("display_names") else "",
                 "url": filing_url,
@@ -4597,13 +4593,14 @@ def sec_recent():
                 entity = src.get("entity_name", "")
                 form_type = src.get("form_type", "")
                 filed = src.get("file_date", "")
-                search_url = f"https://www.sec.gov/cgi-bin/browse-edgar?company={requests.utils.quote(entity)}&CIK=&type={form_type}&dateb=&owner=include&count=5&search_text=&action=getcompany"
+                # Use ticker-based EDGAR company filing link (reliable)
+                filing_url = f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={ticker}&type={form_type}&dateb=&owner=include&count=5&search_text=&action=getcompany"
                 all_filings.append({
                     "ticker": ticker,
                     "form_type": form_type,
                     "entity": entity,
                     "filed_date": filed,
-                    "url": search_url,
+                    "url": filing_url,
                 })
         except Exception:
             pass

@@ -4019,10 +4019,12 @@ def ollama_chat():
 
     # Find the alert and its context
     context = ""
+    alert_ref = None
     with store.lock:
         for a in store.alerts:
             if a["id"] == alert_id:
-                context = f"Title: {a['title']}\nSource: {a['source_name']}\nSummary: {a.get('summary', '')}\nSnippet: {a.get('snippet', '')}"
+                context = f"Title: {a['title']}\nSource: {a['source_name']}\nURL: {a.get('url', '')}\nSummary: {a.get('summary', '')}\nSnippet: {a.get('snippet', '')}"
+                alert_ref = {"title": a.get("title", ""), "url": a.get("url", ""), "source": a.get("source_name", "")}
                 break
 
     if not context:
@@ -4076,7 +4078,8 @@ def ollama_chat():
                         break
             log_chat(alert_id, article_title, question, answer,
                      article_url=article_url, source_id=source_id_chat, keyword=keyword_chat)
-            return jsonify({"answer": answer})
+            refs = [alert_ref] if alert_ref else []
+            return jsonify({"answer": answer, "references": refs})
         return jsonify({"error": f"Ollama returned {resp.status_code}"}), 500
     except requests.exceptions.Timeout:
         log_system_event("ollama_timeout", "Per-article chat timeout",
@@ -4123,7 +4126,7 @@ def general_chat():
                          "should", "think", "your", "that", "this", "have", "from",
                          "they", "been", "with", "will", "does", "going")]
 
-        safe_cols = "title, summary, sentiment, source_name, published_at, keyword"
+        safe_cols = "title, url, summary, sentiment, source_name, published_at, keyword"
         try:
             c.execute("SELECT market_impact FROM articles LIMIT 1")
             safe_cols += ", market_impact"
@@ -4162,13 +4165,17 @@ def general_chat():
         recent_articles = []
         sentiment_24h = {}
 
+    # Build article reference list for citations
+    _chat_refs = []
+
     if matched_articles:
         context_parts.append("RELEVANT ARTICLES:")
         for a in matched_articles:
             impact = a.get("user_corrected_impact", "") or a.get("market_impact", "")
-            # Trim summaries aggressively
             summary = a.get("summary", "")[:100]
-            context_parts.append(f"- [{impact}] {a.get('title', '')} ({a.get('source_name', '')})")
+            ref_num = len(_chat_refs) + 1
+            _chat_refs.append({"n": ref_num, "title": a.get("title", ""), "url": a.get("url", ""), "source": a.get("source_name", "")})
+            context_parts.append(f"[{ref_num}] [{impact}] {a.get('title', '')} ({a.get('source_name', '')})")
             if summary:
                 context_parts.append(f"  {summary}")
 
@@ -4176,7 +4183,9 @@ def general_chat():
         context_parts.append("\nLATEST:")
         for a in recent_articles:
             impact = a.get("user_corrected_impact", "") or a.get("market_impact", "")
-            context_parts.append(f"- [{impact}] {a.get('title', '')} ({a.get('source_name', '')})")
+            ref_num = len(_chat_refs) + 1
+            _chat_refs.append({"n": ref_num, "title": a.get("title", ""), "url": a.get("url", ""), "source": a.get("source_name", "")})
+            context_parts.append(f"[{ref_num}] [{impact}] {a.get('title', '')} ({a.get('source_name', '')})")
 
     if sentiment_24h:
         pos = sentiment_24h.get("positive", 0)
@@ -4190,7 +4199,9 @@ def general_chat():
     if recent_alerts:
         context_parts.append("\nLIVE:")
         for a in recent_alerts:
-            context_parts.append(f"- [{a.get('market_impact', 'neutral')}] {a.get('title', '')} (via {a.get('source_name', '')})")
+            ref_num = len(_chat_refs) + 1
+            _chat_refs.append({"n": ref_num, "title": a.get("title", ""), "url": a.get("url", ""), "source": a.get("source_name", "")})
+            context_parts.append(f"[{ref_num}] [{a.get('market_impact', 'neutral')}] {a.get('title', '')} (via {a.get('source_name', '')})")
 
     context_str = "\n".join(context_parts) if context_parts else "No article data available yet."
 
@@ -4207,7 +4218,8 @@ def general_chat():
 
     prompt = (
         "You are a financial market analyst assistant with real-time news data. "
-        "Be concise and specific. Reference articles when relevant.\n\n"
+        "Be concise and specific. When referencing articles, cite them by their number like [1], [2], etc. "
+        "This helps the user find the source.\n\n"
         f"DATA:\n{context_str}\n"
     )
     if conv_text:
@@ -4239,6 +4251,7 @@ def general_chat():
                 "answer": answer,
                 "context_articles": len(matched_articles),
                 "recent_articles": len(recent_articles),
+                "references": _chat_refs,
             })
         return jsonify({"error": f"Ollama returned {resp.status_code}"}), 500
     except requests.exceptions.Timeout:

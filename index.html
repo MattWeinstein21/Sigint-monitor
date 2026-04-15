@@ -36,30 +36,32 @@ var h = React.useState, ue = React.useEffect;
 var API = window.location.port ? (window.location.protocol + "//" + window.location.hostname + ":" + window.location.port) : window.location.origin;
 
 var SRC = [
-  {id:"truthsocial",name:"Truth Social",icon:"📢",color:"#5448C8"},
+  {id:"truthsocial",name:"Truth Social",icon:"TS",color:"#5448C8"},
   {id:"x_twitter",name:"X / Twitter",icon:"𝕏",color:"#1DA1F2"},
-  {id:"reuters",name:"Reuters",icon:"◉",color:"#FF8000"},
-  {id:"ap_news",name:"AP News",icon:"◆",color:"#E4002B"},
-  {id:"bloomberg",name:"Bloomberg",icon:"▮",color:"#472F92"},
-  {id:"cnbc",name:"CNBC",icon:"▶",color:"#005594"},
-  {id:"wsj",name:"WSJ",icon:"▣",color:"#0274B6"},
-  {id:"foxnews",name:"Fox News",icon:"★",color:"#003366"},
-  {id:"cnn",name:"CNN",icon:"◼",color:"#CC0000"},
-  {id:"nytimes",name:"NYT",icon:"⬡",color:"#888"},
-  {id:"ft",name:"FT",icon:"▤",color:"#FCD0A1"},
-  {id:"marketwatch",name:"MarketWatch",icon:"◈",color:"#16A085"},
-  {id:"yahoo_finance",name:"Yahoo Finance",icon:"▶",color:"#7B0099"},
-  {id:"google_news",name:"Google News",icon:"◎",color:"#4285F4"},
-  {id:"whitehouse",name:"White House",icon:"🏛",color:"#3C3B6E"},
-  {id:"federal_register",name:"Fed Register",icon:"📜",color:"#B22234"},
-  {id:"congress",name:"Congress",icon:"⚖",color:"#002868"},
-  {id:"fed_reserve",name:"Fed Reserve",icon:"🏦",color:"#1B4D3E"},
-  {id:"treasury",name:"Treasury",icon:"💵",color:"#003366"},
-  {id:"eia",name:"EIA",icon:"⛽",color:"#2ECC71"},
-  {id:"opec",name:"OPEC",icon:"🛢",color:"#1ABC9C"},
-  {id:"coindesk",name:"CoinDesk",icon:"₿",color:"#F7931A"},
-  {id:"cointelegraph",name:"CoinTelegraph",icon:"₿",color:"#27AE60"},
-  {id:"newsapi",name:"NewsAPI",icon:"📰",color:"#E74C3C"},
+  {id:"reddit",name:"Reddit",icon:"r/",color:"#FF4500"},
+  {id:"reuters",name:"Reuters",icon:"R",color:"#FF8000"},
+  {id:"ap_news",name:"AP News",icon:"AP",color:"#E4002B"},
+  {id:"bloomberg",name:"Bloomberg",icon:"BB",color:"#472F92"},
+  {id:"cnbc",name:"CNBC",icon:"CNBC",color:"#005594"},
+  {id:"wsj",name:"WSJ",icon:"WSJ",color:"#0274B6"},
+  {id:"foxnews",name:"Fox News",icon:"FOX",color:"#003366"},
+  {id:"cnn",name:"CNN",icon:"CNN",color:"#CC0000"},
+  {id:"nytimes",name:"NYT",icon:"NYT",color:"#888"},
+  {id:"ft",name:"FT",icon:"FT",color:"#FCD0A1"},
+  {id:"marketwatch",name:"MarketWatch",icon:"MW",color:"#16A085"},
+  {id:"yahoo_finance",name:"Yahoo Finance",icon:"Y!",color:"#7B0099"},
+  {id:"google_news",name:"Google News",icon:"G",color:"#4285F4"},
+  {id:"google_news_dynamic",name:"Google News",icon:"G",color:"#4285F4"},
+  {id:"whitehouse",name:"White House",icon:"WH",color:"#3C3B6E"},
+  {id:"federal_register",name:"Fed Register",icon:"FR",color:"#B22234"},
+  {id:"congress",name:"Congress",icon:"CON",color:"#002868"},
+  {id:"fed_reserve",name:"Fed Reserve",icon:"FED",color:"#1B4D3E"},
+  {id:"treasury",name:"Treasury",icon:"UST",color:"#003366"},
+  {id:"eia",name:"EIA",icon:"EIA",color:"#2ECC71"},
+  {id:"opec",name:"OPEC",icon:"OPEC",color:"#1ABC9C"},
+  {id:"coindesk",name:"CoinDesk",icon:"CD",color:"#F7931A"},
+  {id:"cointelegraph",name:"CoinTelegraph",icon:"CT",color:"#27AE60"},
+  {id:"newsapi",name:"NewsAPI",icon:"API",color:"#E74C3C"},
 ];
 var SM = {}; SRC.forEach(function(s){SM[s.id]=s;});
 
@@ -219,7 +221,8 @@ function App(){
       var answer=d.answer||d.error||"No response";
       var meta="";
       if(d.context_articles)meta=" (referenced "+d.context_articles+" articles)";
-      sGcMsgs(function(p){return p.concat([{role:"ai",text:answer,meta:meta}])});
+      var refs=d.references||[];
+      sGcMsgs(function(p){return p.concat([{role:"ai",text:answer,meta:meta,refs:refs}])});
       sGcLoading(false);
     }).catch(function(){
       sGcMsgs(function(p){return p.concat([{role:"ai",text:"Failed to reach Ollama. Check that ollama_url is set in config.json and your GPU server is running."}])});
@@ -597,9 +600,9 @@ function App(){
             </div>}
             {ct==="sources"&&<div>
               <div style={{fontSize:10,fontWeight:600,color:"#666",letterSpacing:2,marginBottom:8,textTransform:"uppercase"}}>📰 News Sources</div>
-              {SRC.filter(function(s2){return SOCIAL_SOURCES.indexOf(s2.id)===-1}).map(function(s2){return <div key={s2.id} className="st" onClick={function(){sEs(function(p){return p.includes(s2.id)?p.filter(function(x){return x!==s2.id}):p.concat([s2.id])})}} style={{display:"flex",alignItems:"center",gap:10,padding:"5px 8px",borderRadius:6,background:es.includes(s2.id)?"#14141F":"transparent",opacity:es.includes(s2.id)?1:0.35,marginBottom:2}}><div style={{width:8,height:8,borderRadius:"50%",background:es.includes(s2.id)?s2.color:"#333"}}/><span style={{fontSize:11}}>{s2.icon} {s2.name}</span></div>})}
+              {SRC.filter(function(s2){return SOCIAL_SOURCES.indexOf(s2.id)===-1}).map(function(s2){return <div key={s2.id} className="st" onClick={function(){sEs(function(p){return p.includes(s2.id)?p.filter(function(x){return x!==s2.id}):p.concat([s2.id])})}} style={{display:"flex",alignItems:"center",gap:8,padding:"5px 8px",borderRadius:6,background:es.includes(s2.id)?"#14141F":"transparent",opacity:es.includes(s2.id)?1:0.35,marginBottom:2}}><span style={{fontSize:8,fontWeight:700,color:s2.color,background:s2.color+"18",padding:"2px 5px",borderRadius:3,minWidth:24,textAlign:"center",letterSpacing:0.5}}>{s2.icon}</span><span style={{fontSize:11,color:"#CCC"}}>{s2.name}</span></div>})}
               <div style={{fontSize:10,fontWeight:600,color:"#666",letterSpacing:2,marginBottom:8,marginTop:16,textTransform:"uppercase"}}>📢 Social Sources</div>
-              {SRC.filter(function(s2){return SOCIAL_SOURCES.indexOf(s2.id)!==-1}).map(function(s2){return <div key={s2.id} className="st" onClick={function(){sEs(function(p){return p.includes(s2.id)?p.filter(function(x){return x!==s2.id}):p.concat([s2.id])})}} style={{display:"flex",alignItems:"center",gap:10,padding:"5px 8px",borderRadius:6,background:es.includes(s2.id)?"#14141F":"transparent",opacity:es.includes(s2.id)?1:0.35,marginBottom:2}}><div style={{width:8,height:8,borderRadius:"50%",background:es.includes(s2.id)?s2.color:"#333"}}/><span style={{fontSize:11}}>{s2.icon} {s2.name}</span></div>})}
+              {SRC.filter(function(s2){return SOCIAL_SOURCES.indexOf(s2.id)!==-1}).map(function(s2){return <div key={s2.id} className="st" onClick={function(){sEs(function(p){return p.includes(s2.id)?p.filter(function(x){return x!==s2.id}):p.concat([s2.id])})}} style={{display:"flex",alignItems:"center",gap:8,padding:"5px 8px",borderRadius:6,background:es.includes(s2.id)?"#14141F":"transparent",opacity:es.includes(s2.id)?1:0.35,marginBottom:2}}><span style={{fontSize:8,fontWeight:700,color:s2.color,background:s2.color+"18",padding:"2px 5px",borderRadius:3,minWidth:24,textAlign:"center",letterSpacing:0.5}}>{s2.icon}</span><span style={{fontSize:11,color:"#CCC"}}>{s2.name}</span></div>})}
               <div style={{fontSize:9,color:"#444",marginTop:12}}>Enabled: {es.length}/{SRC.length}</div>
             </div>}
           </div>
@@ -669,7 +672,7 @@ function App(){
             {pageAlerts.map(function(a){var sr=SM[a.source]||{icon:"?",name:a.source_name||a.source,color:"#888"};var tn=a.article_tone||a.sentiment||"neutral";var im=a.market_impact||"neutral";var ic=iC[im]||"#8E8E93";var tc2=tC[tn]||"#8E8E93";var isX=exp.has(a.id);return <div key={a.id} className="arow" style={{display:"flex",gap:12,padding:"12px 20px",borderBottom:"1px solid #111118",borderLeft:"3px solid "+ic+"44"}}>
               <div style={{display:"flex",flexDirection:"column",alignItems:"center",gap:4,width:40,flexShrink:0,paddingTop:2}}>
                 <div style={{width:8,height:8,borderRadius:"50%",background:svC[a.severity]||"#888"}}/>
-                <span style={{fontSize:16}}>{sr.icon}</span>
+                <span style={{fontSize:9,fontWeight:700,color:sr.color,background:sr.color+"18",padding:"3px 5px",borderRadius:3,textAlign:"center",letterSpacing:0.5,lineHeight:1}}>{sr.icon}</span>
               </div>
               <div style={{flex:1,minWidth:0}}>
                 <div style={{display:"flex",gap:6,marginBottom:4}}>
@@ -690,11 +693,11 @@ function App(){
                     <div style={{fontSize:11,color:"#BBB",lineHeight:1.6,padding:"8px 10px",background:"#0F0F18",borderRadius:6,borderLeft:"2px solid "+ic+"66"}}>{a.summary}</div>
                     {/* Per-alert chat */}
                     <div style={{marginTop:8}}>
-                      {(ch[a.id]||[]).map(function(m,i){return <div key={i} className="cm" style={{display:"flex",justifyContent:m.role==="user"?"flex-end":"flex-start",marginBottom:6}}><div style={{maxWidth:"85%",padding:"6px 10px",borderRadius:m.role==="user"?"8px 8px 2px 8px":"8px 8px 8px 2px",background:m.role==="user"?"#5448C8":"#0A0A14",color:m.role==="user"?"#fff":"#AAA",fontSize:10,lineHeight:1.5,border:m.role==="user"?"none":"1px solid #1A1A25"}}>{m.role==="ai"&&<span style={{fontSize:8,color:"#8B80F0",marginRight:4}}>🤖</span>}{m.text}</div></div>})}
+                      {(ch[a.id]||[]).map(function(m,i){return <div key={i} className="cm" style={{display:"flex",justifyContent:m.role==="user"?"flex-end":"flex-start",marginBottom:6}}><div style={{maxWidth:"85%"}}><div style={{padding:"6px 10px",borderRadius:m.role==="user"?"8px 8px 2px 8px":"8px 8px 8px 2px",background:m.role==="user"?"#5448C8":"#0A0A14",color:m.role==="user"?"#fff":"#AAA",fontSize:10,lineHeight:1.5,border:m.role==="user"?"none":"1px solid #1A1A25"}}>{m.role==="ai"&&<span style={{fontSize:8,color:"#8B80F0",marginRight:4}}>🤖</span>}{m.text}</div>{m.refs&&m.refs.length>0&&m.refs[0].url&&<div style={{marginTop:3,padding:"3px 6px",background:"#0A0A12",borderRadius:4,border:"1px solid #1A1A25"}}><a href={m.refs[0].url} target="_blank" rel="noopener noreferrer" style={{fontSize:8,color:"#5A8FD4",textDecoration:"none"}}>📎 {m.refs[0].source||"Source"}: {(m.refs[0].title||"").substring(0,60)}</a></div>}</div></div>})}
                       {cl===a.id&&<div className="cm" style={{display:"flex",marginBottom:6}}><div style={{padding:"6px 10px",borderRadius:"8px 8px 8px 2px",background:"#0A0A14",border:"1px solid #1A1A25",fontSize:10,color:"#8B80F0"}}>🤖 <span className="thk">Thinking</span></div></div>}
                       <div style={{display:"flex",gap:4,marginTop:4}}>
-                        <input value={ci[a.id]||""} onChange={function(e){sCi(function(p){var n=Object.assign({},p);n[a.id]=e.target.value;return n})}} onKeyDown={function(e){if(e.key==="Enter"){var q=(ci[a.id]||"").trim();if(!q)return;sCi(function(p){var n=Object.assign({},p);n[a.id]="";return n});sCl(a.id);sCh(function(p){var n=Object.assign({},p);n[a.id]=(p[a.id]||[]).concat([{role:"user",text:q}]);return n});var hist=ch[a.id]||[];fetch(API+"/api/chat",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({alert_id:a.id,question:q,history:hist})}).then(function(r){return r.json()}).then(function(d){sCh(function(p){var n=Object.assign({},p);n[a.id]=(p[a.id]||[]).concat([{role:"ai",text:d.answer||d.error||"No response"}]);return n});sCl(null)}).catch(function(){sCh(function(p){var n=Object.assign({},p);n[a.id]=(p[a.id]||[]).concat([{role:"ai",text:"Failed"}]);return n});sCl(null)})}}} placeholder="Ask about this article..." disabled={cl===a.id} style={{flex:1,background:"#14141F",border:"1px solid #2A2A35",borderRadius:6,padding:"5px 8px",color:"#E8E8ED",fontSize:10,outline:"none",opacity:cl===a.id?0.5:1}}/>
-                        <button className="b" onClick={function(){var q=(ci[a.id]||"").trim();if(!q)return;sCi(function(p){var n=Object.assign({},p);n[a.id]="";return n});sCl(a.id);sCh(function(p){var n=Object.assign({},p);n[a.id]=(p[a.id]||[]).concat([{role:"user",text:q}]);return n});var hist=ch[a.id]||[];fetch(API+"/api/chat",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({alert_id:a.id,question:q,history:hist})}).then(function(r){return r.json()}).then(function(d){sCh(function(p){var n=Object.assign({},p);n[a.id]=(p[a.id]||[]).concat([{role:"ai",text:d.answer||d.error||"No response"}]);return n});sCl(null)}).catch(function(){sCh(function(p){var n=Object.assign({},p);n[a.id]=(p[a.id]||[]).concat([{role:"ai",text:"Failed"}]);return n});sCl(null)})}} disabled={cl===a.id} style={{background:"#5448C8",color:"#fff",padding:"5px 10px",borderRadius:6,fontSize:10}}>Ask</button>
+                        <input value={ci[a.id]||""} onChange={function(e){sCi(function(p){var n=Object.assign({},p);n[a.id]=e.target.value;return n})}} onKeyDown={function(e){if(e.key==="Enter"){var q=(ci[a.id]||"").trim();if(!q)return;sCi(function(p){var n=Object.assign({},p);n[a.id]="";return n});sCl(a.id);sCh(function(p){var n=Object.assign({},p);n[a.id]=(p[a.id]||[]).concat([{role:"user",text:q}]);return n});var hist=ch[a.id]||[];fetch(API+"/api/chat",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({alert_id:a.id,question:q,history:hist})}).then(function(r){return r.json()}).then(function(d){sCh(function(p){var n=Object.assign({},p);n[a.id]=(p[a.id]||[]).concat([{role:"ai",text:d.answer||d.error||"No response",refs:d.references||[]}]);return n});sCl(null)}).catch(function(){sCh(function(p){var n=Object.assign({},p);n[a.id]=(p[a.id]||[]).concat([{role:"ai",text:"Failed"}]);return n});sCl(null)})}}} placeholder="Ask about this article..." disabled={cl===a.id} style={{flex:1,background:"#14141F",border:"1px solid #2A2A35",borderRadius:6,padding:"5px 8px",color:"#E8E8ED",fontSize:10,outline:"none",opacity:cl===a.id?0.5:1}}/>
+                        <button className="b" onClick={function(){var q=(ci[a.id]||"").trim();if(!q)return;sCi(function(p){var n=Object.assign({},p);n[a.id]="";return n});sCl(a.id);sCh(function(p){var n=Object.assign({},p);n[a.id]=(p[a.id]||[]).concat([{role:"user",text:q}]);return n});var hist=ch[a.id]||[];fetch(API+"/api/chat",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({alert_id:a.id,question:q,history:hist})}).then(function(r){return r.json()}).then(function(d){sCh(function(p){var n=Object.assign({},p);n[a.id]=(p[a.id]||[]).concat([{role:"ai",text:d.answer||d.error||"No response",refs:d.references||[]}]);return n});sCl(null)}).catch(function(){sCh(function(p){var n=Object.assign({},p);n[a.id]=(p[a.id]||[]).concat([{role:"ai",text:"Failed"}]);return n});sCl(null)})}} disabled={cl===a.id} style={{background:"#5448C8",color:"#fff",padding:"5px 10px",borderRadius:6,fontSize:10}}>Ask</button>
                       </div>
                     </div>
                   </div>}
@@ -1018,9 +1021,17 @@ function App(){
 
           {gcMsgs.map(function(m,i){
             return <div key={i} className="cm" style={{display:"flex",justifyContent:m.role==="user"?"flex-end":"flex-start"}}>
-              <div style={{maxWidth:"85%",padding:"8px 12px",borderRadius:m.role==="user"?"12px 12px 2px 12px":"12px 12px 12px 2px",background:m.role==="user"?"#5448C8":"#14141F",color:m.role==="user"?"#fff":"#CCC",fontSize:11,lineHeight:1.6,border:m.role==="user"?"none":"1px solid #1A1A25",whiteSpace:"pre-wrap"}}>
-                {m.role==="ai"&&<div style={{fontSize:8,color:"#8B80F0",marginBottom:4,fontWeight:600}}>SIGINT AI{m.meta||""}</div>}
-                {m.text}
+              <div style={{maxWidth:"85%"}}>
+                <div style={{padding:"8px 12px",borderRadius:m.role==="user"?"12px 12px 2px 12px":"12px 12px 12px 2px",background:m.role==="user"?"#5448C8":"#14141F",color:m.role==="user"?"#fff":"#CCC",fontSize:11,lineHeight:1.6,border:m.role==="user"?"none":"1px solid #1A1A25",whiteSpace:"pre-wrap"}}>
+                  {m.role==="ai"&&<div style={{fontSize:8,color:"#8B80F0",marginBottom:4,fontWeight:600}}>SIGINT AI{m.meta||""}</div>}
+                  {m.text}
+                </div>
+                {m.refs&&m.refs.length>0&&<div style={{marginTop:4,padding:"4px 8px",background:"#0A0A12",borderRadius:6,border:"1px solid #1A1A25"}}>
+                  <div style={{fontSize:8,color:"#555",marginBottom:3,textTransform:"uppercase",letterSpacing:1}}>Sources</div>
+                  {m.refs.map(function(ref,ri){return ref.url?<a key={ri} href={ref.url} target="_blank" rel="noopener noreferrer" style={{display:"block",fontSize:9,color:"#5A8FD4",textDecoration:"none",marginBottom:2,lineHeight:1.4}}>
+                    <span style={{color:"#8B80F0",fontWeight:600}}>[{ref.n||ri+1}]</span> {ref.title||"Article"} <span style={{color:"#444"}}>— {ref.source||""}</span>
+                  </a>:null})}
+                </div>}
               </div>
             </div>;
           })}

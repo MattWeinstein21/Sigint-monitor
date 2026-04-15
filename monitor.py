@@ -18,6 +18,7 @@ import hashlib
 import logging
 import threading
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 import re
 import sqlite3
 from datetime import datetime, timezone, timedelta
@@ -957,7 +958,42 @@ def get_ollama_lane(config, lane="chat"):
     return url, model
 
 
-# Active chat counter — background enrichment yields when chat is active
+# ─── Ollama Concurrency Gate ────────────────────────────────────────────────
+# Single semaphore that serialises ALL Ollama calls (Phase 2 + Phase 3 + chat
+# + Layer-3 /explain).  One RTX 3060 cannot meaningfully parallelise two
+# large-model inference runs — concurrent requests just cause queue starvation
+# and OOM.  A single token (Semaphore(1)) guarantees at most one call at a time.
+# OLLAMA_MAX_CONCURRENT can be bumped to 2 if the Ollama host has two GPUs.
+OLLAMA_MAX_CONCURRENT = 1
+_ollama_semaphore = threading.Semaphore(OLLAMA_MAX_CONCURRENT)
+
+# Minimum gap (seconds) between consecutive Ollama calls.
+# Gives the GPU time to flush KV cache and keeps VRAM pressure low.
+OLLAMA_INTER_CALL_GAP = 0.5
+_ollama_last_call_lock = threading.Lock()
+_ollama_last_call_ts   = 0.0
+
+def _ollama_call_guard():
+    """Acquire the semaphore AND enforce the inter-call cooldown.
+    Call this before every request.post() to Ollama.
+    Must be paired with _ollama_call_release()."""
+    _ollama_semaphore.acquire()
+    # Enforce minimum gap after the previous call finished
+    with _ollama_last_call_lock:
+        global _ollama_last_call_ts
+        wait = OLLAMA_INTER_CALL_GAP - (time.time() - _ollama_last_call_ts)
+    if wait > 0:
+        time.sleep(wait)
+
+def _ollama_call_release():
+    """Record finish timestamp and release the semaphore."""
+    with _ollama_last_call_lock:
+        global _ollama_last_call_ts
+        _ollama_last_call_ts = time.time()
+    _ollama_semaphore.release()
+
+# Active user-facing chat counter — background workers yield when chat is active
+# (kept for worker scheduling; actual concurrency is handled by _ollama_semaphore)
 _chat_active = 0
 _chat_active_lock = threading.Lock()
 
@@ -1227,6 +1263,389 @@ def record_duplicate_skip(source_id):
 _load_source_stats()
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# THREE-LAYER AI ARCHITECTURE
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# Layer 1 — Broad collection + cheap lexicon triage (ALL alerts, no Ollama)
+#   - keyword matching, entity extraction, ticker linking
+#   - lexicon sentiment + independent market-impact scoring
+#   - attention score (0-100) computed on every alert
+#   - incident/duplicate clustering
+#
+# Layer 2 — Automatic AI for high-value items only
+#   - triggered when: attention_score >= AI_AUTO_THRESHOLD OR watchlist hit OR
+#     report_count >= AI_INCIDENT_THRESHOLD
+#   - generates incident-level synthesis (not per-article summaries)
+#   - output: why_it_matters, affected_tickers, what_changed, what_uncertain
+#   - cached: once generated, reused across all duplicate/related alerts
+#
+# Layer 3 — On-demand AI for user-driven depth
+#   - triggered by explicit user action (Explain, Summarize buttons)
+#   - existing /api/chat remains for follow-up questions
+#   - new /api/alerts/<id>/explain for richer on-demand intelligence
+#
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ─── Layer 2 gate thresholds ──────────────────────────────────────────────────
+AI_AUTO_THRESHOLD     = 65  # attention_score >= this triggers auto Layer-2 AI
+AI_INCIDENT_THRESHOLD = 3   # report_count >= this also triggers auto Layer-2 AI
+AI_MAX_AUTO_PER_CYCLE = 5   # max Phase-3 intelligence jobs fired per poll cycle
+
+# Per-cycle Phase-3 counter. Reset at the start of each monitor_loop iteration
+# so the cap is applied per polling window (not per process lifetime).
+_auto_intel_this_cycle   = 0
+_auto_intel_cycle_lock   = threading.Lock()
+
+# ─── AI output cache ─────────────────────────────────────────────────────────
+# Maps alert_id → {"intelligence": {...}, "generated_at": iso_ts, "source": "auto"|"user"}
+# Keyed by the canonical alert id. Duplicate-merged alerts share via incident_id.
+_ai_intel_cache = {}        # alert_id → intelligence dict
+_ai_intel_lock  = threading.Lock()
+_incident_id_map = {}       # alert_id → incident_id (canonical id for the cluster)
+_incident_id_lock = threading.Lock()
+
+
+def _get_intel_cache(alert_id):
+    """Return cached intelligence for alert_id, following incident_id redirect."""
+    with _ai_intel_lock:
+        canonical = _incident_id_map.get(alert_id, alert_id)
+        return _ai_intel_cache.get(canonical)
+
+
+def _set_intel_cache(alert_id, intel, source="auto"):
+    with _ai_intel_lock:
+        canonical = _incident_id_map.get(alert_id, alert_id)
+        _ai_intel_cache[canonical] = {
+            "intelligence": intel,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "source": source,
+        }
+
+
+def _link_duplicate_to_incident(duplicate_id, canonical_id):
+    """When a duplicate is merged, point it at the canonical alert's cache."""
+    with _ai_intel_lock:
+        _incident_id_map[duplicate_id] = canonical_id
+
+
+def _should_auto_ai(alert):
+    """Layer 2 gate: return True if this alert warrants automatic AI synthesis.
+
+    Triggers:
+      1. attention_score >= AI_AUTO_THRESHOLD (high-priority signal)
+      2. report_count   >= AI_INCIDENT_THRESHOLD (multi-source incident confirmation)
+      3. Direct watchlist-ticker hit (any affected ticker is in the user's holdings)
+
+    All three conditions are checked against the cache first — if we already
+    have intelligence for this alert (or its canonical incident), skip.
+    """
+    if alert.get("is_duplicate"):
+        return False
+    if _get_intel_cache(alert["id"]):
+        return False   # already have cached intelligence
+    score = alert.get("attention_score", 0)
+    if score >= AI_AUTO_THRESHOLD:
+        return True
+    if alert.get("report_count", 1) >= AI_INCIDENT_THRESHOLD:
+        return True
+    # Watchlist hit: any affected ticker is in the user's current holdings
+    try:
+        wl_tickers = {item["symbol"].upper() for item in load_watchlist()}
+        affected = {t.upper() for t in alert.get("affected_tickers", [])}
+        if affected & wl_tickers:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+# Single-source template (Layer 3 on-demand, low-priority alerts with one report)
+INTEL_PROMPT_TEMPLATE = """\
+You are a financial intelligence analyst. Given the article below, produce a concise intelligence assessment.
+
+Article title: {title}
+Source: {source}
+Keyword: {keyword}
+Text: {text}
+
+Respond ONLY with valid JSON, no markdown, no explanation:
+{{"why_it_matters": "1-2 sentences: what is the market significance of this event",
+  "affected_sectors": ["sector1", "sector2"],
+  "what_changed": "what is new versus general background knowledge (or 'not specified' if unclear)",
+  "what_uncertain": "what is still unknown or unconfirmed (or 'nothing noted' if clear-cut)",
+  "relevance_type": "direct|second_order|macro",
+  "watch_next": "what development to monitor next",
+  "confidence": 0.0
+}}"""
+
+# Multi-source incident template (Layer 2 auto, used when report_count >= 2)
+# Synthesises across multiple reports rather than summarising a single article.
+INTEL_INCIDENT_PROMPT_TEMPLATE = """\
+You are a financial intelligence analyst. The same event has been reported by {source_count} different sources. \
+Synthesize across ALL reports to produce a single, authoritative intelligence assessment.
+
+Event keyword: {keyword}
+Primary title: {title}
+Sources reporting: {sources}
+
+--- REPORTS ---
+{reports_text}
+--- END REPORTS ---
+
+Respond ONLY with valid JSON, no markdown, no explanation:
+{{"why_it_matters": "1-2 sentences: what is the market significance of this event",
+  "affected_sectors": ["sector1", "sector2"],
+  "what_changed": "what is new versus general background knowledge (or 'not specified' if unclear)",
+  "what_uncertain": "what is still unknown or unconfirmed across the reports (or 'nothing noted' if consistent)",
+  "source_consensus": "do the sources agree, or are there meaningful discrepancies?",
+  "relevance_type": "direct|second_order|macro",
+  "watch_next": "what development to monitor next",
+  "confidence": 0.0
+}}"""
+
+
+def _generate_intelligence(alert_id, title, source_name, keyword, text, ollama_url, model,
+                           cluster_reports=None):
+    """Call Ollama to generate Layer-2/3 intelligence synthesis. Returns dict or None.
+
+    All calls go through _ollama_call_guard() so they are serialised with
+    Phase-2 classification calls and user-facing chat. This prevents the GPU
+    from being hit with concurrent large-model inference requests.
+
+    cluster_reports: optional list of dicts with keys {source, text} representing
+        additional reports on the same incident. When provided (report_count >= 2),
+        uses INTEL_INCIDENT_PROMPT_TEMPLATE to synthesise across all sources instead
+        of summarising a single article. Each report text is truncated to 600 chars
+        so the total prompt stays well within the model's context window.
+    """
+    if cluster_reports and len(cluster_reports) >= 1:
+        # Multi-source incident synthesis
+        all_sources = [source_name] + [r["source"] for r in cluster_reports]
+        reports_parts = [f"[{source_name}]\n{text[:600]}"]
+        for r in cluster_reports:
+            reports_parts.append(f"[{r['source']}]\n{r['text'][:600]}")
+        prompt = INTEL_INCIDENT_PROMPT_TEMPLATE.format(
+            source_count=len(all_sources),
+            keyword=keyword,
+            title=title[:200],
+            sources=", ".join(all_sources),
+            reports_text="\n\n".join(reports_parts),
+        )
+    else:
+        prompt = INTEL_PROMPT_TEMPLATE.format(
+            title=title[:200],
+            source=source_name,
+            keyword=keyword,
+            text=text[:1800],
+        )
+    try:
+        _ollama_call_guard()
+        try:
+            resp = requests.post(
+                f"{ollama_url.rstrip('/')}/api/generate",
+                json={
+                    "model": model,
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {"num_predict": 512, "temperature": 0.1},
+                },
+                timeout=60,
+            )
+        finally:
+            _ollama_call_release()
+
+        if resp.status_code != 200:
+            log.warning(f"Intelligence generation: Ollama returned {resp.status_code} for alert {alert_id}")
+            return None
+        raw = resp.json().get("response", "")
+        # Strip think tags if present (qwen3.5 / reasoning models)
+        raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
+        # Extract JSON
+        m = re.search(r"\{.*\}", raw, re.DOTALL)
+        if not m:
+            return None
+        parsed = json.loads(m.group(0))
+        required = {"why_it_matters", "what_changed", "relevance_type"}
+        if not required.issubset(parsed.keys()):
+            return None
+        return parsed
+    except Exception as e:
+        log.warning(f"Intelligence generation failed for alert {alert_id}: {e}")
+        return None
+
+
+# ─── For You scoring ─────────────────────────────────────────────────────────
+
+# Reason-label templates for UI display
+FOR_YOU_REASONS = {
+    "watchlist_direct":  "Matches your watchlist",
+    "watchlist_sector":  "Related sector to your holdings",
+    "keyword_match":     "Matches your tracked keyword",
+    "high_priority":     "High-priority signal",
+    "multi_confirmed":   "Confirmed by multiple sources",
+    "macro_adjacent":    "Macro signal with likely second-order effect",
+    "recent_topic":      "Related to your recent AI question",
+    "watchlist_ticker":  "Directly mentions your holdings",
+}
+
+# Broad macro/sector keywords that signal second-order effects
+MACRO_KEYWORDS = {
+    "federal reserve", "fed", "interest rate", "rate cut", "rate hike",
+    "inflation", "cpi", "ppi", "gdp", "unemployment", "jobs", "payroll",
+    "treasury", "yield", "recession", "tariff", "trade war", "sanctions",
+    "oil", "energy", "dollar", "dxy", "vix", "volatility",
+}
+
+SECTOR_TICKER_MAP = {
+    "tech":         {"AAPL", "MSFT", "NVDA", "GOOGL", "META", "AMD", "INTC", "TSLA", "AMZN"},
+    "finance":      {"JPM", "BAC", "GS", "MS", "WFC", "C", "BRK", "V", "MA"},
+    "energy":       {"XOM", "CVX", "COP", "SLB", "OXY", "VLO", "MPC"},
+    "healthcare":   {"JNJ", "UNH", "PFE", "ABBV", "MRK", "LLY", "TMO"},
+    "consumer":     {"WMT", "COST", "TGT", "HD", "NKE", "MCD", "SBUX"},
+    "crypto":       {"BTC", "ETH", "SOL", "COIN", "MSTR"},
+}
+
+
+def _get_sector_for_ticker(ticker):
+    t = ticker.upper()
+    for sector, tickers in SECTOR_TICKER_MAP.items():
+        if t in tickers:
+            return sector
+    return None
+
+
+def _score_for_you(alert, watchlist_tickers, watchlist_sectors, recent_topics, monitored_keywords=None):
+    """
+    Compute a For You relevance score (0-100) and a reason label.
+    Returns (score, reason_key, is_adjacent).
+
+    monitored_keywords: list of strings from the user's config (the actual keyword
+    watchlist), used for keyword_match reason. Distinct from watchlist_tickers
+    (the stock/ETF holdings list).
+    """
+    score = 0.0
+    reason_key = None
+    is_adjacent = False
+    monitored_keywords = monitored_keywords or []
+
+    title_lower = (alert.get("title") or "").lower()
+    kw = (alert.get("keyword") or "").lower()
+    affected = {t.upper() for t in alert.get("affected_tickers", [])}
+    attn = alert.get("attention_score", 0)
+
+    # 1. Direct watchlist ticker hit (strongest signal)
+    if affected & watchlist_tickers:
+        score += 40
+        reason_key = "watchlist_ticker"
+
+    # 2. Alert's trigger keyword is one the user explicitly monitors.
+    # Compare against the actual keywords list from config, not watchlist tickers.
+    if kw and monitored_keywords:
+        if any(kw == mk.lower() or kw in mk.lower() or mk.lower() in kw
+               for mk in monitored_keywords):
+            score += 20
+            if not reason_key:
+                reason_key = "keyword_match"
+
+    # 3. Sector overlap with watchlist holdings
+    if not reason_key:
+        for t in watchlist_tickers:
+            sec = _get_sector_for_ticker(t)
+            if sec and sec in watchlist_sectors:
+                # check if alert affects that sector
+                if any(sec in _get_sector_for_ticker(at) or "" for at in affected):
+                    score += 20
+                    reason_key = "watchlist_sector"
+                    is_adjacent = True
+                    break
+
+    # 4. Macro signal that has broad second-order effects
+    if not reason_key:
+        text_check = f"{title_lower} {kw}"
+        if any(mk in text_check for mk in MACRO_KEYWORDS):
+            score += 15
+            reason_key = "macro_adjacent"
+            is_adjacent = True
+
+    # 5. Recent AI topic match
+    if recent_topics:
+        for topic in recent_topics:
+            if any(w in title_lower for w in topic.lower().split() if len(w) > 4):
+                score += 15
+                if not reason_key:
+                    reason_key = "recent_topic"
+                break
+
+    # 6. High attention score bonus
+    if attn >= AI_AUTO_THRESHOLD:
+        score += 15
+        if not reason_key:
+            reason_key = "high_priority"
+
+    # 7. Multi-source confirmation
+    if alert.get("report_count", 1) >= 3:
+        score += 10
+        if not reason_key:
+            reason_key = "multi_confirmed"
+
+    # 8. Base attention blended in (max 20 additional points)
+    score += min(20, attn * 0.2)
+
+    return min(100, round(score, 1)), reason_key, is_adjacent
+
+
+def _build_for_you(alerts, watchlist, recent_topics=None, monitored_keywords=None):
+    """
+    Select and rank the For You feed from the current alert pool.
+    Returns list of dicts: {alert, fy_score, reason_key, reason_label, is_adjacent}
+    """
+    recent_topics = recent_topics or []
+    # Load monitored keywords from config if not provided (allows caller to pass
+    # pre-loaded config keywords to avoid a redundant disk read)
+    if monitored_keywords is None:
+        try:
+            monitored_keywords = [normalize_whitespace(k).lower()
+                                   for k in load_config().get("keywords", []) if k]
+        except Exception:
+            monitored_keywords = []
+    watchlist_tickers = {item["symbol"].upper() for item in watchlist}
+    watchlist_sectors = set()
+    for t in watchlist_tickers:
+        sec = _get_sector_for_ticker(t)
+        if sec:
+            watchlist_sectors.add(sec)
+
+    candidates = []
+    for a in alerts:
+        if a.get("is_duplicate"):
+            continue
+        fy_score, reason_key, is_adjacent = _score_for_you(
+            a, watchlist_tickers, watchlist_sectors, recent_topics,
+            monitored_keywords=monitored_keywords,
+        )
+        if fy_score >= 10 or reason_key:  # minimum bar to appear
+            candidates.append({
+                "alert": a,
+                "fy_score": fy_score,
+                "reason_key": reason_key or "high_priority",
+                "reason_label": FOR_YOU_REASONS.get(reason_key or "high_priority", "Relevant signal"),
+                "is_adjacent": is_adjacent,
+            })
+
+    # Sort by fy_score descending
+    candidates.sort(key=lambda x: x["fy_score"], reverse=True)
+
+    # Enforce 70/30 direct vs adjacent split (max 20 items total)
+    direct  = [c for c in candidates if not c["is_adjacent"]]
+    adjacent = [c for c in candidates if c["is_adjacent"]]
+    direct_cap  = 14
+    adjacent_cap = 6
+    result = direct[:direct_cap] + adjacent[:adjacent_cap]
+    result.sort(key=lambda x: x["fy_score"], reverse=True)
+    return result[:20]
+
+
 class AlertStore:
     """Thread-safe in-memory alert store with deduplication and async AI enrichment."""
 
@@ -1241,7 +1660,11 @@ class AlertStore:
         # Chat lane config (used by worker 2 when chat is idle)
         self.ollama_chat_url = ""
         self.ollama_chat_model = "llama3"
-        self._ai_queue = deque(maxlen=100)
+        # Use an unbounded deque + explicit cap so we can log when items are dropped
+        # rather than silently losing them. Capacity of 200 covers burst ingestion.
+        self._ai_queue = deque()
+        self._AI_QUEUE_CAP = 200
+        self._ai_queue_dropped = 0  # counter for monitoring
         self._ai_lock = threading.Lock()
         # Worker 1: analysis lane (always runs, yields to chat)
         self._ai_thread = threading.Thread(target=self._ai_worker, args=("analysis",), daemon=True)
@@ -1272,19 +1695,34 @@ class AlertStore:
 
     def _ai_worker(self, role="analysis"):
         """Background worker for AI enrichment.
-        role='analysis': uses analysis lane, yields only during active chat.
-        role='chat_assist': uses chat lane model for analysis, pauses entirely during chat."""
+
+        Concurrency model (v2.0.5+):
+          - A single _ollama_semaphore(1) serialises ALL Ollama calls globally
+            (Phase 2, Phase 3, chat, /explain). Workers do NOT need to race;
+            they simply block on _ollama_call_guard() inside _enrich_with_ai.
+          - role='analysis': primary worker, uses the analysis-lane model/URL.
+          - role='chat_assist': secondary worker, uses the chat-lane model but
+            only processes jobs when chat is completely idle AND the chat-lane
+            URL is configured. This avoids contending with interactive users.
+
+        The workers deliberately have a single shared queue. Concurrency is
+        governed by the semaphore, not by worker count. Adding more workers
+        would only increase queue-pop contention without improving throughput
+        on a single-GPU host.
+        """
         while True:
             with _chat_active_lock:
                 chat_busy = _chat_active > 0
 
             if role == "chat_assist":
-                # Chat-assist worker: only runs when chat is completely idle
+                # Secondary worker: stay fully idle while any chat is in-flight
+                # or when the chat-lane URL is not configured.
                 if chat_busy or not self.ollama_chat_url:
                     time.sleep(2)
                     continue
             else:
-                # Analysis worker: yields briefly during chat, doesn't fully stop
+                # Primary worker: back off briefly during chat so the user
+                # request can acquire the semaphore sooner.
                 if chat_busy:
                     time.sleep(1)
                     continue
@@ -1292,10 +1730,21 @@ class AlertStore:
             job = None
             with self._ai_lock:
                 if self._ai_queue:
+                    # Re-sort by _priority descending before popping so that
+                    # duplicate-merges that bumped report_count (and thus raised
+                    # the priority of an existing job) are processed first.
+                    # This is O(n log n) on the queue length but the queue is
+                    # capped at AI_QUEUE_CAP=200 so it is negligible.
+                    sorted_jobs = sorted(
+                        self._ai_queue,
+                        key=lambda j: j.get("_priority", 0),
+                        reverse=True,
+                    )
+                    self._ai_queue.clear()
+                    self._ai_queue.extend(sorted_jobs)
                     job = self._ai_queue.popleft()
             if job:
                 try:
-                    # Choose which model to use based on role
                     if role == "chat_assist":
                         job["_use_chat_lane"] = True
                     self._enrich_with_ai(job)
@@ -1305,7 +1754,16 @@ class AlertStore:
                 time.sleep(2)
 
     def _enrich_with_ai(self, job):
-        """Fetch article (if needed), run Ollama analysis, ensemble with lexicon, update alert."""
+        """Fetch article (if needed), run Ollama analysis, ensemble with lexicon, update alert.
+
+        Architecture:
+          - Phase 1: Article fetch + lexicon refinement (ALL queued alerts)
+          - Phase 2: Ollama classification (ALL queued alerts — lightweight structured JSON)
+          - Phase 3: Intelligence synthesis (Layer-2 gate: high-score/confirmed items only)
+
+        Phase 3 is the selective gate. Not every alert gets intelligence synthesis;
+        only those above AI_AUTO_THRESHOLD or with report_count >= AI_INCIDENT_THRESHOLD.
+        """
         alert_id = job["alert_id"]
         source_id = job["source_id"]
         keyword = job["keyword"]
@@ -1359,10 +1817,11 @@ class AlertStore:
                         break
             return
 
-        # Phase 2: Run Ollama
+        # Phase 2: Run Ollama classification (lightweight structured JSON — all queued alerts)
         llm_result, raw_response, success = ollama_analyze(
             analysis_text, active_url, active_model, keyword=keyword
         )
+        _alert_snap = {}  # will be populated inside the lock; used by Phase 3
 
         with self.lock:
             for alert in self.alerts:
@@ -1488,7 +1947,89 @@ class AlertStore:
                     disagree = " ⚡DISAGREE" if lexicon_tone != llm_tone and lexicon_tone != "neutral" else ""
                     impact_disagree = " ⚡IMPACT" if lexicon_impact != llm_impact and lexicon_impact != "neutral" else ""
                     log.info(f"🤖{emoji}{disagree}{impact_disagree} [{method}] tone={final_tone} impact={final_impact} conf={alert['confidence']} → {alert['title'][:55]}")
+
+                    # ─── Phase 3: Layer-2 intelligence synthesis (selective gate) ───
+                    # Only runs for high-priority / multi-confirmed items.
+                    # Generates why_it_matters, what_changed, etc. instead of
+                    # generic summaries. Output is cached and shared across
+                    # all duplicate/related alerts in the same incident cluster.
+                    _alert_snap = alert.copy()  # snapshot before releasing lock
                     break
+
+        # Phase 3 runs OUTSIDE the store lock to avoid holding it during Ollama call.
+        # Check per-cycle cap before committing to an intelligence call.
+        if success and _should_auto_ai(_alert_snap):
+            global _auto_intel_this_cycle
+            _run_phase3 = False
+            with _auto_intel_cycle_lock:
+                if _auto_intel_this_cycle >= AI_MAX_AUTO_PER_CYCLE:
+                    log.debug(
+                        f"Phase-3 cap reached ({AI_MAX_AUTO_PER_CYCLE}/cycle) "
+                        f"— skipping intel for alert {alert_id}"
+                    )
+                else:
+                    _auto_intel_this_cycle += 1
+                    _run_phase3 = True
+            if _run_phase3:
+                # Build cluster_reports with REAL per-source article text.
+                # cluster_sources was populated at merge time with {source_name, url, snippet}
+                # for each confirming source. We now fetch each URL concurrently
+                # (ThreadPoolExecutor, max 3 workers) so the Ollama prompt receives
+                # genuinely distinct evidence from each source rather than the same
+                # in-memory snapshot repeated N times.
+                #
+                # Fetch strategy per cluster member:
+                #   1. Try fetch_article_text(url) — full article if accessible
+                #   2. Fall back to stored snippet if fetch fails/paywalled
+                #   3. Fall back to primary alert snippet if snippet is also empty
+                # Each fetched text is capped at 600 chars in the prompt to keep
+                # total prompt size within the model's context window.
+                raw_cluster = _alert_snap.get("cluster_sources", [])
+
+                def _fetch_cluster_member(cs):
+                    """Fetch article text for one cluster member. Returns {source, text}."""
+                    text = cs.get("snippet") or _alert_snap.get("snippet", "") or _alert_snap.get("title", "")
+                    member_url = cs.get("url", "")
+                    if member_url:
+                        try:
+                            fetched, ok = fetch_article_text(member_url, timeout=12)
+                            if ok and fetched and len(fetched) > len(text):
+                                text = fetched
+                        except Exception:
+                            pass  # keep snippet fallback
+                    return {"source": cs["source_name"], "text": text}
+
+                cluster_reports = []
+                if raw_cluster:
+                    # Cap at 4 cluster members to bound total prompt size
+                    # (primary + 4 = 5 sources max ≈ 5 × 600 = 3000 chars of evidence)
+                    members_to_fetch = raw_cluster[:4]
+                    with ThreadPoolExecutor(max_workers=min(3, len(members_to_fetch))) as pool:
+                        cluster_reports = list(pool.map(_fetch_cluster_member, members_to_fetch))
+
+                is_incident = len(cluster_reports) >= 1
+                intel = _generate_intelligence(
+                    alert_id=alert_id,
+                    title=_alert_snap.get("title", ""),
+                    source_name=_alert_snap.get("source_name", ""),
+                    keyword=keyword,
+                    text=analysis_text,
+                    ollama_url=active_url,
+                    model=active_model,
+                    cluster_reports=cluster_reports if is_incident else None,
+                )
+                if intel:
+                    _set_intel_cache(alert_id, intel, source="auto")
+                    with self.lock:
+                        for a in self.alerts:
+                            if a["id"] == alert_id:
+                                a["intelligence"] = intel
+                                a["intelligence_source"] = "auto"
+                                a["intelligence_at"] = datetime.now(timezone.utc).isoformat()
+                                break
+                n_sources = 1 + len(cluster_reports)
+                synthesis_type = f"incident/{n_sources}-sources" if is_incident else "single-source"
+                log.info(f"🧠 [Layer-2/{synthesis_type}] Intelligence generated for alert {alert_id}: {_alert_snap.get('title', '')[:55]}")
 
     def add(self, source_id, source_name, title, url, snippet, keyword, severity="medium", published_at=None):
         if not title or not is_valid_source_url(url):
@@ -1513,7 +2054,23 @@ class AlertStore:
                             also.append(source_name)
                             a["also_reported_by"] = also
                             a["report_count"] = a.get("report_count", 1) + 1
+                            # Store per-source evidence for true multi-source synthesis.
+                            # Keyed by source_name to prevent double-appending on
+                            # repeated hash collisions from the same source.
+                            cs = a.get("cluster_sources", [])
+                            if not any(c["source_name"] == source_name for c in cs):
+                                cs.append({
+                                    "source_name": source_name,
+                                    "url": url.strip(),
+                                    "snippet": (snippet or "").strip()[:500],
+                                })
+                                a["cluster_sources"] = cs
+                        # Refresh last_seen_at so recency decay resets for developing stories
+                        a["last_seen_at"] = datetime.now(timezone.utc).isoformat()
                         break
+                # Link new alert URL to canonical alert's intelligence cache
+                new_h = self._hash(source_id, title, re.sub(r'[?#].*$', '', url.strip()))
+                _link_duplicate_to_incident(new_h, dup_id)
                 log.debug(f"Semantic dup merged: '{title[:50]}' → existing alert {dup_id}")
                 return False
 
@@ -1570,6 +2127,10 @@ class AlertStore:
                 # Duplicate tracking
                 "report_count": 1,
                 "also_reported_by": [],
+                # Per-source cluster data for true multi-source incident synthesis.
+                # Each entry: {source_name, url, snippet}. The primary source is
+                # NOT in this list (it is the alert itself). Populated at merge time.
+                "cluster_sources": [],
                 # AI fields — populated async
                 "summary": fallback_summary,
                 "ai_summary": False,
@@ -1584,6 +2145,8 @@ class AlertStore:
                 "published_at_utc": pub_utc,
                 "source_reliability": word_result.get("source_reliability", 0.5),
                 "timestamp": datetime.now(timezone.utc).isoformat(),
+                # last_seen_at updates on every duplicate confirmation; used for recency decay
+                "last_seen_at": datetime.now(timezone.utc).isoformat(),
             }
             self.alerts.insert(0, alert)
             if len(self.alerts) > self.max_alerts:
@@ -1600,29 +2163,59 @@ class AlertStore:
 
         # Queue background fetch + AI enrichment (article text fetched async)
         if self.ollama_url:
+            # Compute full attention score now (alert is already in self.alerts)
+            # so the queue prioritises on the same model used by get_all(),
+            # not just the raw confidence value.
+            try:
+                _wl = self._get_watchlist_tickers()
+                _full_priority = self._compute_attention(alert, _wl)
+            except Exception:
+                _full_priority = word_result.get("confidence", 0.3) * 20  # fallback
+            job = {
+                "alert_id": alert_id,
+                "url": url,
+                "snippet_text": quick_text,
+                "source_id": source_id,
+                "keyword": keyword,
+                "needs_fetch": True,
+                # Full 0-100 attention score (severity + confidence + recency +
+                # confirmation + watchlist + source_reliability)
+                "_priority": _full_priority,
+            }
             with self._ai_lock:
-                self._ai_queue.append({
-                    "alert_id": alert_id,
-                    "url": url,
-                    "snippet_text": quick_text,
-                    "source_id": source_id,
-                    "keyword": keyword,
-                    "needs_fetch": True,
-                })
+                if len(self._ai_queue) >= self._AI_QUEUE_CAP:
+                    # Drop the lowest-priority item rather than the newest/oldest arbitrarily
+                    min_idx = min(range(len(self._ai_queue)),
+                                  key=lambda i: self._ai_queue[i].get("_priority", 0))
+                    dropped = self._ai_queue[min_idx]
+                    del self._ai_queue[min_idx]
+                    self._ai_queue_dropped += 1
+                    log.warning(
+                        f"AI queue full ({self._AI_QUEUE_CAP}): dropped alert "
+                        f"{dropped.get('alert_id')} (priority={dropped.get('_priority', 0):.2f}). "
+                        f"Total dropped this session: {self._ai_queue_dropped}"
+                    )
+                self._ai_queue.append(job)
         return True
 
-    def get_all(self, since=None, limit=None):
+    def get_all(self, since=None, limit=None, sort="time"):
         with self.lock:
-            items = self.alerts
+            items = list(self.alerts)  # snapshot
             if since:
                 items = [a for a in items if a["timestamp"] > since]
-            # Compute attention scores (0-100) for every alert before returning
+            # Compute attention scores (0-100) for every alert before applying limit
             wl_tickers = self._get_watchlist_tickers()
             for a in items:
                 a["attention_score"] = self._compute_attention(a, wl_tickers)
+            # Sort BEFORE limit so the limit trims the lowest-priority tail,
+            # not the oldest tail. Default: newest-first (time). score=priority-first.
+            if sort == "score":
+                items.sort(key=lambda x: x.get("attention_score", 0), reverse=True)
+            else:
+                items.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
             if limit is not None:
                 items = items[:limit]
-            return list(items)
+            return items
 
     def _get_watchlist_tickers(self):
         try:
@@ -1649,10 +2242,17 @@ class AlertStore:
         score += sev_map.get(alert.get("severity", "medium"), 10)
         score += alert.get("confidence", 0.3) * 20
         try:
-            pub = alert.get("published_at_utc") or alert.get("timestamp", "")
-            if pub:
-                age_h = (datetime.now(timezone.utc) - datetime.fromisoformat(pub.replace("Z", "+00:00"))).total_seconds() / 3600
-                score += max(0, 20 * (0.5 ** (age_h / 2)))
+            # Use last_seen_at for recency so developing stories that keep
+            # getting reconfirmed don't decay like stale news.
+            freshness_ts = (
+                alert.get("last_seen_at")
+                or alert.get("published_at_utc")
+                or alert.get("timestamp", "")
+            )
+            if freshness_ts:
+                age_h = (datetime.now(timezone.utc) - datetime.fromisoformat(freshness_ts.replace("Z", "+00:00"))).total_seconds() / 3600
+                # Half-life 4h (was 2h) — keeps actionable items visible longer
+                score += max(0, 20 * (0.5 ** (age_h / 4)))
         except Exception:
             score += 5
         rc = alert.get("report_count", 1)
@@ -2534,6 +3134,70 @@ DEFAULT_SIGNAL_SETS = {
     },
 }
 
+# Market-impact words that can diverge from article tone.
+# "neutral tone, bearish impact" e.g. factual reporting that rates will be hiked.
+# "negative tone, bullish impact" e.g. alarmed reporting about short-sellers.
+MARKET_IMPACT_LEXICON = {
+    "bullish": {
+        # Direct price-up signals
+        "rate cut": 3.0, "rate cuts": 3.0, "cut rates": 3.0, "dovish": 2.5,
+        "stimulus": 2.5, "quantitative easing": 2.5, "qe": 2.0,
+        "buyback": 2.0, "share repurchase": 2.0, "dividend increase": 2.0,
+        "earnings beat": 2.5, "beat expectations": 2.5, "raised guidance": 2.5,
+        "record revenue": 2.5, "record profit": 2.5, "strong demand": 2.0,
+        "short squeeze": 2.5, "covering shorts": 2.0,
+        "trade deal": 2.5, "tariff removed": 2.5, "tariff pause": 2.0,
+        "deregulat": 2.0, "tax cut": 2.5, "fiscal stimulus": 2.5,
+        "ceasefire": 2.0, "peace deal": 2.0, "de-escalat": 2.0,
+        "fda approv": 2.5, "phase 3 success": 2.5, "clinical success": 2.5,
+        "rally": 2.0, "surge": 2.0, "soar": 2.0, "record high": 2.5,
+        "opec cut": 2.0, "supply cut": 1.5,
+        "ipo": 1.5, "merger": 1.5, "acquisition": 1.5,
+    },
+    "bearish": {
+        # Direct price-down signals
+        "rate hike": 3.0, "rate hikes": 3.0, "hike rates": 3.0, "hawkish": 2.5,
+        "quantitative tightening": 2.5, "qt": 1.5, "tapering": 2.0,
+        "missed earnings": 2.5, "missed expectations": 2.5, "lowered guidance": 2.5,
+        "earnings miss": 2.5, "revenue miss": 2.5, "profit warning": 2.5,
+        "layoff": 2.0, "lay off": 2.0, "job cut": 2.0, "downsiz": 2.0,
+        "recession": 3.0, "stagflation": 3.0, "deflation": 2.0,
+        "tariff": 1.5, "trade war": 2.5, "import ban": 2.5, "export ban": 2.5,
+        "sanction": 2.0, "embargo": 2.0,
+        "bank failure": 3.0, "bank run": 3.0, "credit downgrade": 2.5,
+        "debt ceiling": 2.0, "default": 2.5, "government shutdown": 2.0,
+        "inflation": 1.5, "cpi rose": 2.0, "ppi rose": 2.0, "hot inflation": 2.5,
+        "yield invert": 2.5, "inverted yield": 2.5,
+        "oil embargo": 2.5, "supply disruption": 2.0, "opec flood": 2.0,
+        "crash": 3.0, "plunge": 2.5, "freefall": 3.0, "collapse": 3.0,
+        "fda reject": 2.5, "clinical fail": 2.5, "drug recall": 2.5,
+        "war": 2.0, "invasion": 2.5, "military strike": 2.5, "nuclear": 2.0,
+    },
+}
+
+
+def _score_market_impact(text):
+    """Return (impact, raw_score) where impact is 'bullish'/'bearish'/'neutral'
+    and raw_score is the net directional score.
+    Runs independently of tone — a neutral-tone article can return 'bearish'."""
+    text_lower = text.lower()
+    bull = 0.0
+    bear = 0.0
+    for phrase, weight in MARKET_IMPACT_LEXICON["bullish"].items():
+        if phrase in text_lower:
+            bull += weight
+    for phrase, weight in MARKET_IMPACT_LEXICON["bearish"].items():
+        if phrase in text_lower:
+            bear += weight
+    net = bull - bear
+    threshold = 1.0  # minimum net signal to commit to a direction
+    if net > threshold:
+        return "bullish", net
+    elif net < -threshold:
+        return "bearish", net
+    return "neutral", net
+
+
 AMPLIFIERS = {
     "breaking": 1.5, "just in": 1.5, "alert": 1.3, "urgent": 1.5,
     "exclusive": 1.3, "developing": 1.2, "major": 1.3,
@@ -2765,19 +3429,24 @@ def ollama_analyze(text, ollama_url, model="llama3", keyword=""):
             if attempt > 0:
                 prompt += "\n\nIMPORTANT: Respond with valid JSON ONLY. No other text."
 
-            resp = requests.post(
-                f"{ollama_url.rstrip('/')}/api/generate",
-                json={
-                    "model": model,
-                    "prompt": prompt,
-                    "stream": False,
-                    "options": {
-                        "num_predict": OLLAMA_ANALYSIS_NUM_PREDICT,
-                        "temperature": OLLAMA_ANALYSIS_TEMPERATURE,
+            _ollama_call_guard()
+            try:
+                resp = requests.post(
+                    f"{ollama_url.rstrip('/')}/api/generate",
+                    json={
+                        "model": model,
+                        "prompt": prompt,
+                        "stream": False,
+                        "options": {
+                            "num_predict": OLLAMA_ANALYSIS_NUM_PREDICT,
+                            "temperature": OLLAMA_ANALYSIS_TEMPERATURE,
+                        },
                     },
-                },
-                timeout=OLLAMA_ANALYSIS_TIMEOUT,
-            )
+                    timeout=OLLAMA_ANALYSIS_TIMEOUT,
+                )
+            finally:
+                _ollama_call_release()
+
             if resp.status_code != 200:
                 log.debug(f"Analysis lane: Ollama returned {resp.status_code} on attempt {attempt+1}")
                 continue
@@ -3054,9 +3723,17 @@ def analyze_sentiment_words_only(text, source_id="", matched_keywords=None):
     source_reliability = SOURCE_WEIGHTS.get(source_id, 0.5)
     confidence *= (0.7 + source_reliability * 0.3)
 
+    # Independent market-impact scan — can diverge from tone.
+    # e.g. neutral reporting of a rate hike → neutral tone, bearish impact.
+    lexicon_impact, impact_net = _score_market_impact(text)
+    # If the impact lexicon has no strong signal, fall back to tone-derived impact
+    # (keeps backward-compatible behaviour for articles with no explicit price words).
+    if lexicon_impact == "neutral" and tone != "neutral":
+        lexicon_impact = "bullish" if tone == "positive" else "bearish"
+
     return {
         "article_tone": tone,
-        "market_impact": {"positive": "bullish", "negative": "bearish", "neutral": "neutral"}[tone],
+        "market_impact": lexicon_impact,
         "polarity": round(final_polarity, 3),
         "confidence": round(min(1.0, confidence), 2),
         "severity": severity,
@@ -3705,6 +4382,12 @@ def monitor_loop():
     global _max_article_age_hours
     while True:
         try:
+            # Reset per-cycle Phase-3 cap counter so the AI_MAX_AUTO_PER_CYCLE
+            # limit applies per polling window, not per process lifetime.
+            global _auto_intel_this_cycle
+            with _auto_intel_cycle_lock:
+                _auto_intel_this_cycle = 0
+
             config = load_config()
             keywords = [normalize_whitespace(k).lower() for k in config.get("keywords", []) if normalize_whitespace(k)]
             interval = config.get("poll_interval_seconds", 120)
@@ -3794,7 +4477,8 @@ def index():
 def get_alerts():
     since = request.args.get("since")
     limit = request.args.get("limit", type=int)
-    return jsonify({"alerts": store.get_all(since=since, limit=limit)})
+    sort = request.args.get("sort", "time")  # "time" (newest-first) or "score" (priority-first)
+    return jsonify({"alerts": store.get_all(since=since, limit=limit, sort=sort)})
 
 
 @app.route("/api/alerts", methods=["DELETE"])
@@ -3958,10 +4642,15 @@ def trigger_refresh():
 
 @app.route("/api/status")
 def status():
+    with store._ai_lock:
+        ai_queue_depth = len(store._ai_queue)
+        ai_dropped = store._ai_queue_dropped
     return jsonify({
         "status": "running",
         "alert_count": len(store.alerts),
         "sources": list(RSS_SOURCES.keys()) + ["whitehouse", "truthsocial", "newsapi", "x_twitter"],
+        "ai_queue_depth": ai_queue_depth,
+        "ai_queue_dropped": ai_dropped,
     })
 
 
@@ -4079,7 +4768,8 @@ def ollama_chat():
         role = "User" if msg.get("role") == "user" else "Assistant"
         conv_text += f"\n{role}: {msg.get('text', '')}"
 
-    # Signal that chat is active so background enrichment yields
+    # Signal that chat is active so background enrichment yields,
+    # then acquire the global Ollama semaphore to prevent concurrent calls.
     with _chat_active_lock:
         _chat_active += 1
 
@@ -4092,19 +4782,24 @@ def ollama_chat():
             prompt += f"\nPrevious conversation:{conv_text}\n"
         prompt += f"\nUser: {question}\n\nAssistant:"
 
-        resp = requests.post(
-            f"{chat_url.rstrip('/')}/api/generate",
-            json={
-                "model": chat_model,
-                "prompt": prompt,
-                "stream": False,
-                "options": {
-                    "num_predict": OLLAMA_CHAT_NUM_PREDICT,
-                    "temperature": OLLAMA_CHAT_TEMPERATURE,
+        _ollama_call_guard()
+        try:
+            resp = requests.post(
+                f"{chat_url.rstrip('/')}/api/generate",
+                json={
+                    "model": chat_model,
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {
+                        "num_predict": OLLAMA_CHAT_NUM_PREDICT,
+                        "temperature": OLLAMA_CHAT_TEMPERATURE,
+                    },
                 },
-            },
-            timeout=OLLAMA_CHAT_TIMEOUT,
-        )
+                timeout=OLLAMA_CHAT_TIMEOUT,
+            )
+        finally:
+            _ollama_call_release()
+
         if resp.status_code == 200:
             answer = resp.json().get("response", "").strip()
             article_title = ""
@@ -4259,24 +4954,29 @@ def general_chat():
         prompt += f"\nHISTORY:{conv_text}\n"
     prompt += f"\nUser: {question}\n\nAssistant:"
 
-    # Signal chat is active
+    # Signal chat is active, then acquire the global Ollama semaphore
     with _chat_active_lock:
         _chat_active += 1
 
     try:
-        resp = requests.post(
-            f"{chat_url.rstrip('/')}/api/generate",
-            json={
-                "model": chat_model,
-                "prompt": prompt,
-                "stream": False,
-                "options": {
-                    "num_predict": OLLAMA_CHAT_NUM_PREDICT,
-                    "temperature": OLLAMA_CHAT_TEMPERATURE,
+        _ollama_call_guard()
+        try:
+            resp = requests.post(
+                f"{chat_url.rstrip('/')}/api/generate",
+                json={
+                    "model": chat_model,
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {
+                        "num_predict": OLLAMA_CHAT_NUM_PREDICT,
+                        "temperature": OLLAMA_CHAT_TEMPERATURE,
+                    },
                 },
-            },
-            timeout=OLLAMA_CHAT_TIMEOUT,
-        )
+                timeout=OLLAMA_CHAT_TIMEOUT,
+            )
+        finally:
+            _ollama_call_release()
+
         if resp.status_code == 200:
             answer = resp.json().get("response", "").strip()
             log_chat(0, "general_chat", question, answer)
@@ -5711,6 +6411,164 @@ def wiki_summary_endpoint(term):
     if summary:
         return jsonify({"term": term, "summary": summary})
     return jsonify({"term": term, "summary": "", "error": "Not found"}), 404
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# FOR YOU + ON-DEMAND AI ENDPOINTS
+# ───────────────────────────────────────────────────────────────────────────
+
+@app.route("/api/for-you")
+def for_you():
+    """
+    Returns the personalised For You feed.
+    Reads watchlist to understand holdings/sectors, recent chat topics for interest signals,
+    then scores and ranks alerts using _build_for_you().
+    Each item includes: alert data + fy_score + reason_label + is_adjacent + intelligence (if available).
+    """
+    try:
+        wl = load_watchlist()
+    except Exception:
+        wl = []
+
+    # Pull recent chat questions as personalisation signal
+    recent_topics = []
+    try:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("SELECT question FROM chat_logs ORDER BY timestamp DESC LIMIT 10")
+        recent_topics = [row[0] for row in c.fetchall() if row[0]]
+        conn.close()
+    except Exception:
+        pass
+
+    # Get scored alerts
+    alerts_snap = store.get_all(sort="score")
+    items = _build_for_you(alerts_snap, wl, recent_topics)
+
+    response_items = []
+    for item in items:
+        a = item["alert"]
+        # Attach cached intelligence if available
+        intel = _get_intel_cache(a["id"])
+        entry = dict(a)  # shallow copy
+        entry["fy_score"] = item["fy_score"]
+        entry["reason_label"] = item["reason_label"]
+        entry["reason_key"] = item["reason_key"]
+        entry["is_adjacent"] = item["is_adjacent"]
+        if intel:
+            entry["intelligence"] = intel["intelligence"]
+            entry["intelligence_source"] = intel["source"]
+            entry["intelligence_at"] = intel["generated_at"]
+        response_items.append(entry)
+
+    return jsonify({
+        "items": response_items,
+        "watchlist_size": len(wl),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    })
+
+
+@app.route("/api/alerts/<int:alert_id>/explain", methods=["POST"])
+def explain_alert(alert_id):
+    """
+    Layer-3 on-demand intelligence for a specific alert.
+    Called when user clicks 'Explain' or 'Summarize' on any alert card.
+
+    If intelligence is already cached (auto or prior user request), returns it immediately.
+    Otherwise calls Ollama to generate it now and caches the result.
+
+    Request body (optional): {"force": true} to regenerate even if cached.
+    """
+    global _chat_active
+    data = request.get_json(silent=True) or {}
+    force = data.get("force", False)
+
+    # Return cached result immediately if available and not forcing
+    if not force:
+        cached = _get_intel_cache(alert_id)
+        if cached:
+            return jsonify({
+                "alert_id": alert_id,
+                "intelligence": cached["intelligence"],
+                "intelligence_source": cached["source"],
+                "intelligence_at": cached["generated_at"],
+                "from_cache": True,
+            })
+
+    # Find the alert
+    alert_snap = None
+    with store.lock:
+        for a in store.alerts:
+            if a["id"] == alert_id:
+                alert_snap = a.copy()
+                break
+
+    if not alert_snap:
+        return jsonify({"error": "Alert not found"}), 404
+
+    config = load_config()
+    chat_url, chat_model = get_ollama_lane(config, "chat")
+    if not chat_url:
+        return jsonify({"error": "Ollama not configured"}), 400
+
+    # Get best available text — for Layer-3 on-demand we always attempt a live
+    # article fetch. Low-priority alerts were never auto-fetched so without this
+    # the AI would only see snippet-level text (often 1-2 sentences) and produce
+    # shallow intelligence. The user explicitly triggered this request so the
+    # extra network latency is acceptable.
+    analysis_text = alert_snap.get("snippet") or alert_snap.get("title", "")
+    article_url = alert_snap.get("url", "")
+    if article_url:
+        try:
+            fetched_text, fetch_ok = fetch_article_text(article_url, timeout=15)
+            if fetch_ok and fetched_text and len(fetched_text) > len(analysis_text):
+                analysis_text = fetched_text
+                # Mark the alert as fetched so future explain calls skip the network round-trip
+                with store.lock:
+                    for a in store.alerts:
+                        if a["id"] == alert_id:
+                            a["article_fetched"] = True
+                            break
+        except Exception:
+            pass  # Fall back to snippet — better than failing the whole request
+
+    with _chat_active_lock:
+        _chat_active += 1
+    try:
+        intel = _generate_intelligence(
+            alert_id=alert_id,
+            title=alert_snap.get("title", ""),
+            source_name=alert_snap.get("source_name", ""),
+            keyword=alert_snap.get("keyword", ""),
+            text=analysis_text,
+            ollama_url=chat_url,
+            model=chat_model,
+        )
+    finally:
+        with _chat_active_lock:
+            _chat_active = max(0, _chat_active - 1)
+
+    if not intel:
+        return jsonify({"error": "Intelligence generation failed. Check Ollama is running."}), 500
+
+    _set_intel_cache(alert_id, intel, source="user")
+    # Stamp the in-memory alert
+    with store.lock:
+        for a in store.alerts:
+            if a["id"] == alert_id:
+                a["intelligence"] = intel
+                a["intelligence_source"] = "user"
+                a["intelligence_at"] = datetime.now(timezone.utc).isoformat()
+                break
+
+    log.info(f"💬 [Layer-3] On-demand intelligence for alert {alert_id}: {alert_snap.get('title', '')[:55]}")
+    return jsonify({
+        "alert_id": alert_id,
+        "intelligence": intel,
+        "intelligence_source": "user",
+        "intelligence_at": datetime.now(timezone.utc).isoformat(),
+        "from_cache": False,
+    })
 
 
 _monitor_started = False

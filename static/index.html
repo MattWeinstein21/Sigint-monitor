@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- SIGINT build: 2026-04-15 v2.0.2 score-fix -->
+<!-- SIGINT build: 2026-04-15 v2.0.7 true-incident-synthesis -->
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -212,7 +212,25 @@ function App(){
   var[searchResults,sSearchResults]=s([]);
   var searchTimer=React.useRef(null);
   var[alertSort,sAlertSort]=s("time");
+  // Ref mirrors alertSort so the poll closure can read current value without
+  // being added to the effect dep array (adding it would remount and reset scroll).
+  var alertSortRef=React.useRef("time");
+  u(function(){alertSortRef.current=alertSort},[alertSort]);
+  // Immediately re-fetch on sort change so the view updates without waiting 8s
+  var switchSort=function(newSort){
+    alertSortRef.current=newSort;
+    sAlertSort(newSort);
+    F("/api/alerts?limit=300&sort="+newSort).then(function(d){if(d.alerts)sAl(d.alerts)}).catch(function(){});
+  };
   var[sideExpanded,setSideExpanded]=s(false);
+  // For You state
+  var[fyItems,sFyItems]=s([]);
+  var[fyLoading,sFyLoading]=s(false);
+  var[fyError,sFyError]=s("");
+  var[fyGeneratedAt,sFyGeneratedAt]=s(null);
+  // Per-alert intelligence state: {alertId: {intelligence, source, loading, error}}
+  var[intelMap,sIntelMap]=s({});
+  var fyPollRef=React.useRef(null);
 
   var tt=function(m){sToast(m);setTimeout(function(){sToast("")},3000)};
   var te=function(id){sExp(function(p){var n=new Set(p);if(n.has(id))n.delete(id);else n.add(id);return n})};
@@ -293,7 +311,24 @@ function App(){
     F("/api/signal-sets").then(function(d){if(d.sets)sSs(d.sets)}).catch(function(){});
   },[]);
   u(function(){var iv=setInterval(function(){fetch(API+"/api/status").then(function(r){if(r.ok)sConn(true);else throw 0}).catch(function(){sConn(false)})},15000);return function(){clearInterval(iv)}},[]);
-  u(function(){if(!mon)return;var c=false;var p=function(){F("/api/alerts?limit=300").then(function(d){if(!c&&d.alerts){sAl(d.alerts);sConn(true)}}).catch(function(){if(!c)sConn(false)})};p();var iv=setInterval(p,8000);return function(){c=true;clearInterval(iv)}},[mon]);
+  u(function(){if(!mon)return;var c=false;var p=function(){
+    var sortParam=alertSortRef.current||"time";
+    F("/api/alerts?limit=300&sort="+sortParam).then(function(d){
+      if(!c&&d.alerts){
+        sAl(d.alerts);sConn(true);
+        // Pre-populate intelMap from auto-generated intelligence on alerts
+        sIntelMap(function(prev){
+          var next=Object.assign({},prev);
+          d.alerts.forEach(function(a){
+            if(a.intelligence&&!next[a.id]){
+              next[a.id]={intelligence:a.intelligence,source:a.intelligence_source||"auto",loading:false,error:""};
+            }
+          });
+          return next;
+        });
+      }
+    }).catch(function(){if(!c)sConn(false)});
+  };p();var iv=setInterval(p,8000);return function(){c=true;clearInterval(iv)}},[mon]);
   u(function(){if(mv!=="market")return;var dead=false;
     var iv2=rng==="1d"?"5m":rng==="5d"?"15m":"1d";
     var priceKey=rng+":"+iv2;
@@ -306,6 +341,43 @@ function App(){
     return function(){dead=true;clearInterval(iv1);clearInterval(iv3)}
   },[mv,rng]);
   u(function(){if(mv!=="analytics")return;var dead=false;var entry=tabCache.current.analytics;if(cacheFresh(entry,60000)&&entry.data){sAcd(entry.data);}else{F("/api/data/accuracy").then(function(d){if(dead)return;tabCache.current.analytics={ts:Date.now(),data:d};sAcd(d)}).catch(function(){})}return function(){dead=true}},[mv]);
+  // For You: load when tab is active, poll every 30s
+  u(function(){
+    if(mv!=="foryou")return;
+    var dead=false;
+    var load=function(){
+      sFyLoading(true);sFyError("");
+      F("/api/for-you").then(function(d){
+        if(dead)return;
+        sFyItems(d.items||[]);sFyGeneratedAt(d.generated_at||null);sFyLoading(false);
+        // Pre-populate intelMap from items that already have intelligence
+        sIntelMap(function(prev){
+          var next=Object.assign({},prev);
+          (d.items||[]).forEach(function(item){
+            if(item.intelligence&&!next[item.id]){
+              next[item.id]={intelligence:item.intelligence,source:item.intelligence_source||"auto",loading:false,error:""};
+            }
+          });
+          return next;
+        });
+      }).catch(function(){if(!dead){sFyLoading(false);sFyError("Failed to load personalised feed");}});
+    };
+    load();
+    var iv=setInterval(load,30000);
+    return function(){dead=true;clearInterval(iv)};
+  },[mv]);
+
+  // Explain/Summarize helper — Layer 3 on-demand AI
+  var requestExplain=function(alertId){
+    sIntelMap(function(p){var n=Object.assign({},p);n[alertId]=Object.assign({},p[alertId]||{},{loading:true,error:""});return n});
+    fetch(API+"/api/alerts/"+alertId+"/explain",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({})}).then(function(r){return r.json()}).then(function(d){
+      if(d.error){sIntelMap(function(p){var n=Object.assign({},p);n[alertId]=Object.assign({},p[alertId]||{},{loading:false,error:d.error});return n});return;}
+      sIntelMap(function(p){var n=Object.assign({},p);n[alertId]={intelligence:d.intelligence,source:d.intelligence_source,loading:false,error:""};return n});
+      // Also update alert in the al array if present
+      sAl(function(prev){return prev.map(function(a){return a.id===alertId?Object.assign({},a,{intelligence:d.intelligence,intelligence_source:d.intelligence_source}):a})});
+    }).catch(function(){sIntelMap(function(p){var n=Object.assign({},p);n[alertId]=Object.assign({},p[alertId]||{},{loading:false,error:"Request failed"});return n});});
+  };
+
   u(function(){if(mv!=="economy")return;var dead=false;var applyEconomy=function(d){if(dead||!d)return;if(d.fear_greed)sFg(d.fear_greed);if(d.indicators)sFd(d.indicators);if(d.stories)sHn(d.stories);if(d.btc&&!d.btc.error)sBt(d.btc);if(d.trending)sCgTrending(d.trending);if(d.global)sCgGlobal(d.global)};var loadEconomy=function(force){var entry=tabCache.current.economy;if(!force&&cacheFresh(entry,60000)){applyEconomy(entry.data);return;}Promise.all([F("/api/economy/fred-dashboard"),F("/api/market/fear-greed"),F("/api/news/hackernews?limit=10"),F("/api/crypto/binance/BTC"),F("/api/crypto/trending"),F("/api/crypto/global")]).then(function(res){var data={indicators:res[0].indicators||{},fear_greed:res[1].fear_greed||[],stories:res[2].stories||[],btc:res[3]||null,trending:res[4].trending||[],global:res[5]||null};tabCache.current.economy={ts:Date.now(),data:data};applyEconomy(data)}).catch(function(){})};loadEconomy(false);var iv=setInterval(function(){loadEconomy(true)},60000);return function(){dead=true;clearInterval(iv)}},[mv]);
 
   var Sp=function(p){if(!p.data||p.data.length<2)return null;var v=p.data.map(function(d){return d.close});var mi=Math.min.apply(null,v),ma=Math.max.apply(null,v),r=ma-mi||1;var pts=v.map(function(val,i){return(i/(v.length-1))*p.width+","+(p.height-((val-mi)/r)*p.height)}).join(" ");return <svg width={p.width} height={p.height} style={{display:"block"}}><polyline points={pts} fill="none" stroke={p.color} strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>};
@@ -321,10 +393,9 @@ function App(){
     return es.includes(a.source);
   });
 
+  // Server already returns data in the correct order (sort=time or sort=score).
+  // No client-side re-sort needed — just slice to preserve the server order.
   var sortedFilt=filt.slice();
-  if(alertSort==="score"){
-    sortedFilt.sort(function(a,b){return (b.attention_score||b.confidence||0)-(a.attention_score||a.confidence||0)});
-  }
 
   var filteredNews=mn.filter(function(n){
     if(newsFilter.length===0)return true;
@@ -342,6 +413,7 @@ function App(){
   /* ===== SIDEBAR ===== */
   var NavSidebar = function(){
     var navItems=[
+      {id:"foryou",icon:"foryou",label:"For You"},
       {id:"alerts",icon:"signals",label:"Alerts"},
       {id:"market",icon:"markets",label:"Markets"},
       {id:"economy",icon:"economy",label:"Economy"},
@@ -360,6 +432,7 @@ function App(){
         {navItems.map(function(item){
           var isActive=mv===item.id;
           var iconEl=null;
+          if(item.id==="foryou")iconEl=<svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M9 3C9 3 4 6 4 10.5a5 5 0 0 0 10 0C14 6 9 3 9 3z" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round" fill="none"/><path d="M9 10.5V7" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/></svg>;
           if(item.id==="alerts")iconEl=<svg width="18" height="18" viewBox="0 0 18 18" fill="none"><rect x="2" y="4" width="14" height="2" rx="1" fill="currentColor"/><rect x="2" y="8" width="10" height="2" rx="1" fill="currentColor"/><rect x="2" y="12" width="12" height="2" rx="1" fill="currentColor"/></svg>;
           if(item.id==="market")iconEl=<svg width="18" height="18" viewBox="0 0 18 18" fill="none"><polyline points="2,13 6,8 9,11 13,5 16,7" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" fill="none"/></svg>;
           if(item.id==="economy")iconEl=<svg width="18" height="18" viewBox="0 0 18 18" fill="none"><circle cx="9" cy="9" r="7" stroke="currentColor" strokeWidth="1.6" fill="none"/><path d="M9 4v1.5M9 12.5V14M6.5 6.5C6.5 5.7 7.2 5 9 5s2.5 1 2.5 2-1 1.5-2.5 1.5S6.5 9.5 6.5 10.5c0 1 .7 2 2.5 2s2.5-1 2.5-2" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round"/></svg>;
@@ -623,6 +696,45 @@ function App(){
     </div>;
   };
 
+  /* ===== INTELLIGENCE PANEL (shared between Alerts + For You) ===== */
+  var IntelPanel = function(p){
+    // p: {alertId, borderColor}
+    var intel=intelMap[p.alertId];
+    var ic=p.borderColor||"#8B80F0";
+    if(!intel&&!intelMap[p.alertId])return(
+      <button className="b" onClick={function(){requestExplain(p.alertId)}} style={{display:"inline-flex",alignItems:"center",gap:5,marginTop:6,fontSize:10,padding:"4px 10px",borderRadius:6,background:"#5448C818",color:"#8B80F0",border:"1px solid #5448C830",fontFamily:"'JetBrains Mono',monospace"}}>
+        <svg width="10" height="10" viewBox="0 0 10 10" fill="none"><circle cx="5" cy="5" r="4" stroke="currentColor" strokeWidth="1.2"/><path d="M5 3v2.5M5 7v.5" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round"/></svg>
+        Explain
+      </button>
+    );
+    if(intel&&intel.loading)return(
+      <div style={{marginTop:6,fontSize:10,color:"#8B80F0",fontFamily:"'JetBrains Mono',monospace"}}><span className="thk">Generating intelligence</span></div>
+    );
+    if(intel&&intel.error)return(
+      <div style={{marginTop:6,fontSize:10,color:"#FF453A",fontFamily:"'JetBrains Mono',monospace"}}>{intel.error}
+        <button className="b" onClick={function(){requestExplain(p.alertId)}} style={{marginLeft:8,fontSize:9,padding:"2px 7px",borderRadius:4,background:"#FF453A18",color:"#FF453A",border:"1px solid #FF453A30"}}>Retry</button>
+      </div>
+    );
+    if(!intel||!intel.intelligence)return null;
+    var d=intel.intelligence;
+    var srcLabel=intel.source==="auto"?"AUTO-INTEL":"YOUR REQUEST";
+    var srcColor=intel.source==="auto"?"#8B80F0":"#30D158";
+    return(
+      <div style={{marginTop:8,padding:"12px 14px",background:"#0A0A14",borderRadius:8,borderLeft:"2px solid "+ic+"88",animation:"slideIn 0.15s ease-out"}}>
+        <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:8}}>
+          <svg width="10" height="10" viewBox="0 0 10 10" fill="none"><circle cx="5" cy="5" r="4" stroke={srcColor} strokeWidth="1.2"/><path d="M5 3v2.5M5 7v.5" stroke={srcColor} strokeWidth="1.2" strokeLinecap="round"/></svg>
+          <span style={{fontSize:8,fontWeight:700,color:srcColor,fontFamily:"'JetBrains Mono',monospace",letterSpacing:0.5}}>{srcLabel}</span>
+          <button className="b" onClick={function(){requestExplain(p.alertId)}} style={{marginLeft:"auto",fontSize:8,padding:"2px 6px",borderRadius:3,background:"transparent",color:"#3A3A4E",border:"1px solid #1C1C28",fontFamily:"'JetBrains Mono',monospace"}}>Refresh</button>
+        </div>
+        {d.why_it_matters&&<div style={{marginBottom:7}}><span style={{fontSize:9,color:"#7A7A8E",fontFamily:"'JetBrains Mono',monospace",display:"block",marginBottom:2}}>WHY IT MATTERS</span><div style={{fontSize:12,color:"#EDEDF0",lineHeight:1.6}}>{d.why_it_matters}</div></div>}
+        {d.what_changed&&d.what_changed!="not specified"&&<div style={{marginBottom:7}}><span style={{fontSize:9,color:"#7A7A8E",fontFamily:"'JetBrains Mono',monospace",display:"block",marginBottom:2}}>WHAT CHANGED</span><div style={{fontSize:11,color:"#EDEDF0",lineHeight:1.55}}>{d.what_changed}</div></div>}
+        {d.what_uncertain&&d.what_uncertain!="nothing noted"&&<div style={{marginBottom:7}}><span style={{fontSize:9,color:"#7A7A8E",fontFamily:"'JetBrains Mono',monospace",display:"block",marginBottom:2}}>STILL UNCERTAIN</span><div style={{fontSize:11,color:"#FF9F0A",lineHeight:1.55}}>{d.what_uncertain}</div></div>}
+        {d.watch_next&&<div style={{marginBottom:7}}><span style={{fontSize:9,color:"#7A7A8E",fontFamily:"'JetBrains Mono',monospace",display:"block",marginBottom:2}}>WATCH NEXT</span><div style={{fontSize:11,color:"#EDEDF0",lineHeight:1.55}}>{d.watch_next}</div></div>}
+        {d.affected_sectors&&d.affected_sectors.length>0&&<div style={{display:"flex",gap:4,flexWrap:"wrap"}}>{d.affected_sectors.map(function(s,i){return <span key={i} style={{fontSize:9,padding:"2px 7px",borderRadius:4,background:"#5448C815",color:"#8B80F0",border:"1px solid #5448C830",fontFamily:"'JetBrains Mono',monospace"}}>{s}</span>})}</div>}
+      </div>
+    );
+  };
+
   /* ===== ALERTS PAGE ===== */
   var AlertsPage = function(){
     var totalAlertPages=Math.ceil(sortedFilt.length/ALERTS_PER_PAGE);
@@ -641,8 +753,8 @@ function App(){
           <div style={{display:"flex",gap:6,alignItems:"center",flexShrink:0}}>
             {/* Sort toggle */}
             <div style={{display:"flex",borderRadius:7,overflow:"hidden",border:"1px solid #1C1C28"}}>
-              <button className="b" onClick={function(){sAlertSort("time")}} style={{padding:"6px 12px",fontSize:10,background:alertSort==="time"?"#141420":"transparent",color:alertSort==="time"?"#EDEDF0":"#7A7A8E",fontFamily:"'JetBrains Mono',monospace"}}>Recent</button>
-              <button className="b" onClick={function(){sAlertSort("score")}} style={{padding:"6px 12px",fontSize:10,background:alertSort==="score"?"#141420":"transparent",color:alertSort==="score"?"#EDEDF0":"#7A7A8E",fontFamily:"'JetBrains Mono',monospace"}}>Priority</button>
+              <button className="b" onClick={function(){switchSort("time")}} style={{padding:"6px 12px",fontSize:10,background:alertSort==="time"?"#141420":"transparent",color:alertSort==="time"?"#EDEDF0":"#7A7A8E",fontFamily:"'JetBrains Mono',monospace"}}>Recent</button>
+              <button className="b" onClick={function(){switchSort("score")}} style={{padding:"6px 12px",fontSize:10,background:alertSort==="score"?"#141420":"transparent",color:alertSort==="score"?"#EDEDF0":"#7A7A8E",fontFamily:"'JetBrains Mono',monospace"}}>Priority</button>
             </div>
             {/* Filter button */}
             <div style={{position:"relative"}}>
@@ -716,17 +828,23 @@ function App(){
               </div>}
               {a.also_reported_by&&a.also_reported_by.length>0&&<div style={{fontSize:9,color:"#3A3A4E",marginBottom:4,fontFamily:"'JetBrains Mono',monospace"}}>Also: {a.also_reported_by.join(", ")}</div>}
               {a.event&&a.event.action&&<div style={{fontSize:10,color:"#7A7A8E",marginBottom:5}}><span style={{color:"#EDEDF0"}}>{a.event.actor}</span> <span style={{color:"#8B80F0"}}>{(a.event.action||"").replace(/_/g," ")}</span>{a.event.target&&<span style={{color:"#EDEDF0"}}> to {a.event.target}</span>}{a.event.magnitude&&<span style={{color:"#FF9F0A"}}> ({a.event.magnitude})</span>}</div>}
-              {/* Summary expand */}
-              {a.summary&&<div style={{marginBottom:5}}>
-                <button className="b" onClick={function(){te(a.id)}} style={{fontSize:10,color:"#7A7A8E",background:"none",padding:"0",marginBottom:isX?6:0,display:"flex",alignItems:"center",gap:5}}>
+              {/* Summary + Intelligence expand */}
+              <div style={{marginBottom:5}}>
+                {/* Expand toggle — show if there's a summary OR intelligence already loaded */}
+                {(a.summary||intelMap[a.id])&&<button className="b" onClick={function(){te(a.id)}} style={{fontSize:10,color:"#7A7A8E",background:"none",padding:"0",marginBottom:isX?6:0,display:"flex",alignItems:"center",gap:5}}>
                   <svg width="10" height="10" viewBox="0 0 10 10" fill="none" style={{transform:isX?"rotate(90deg)":"rotate(0deg)",transition:"transform 0.2s",flexShrink:0}}><polyline points="2,2 8,5 2,8" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>
-                  {isX?"Hide summary":"Show summary"}
+                  {isX?"Collapse":"Show detail"}
                   {a.ai_summary&&<span style={{fontSize:8,background:"#5448C820",color:"#8B80F0",padding:"1px 5px",borderRadius:3,fontFamily:"'JetBrains Mono',monospace"}}>AI</span>}
+                  {intelMap[a.id]&&intelMap[a.id].intelligence&&<span style={{fontSize:8,background:"#8B80F020",color:"#8B80F0",padding:"1px 5px",borderRadius:3,fontFamily:"'JetBrains Mono',monospace"}}>INTEL</span>}
                   {a.ai_processing&&!a.ai_summary&&<span className="thk" style={{fontSize:9,color:"#FF9F0A",fontFamily:"'JetBrains Mono',monospace"}}>Analyzing</span>}
-                </button>
-                {isX&&<div style={{maxWidth:"70%",animation:"slideIn 0.15s ease-out"}}>
-                  <div style={{fontSize:12,color:"#EDEDF0",lineHeight:1.65,padding:"10px 14px",background:"#0F0F1A",borderRadius:8,borderLeft:"2px solid "+ic+"88",marginBottom:10}}>{a.summary}</div>
-                  <div>
+                </button>}
+                {/* Inline Explain button when no intel and not expanded */}
+                {!intelMap[a.id]&&!isX&&<IntelPanel alertId={a.id} borderColor={ic}/>}
+                {isX&&<div style={{maxWidth:"72%",animation:"slideIn 0.15s ease-out"}}>
+                  {a.summary&&<div style={{fontSize:12,color:"#EDEDF0",lineHeight:1.65,padding:"10px 14px",background:"#0F0F1A",borderRadius:8,borderLeft:"2px solid "+ic+"88",marginBottom:10}}>{a.summary}</div>}
+                  {/* Intelligence panel — auto-generated or on-demand */}
+                  <IntelPanel alertId={a.id} borderColor={ic}/>
+                  <div style={{marginTop:10}}>
                     {(ch[a.id]||[]).map(function(m,i){return <div key={i} className="cm" style={{display:"flex",justifyContent:m.role==="user"?"flex-end":"flex-start",marginBottom:6}}><div style={{maxWidth:"85%",padding:"7px 11px",borderRadius:m.role==="user"?"10px 10px 2px 10px":"10px 10px 10px 2px",background:m.role==="user"?"#5448C8":"#141420",color:m.role==="user"?"#fff":"#EDEDF0",fontSize:11,lineHeight:1.55,border:m.role==="user"?"none":"1px solid #1C1C28"}}>{m.role==="ai"&&<span style={{fontSize:8,color:"#8B80F0",marginRight:4,fontFamily:"'JetBrains Mono',monospace"}}>AI</span>}{m.text}</div></div>})}
                     {cl===a.id&&<div className="cm" style={{display:"flex",marginBottom:6}}><div style={{padding:"7px 11px",borderRadius:"10px 10px 10px 2px",background:"#141420",border:"1px solid #1C1C28",fontSize:11,color:"#8B80F0"}}><span className="thk" style={{fontFamily:"'JetBrains Mono',monospace"}}>Thinking</span></div></div>}
                     <div style={{display:"flex",gap:5,marginTop:6}}>
@@ -735,7 +853,7 @@ function App(){
                     </div>
                   </div>
                 </div>}
-              </div>}
+              </div>
               {/* Tag row */}
               <div style={{display:"flex",gap:5,alignItems:"center",flexWrap:"wrap",marginTop:4}}>
                 {dShow.impact&&<span style={{fontSize:10,padding:"2px 8px",borderRadius:4,color:ic,background:ic+"18",border:"1px solid "+ic+"30",fontWeight:600,fontFamily:"'JetBrains Mono',monospace"}}>{im==="bullish"?"BULL":im==="bearish"?"BEAR":"NEUT"}</span>}
@@ -1042,6 +1160,104 @@ function App(){
     </div>;
   };
 
+  /* ===== FOR YOU PAGE ===== */
+  var FOR_YOU_REASON_LABELS = {
+    watchlist_ticker: "Watchlist match",
+    watchlist_sector: "Sector match",
+    keyword_match: "Keyword match",
+    high_priority: "High priority",
+    multi_confirmed: "Multi-source",
+    macro_adjacent: "Macro relevance",
+    recent_topic: "Recent topic",
+  };
+  var ForYouPage = function(){
+    var hasFy = fyItems.length > 0;
+    return <div style={{flex:1,overflowY:"auto",padding:"20px"}}>
+      {/* Header */}
+      <div style={{display:"flex",alignItems:"flex-start",justifyContent:"space-between",marginBottom:20,flexWrap:"wrap",gap:12}}>
+        <div>
+          <div style={{fontSize:20,fontWeight:700,color:"#EDEDF0",fontFamily:"'Space Grotesk',sans-serif",marginBottom:4}}>For You</div>
+          <div style={{fontSize:11,color:"#7A7A8E",maxWidth:560,lineHeight:1.55}}>Personalised signal feed based on your watchlist, keywords, and recent activity. Direct matches come first, followed by adjacent macro context.</div>
+          {fyGeneratedAt&&<div style={{fontSize:9,color:"#3A3A4E",marginTop:6,fontFamily:"'JetBrains Mono',monospace"}}>Generated {ago(fyGeneratedAt)}</div>}
+        </div>
+        <button className="b" onClick={function(){sFyLoading(true);sFyError("");F("/api/for-you").then(function(d){sFyItems(d.items||[]);sFyGeneratedAt(d.generated_at||null);sFyLoading(false);sIntelMap(function(prev){var next=Object.assign({},prev);(d.items||[]).forEach(function(item){if(item.intelligence&&!next[item.id]){next[item.id]={intelligence:item.intelligence,source:item.intelligence_source||"auto",loading:false,error:""};}});return next;});}).catch(function(){sFyLoading(false);sFyError("Failed to refresh")})}} disabled={fyLoading} style={{padding:"8px 16px",borderRadius:8,background:"#0F0F1A",color:"#7A7A8E",border:"1px solid #1C1C28",fontSize:11,display:"flex",alignItems:"center",gap:6,flexShrink:0}}>
+          <svg width="11" height="11" viewBox="0 0 12 12" fill="none" style={{animation:fyLoading?"spin 1s linear infinite":"none"}}><path d="M11 6A5 5 0 1 1 8.5 1.8" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round"/><polyline points="8,0 8.5,2.5 11,2" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round"/></svg>
+          {fyLoading?"Refreshing...":"Refresh"}
+        </button>
+      </div>
+      {/* Error */}
+      {fyError&&<div style={{padding:"10px 14px",borderRadius:8,background:"#FF453A15",border:"1px solid #FF453A30",color:"#FF453A",fontSize:11,marginBottom:16}}>{fyError}</div>}
+      {/* Loading skeleton */}
+      {fyLoading&&fyItems.length===0&&<div style={{display:"flex",flexDirection:"column",gap:8}}>
+        {[1,2,3].map(function(i){return <div key={i} style={{height:80,borderRadius:10,background:"#0F0F1A",border:"1px solid #1C1C28",animation:"pulse 1.5s infinite"}}></div>})}
+      </div>}
+      {/* Empty state — no watchlist */}
+      {!fyLoading&&fyItems.length===0&&!fyError&&<div style={{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:"60px 20px",gap:14,textAlign:"center"}}>
+        <svg width="48" height="48" viewBox="0 0 48 48" fill="none"><circle cx="24" cy="24" r="20" stroke="#1C1C28" strokeWidth="2"/><path d="M24 14C24 14 16 18 16 24.5a8 8 0 0 0 16 0C32 18 24 14 24 14z" stroke="#242434" strokeWidth="1.8" strokeLinejoin="round" fill="none"/><path d="M24 22v5" stroke="#242434" strokeWidth="1.8" strokeLinecap="round"/></svg>
+        <div style={{fontSize:14,color:"#3A3A4E",fontWeight:600}}>Nothing personalised yet</div>
+        <div style={{fontSize:11,color:"#3A3A4E",maxWidth:340}}>Add tickers or keywords to your watchlist and let SIGINT collect some signals. Come back once alerts start flowing in.</div>
+        <button className="b" onClick={function(){sMv("market");sCfg(false)}} style={{padding:"9px 18px",borderRadius:8,background:"#5448C820",color:"#8B80F0",border:"1px solid #5448C844",fontSize:11,fontWeight:600}}>Go to Watchlist</button>
+      </div>}
+      {/* Feed */}
+      {hasFy&&<div style={{display:"flex",flexDirection:"column",gap:8}}>
+        {fyItems.map(function(item,idx2){
+          var sr=SM[item.source]||{icon:"?",name:item.source_name||item.source,color:"#7A7A8E"};
+          var im2=item.market_impact||"neutral";
+          var ic2=iC[im2]||"#7A7A8E";
+          var reasonKey=item.reason_key||"";
+          var reasonLabel=FOR_YOU_REASON_LABELS[reasonKey]||reasonKey||"Recommended";
+          var isAdj=item.is_adjacent;
+          var fyScore=item.fy_score||0;
+          var itemIntel=intelMap[item.id];
+          var hasIntel=itemIntel&&itemIntel.intelligence;
+          var isExpanded=exp.has("fy_"+item.id);
+          var toggleFy=function(){sExp(function(p){var n=new Set(p);if(n.has("fy_"+item.id))n.delete("fy_"+item.id);else n.add("fy_"+item.id);return n})};
+          return <div key={item.id} className="arow" style={{background:"#0F0F1A",borderRadius:10,border:"1px solid #1C1C28",borderLeft:"3px solid "+ic2+(isAdj?"44":"88"),overflow:"hidden"}}>
+            <div style={{padding:"13px 16px"}}>
+              {/* Reason + score row */}
+              <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:8,flexWrap:"wrap"}}>
+                <span style={{fontSize:9,fontWeight:700,padding:"2px 8px",borderRadius:4,background:isAdj?"#FF9F0A18":"#5448C820",color:isAdj?"#FF9F0A":"#8B80F0",border:"1px solid "+(isAdj?"#FF9F0A30":"#5448C840"),fontFamily:"'JetBrains Mono',monospace",letterSpacing:0.3}}>{isAdj?"ADJACENT":"DIRECT"}</span>
+                <span style={{fontSize:9,padding:"2px 8px",borderRadius:4,background:"#141420",color:"#7A7A8E",border:"1px solid #1C1C28",fontFamily:"'JetBrains Mono',monospace"}}>{reasonLabel}</span>
+                {item.reason_label&&item.reason_label!==reasonLabel&&<span style={{fontSize:10,color:"#7A7A8E",fontStyle:"normal"}}>{item.reason_label}</span>}
+                <span style={{marginLeft:"auto",fontSize:9,color:fyScore>=80?"#FF453A":fyScore>=50?"#FF9F0A":"#8B80F0",fontFamily:"'JetBrains Mono',monospace",background:fyScore>=80?"#FF453A18":fyScore>=50?"#FF9F0A18":"#5448C818",padding:"1px 6px",borderRadius:4}}>fy:{Math.round(fyScore)}</span>
+              </div>
+              {/* Title row */}
+              <div style={{display:"flex",alignItems:"flex-start",gap:8,marginBottom:6}}>
+                <span style={{fontSize:9,fontWeight:700,background:sr.color+"22",color:sr.color,padding:"2px 6px",borderRadius:4,flexShrink:0,marginTop:2,fontFamily:"'JetBrains Mono',monospace"}}>{sr.icon}</span>
+                <div style={{fontSize:13,fontWeight:500,color:"#EDEDF0",lineHeight:1.4,flex:1}}>{item.title}</div>
+                {item.report_count>1&&<span style={{fontSize:9,padding:"2px 6px",borderRadius:4,background:"#5448C815",color:"#8B80F0",flexShrink:0,marginTop:2,fontFamily:"'JetBrains Mono',monospace"}}>x{item.report_count}</span>}
+              </div>
+              {/* Tickers */}
+              {item.affected_tickers&&item.affected_tickers.length>0&&<div style={{display:"flex",gap:4,marginBottom:6,flexWrap:"wrap"}}>
+                {item.affected_tickers.map(function(t){return <span key={t} className="b" onClick={function(){sMv("market");sSel(t)}} style={{fontSize:9,padding:"2px 7px",borderRadius:4,background:"#30D15815",color:"#30D158",border:"1px solid #30D15822",fontFamily:"'JetBrains Mono',monospace",fontWeight:600,cursor:"pointer"}}>{"$"+t}</span>})}
+              </div>}
+              {/* Event */}
+              {item.event&&item.event.action&&<div style={{fontSize:10,color:"#7A7A8E",marginBottom:5}}><span style={{color:"#EDEDF0"}}>{item.event.actor}</span> <span style={{color:"#8B80F0"}}>{(item.event.action||"").replace(/_/g," ")}</span>{item.event.target&&<span style={{color:"#EDEDF0"}}> to {item.event.target}</span>}{item.event.magnitude&&<span style={{color:"#FF9F0A"}}> ({item.event.magnitude})</span>}</div>}
+              {/* Intelligence — auto-expanded when present, collapsible */}
+              <div style={{marginTop:6}}>
+                {hasIntel&&<button className="b" onClick={toggleFy} style={{fontSize:10,color:"#8B80F0",background:"none",padding:"0",marginBottom:isExpanded?6:0,display:"flex",alignItems:"center",gap:5}}>
+                  <svg width="10" height="10" viewBox="0 0 10 10" fill="none" style={{transform:isExpanded?"rotate(90deg)":"rotate(0deg)",transition:"transform 0.2s",flexShrink:0}}><polyline points="2,2 8,5 2,8" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>
+                  {isExpanded?"Hide intelligence":"Show intelligence"}
+                  <span style={{fontSize:8,background:itemIntel.source==="auto"?"#8B80F020":"#30D15820",color:itemIntel.source==="auto"?"#8B80F0":"#30D158",padding:"1px 5px",borderRadius:3,fontFamily:"'JetBrains Mono',monospace"}}>{itemIntel.source==="auto"?"AUTO":"YOURS"}</span>
+                </button>}
+                {(isExpanded||!hasIntel)&&<IntelPanel alertId={item.id} borderColor={isAdj?"#FF9F0A":"#8B80F0"}/>}
+              </div>
+              {/* Tag row */}
+              <div style={{display:"flex",gap:5,alignItems:"center",flexWrap:"wrap",marginTop:8}}>
+                <span style={{fontSize:10,padding:"2px 8px",borderRadius:4,color:ic2,background:ic2+"18",border:"1px solid "+ic2+"30",fontWeight:600,fontFamily:"'JetBrains Mono',monospace"}}>{im2==="bullish"?"BULL":im2==="bearish"?"BEAR":"NEUT"}</span>
+                <span style={{fontSize:10,background:"#141420",padding:"2px 7px",borderRadius:4,color:sr.color,border:"1px solid #1C1C28"}}>{item.source_name||sr.name}</span>
+                {item.keyword&&<span style={{fontSize:10,background:"#5448C818",padding:"2px 7px",borderRadius:4,color:"#8B80F0",fontFamily:"'JetBrains Mono',monospace"}}>{item.keyword}</span>}
+                {item.url&&<a href={item.url} target="_blank" rel="noopener noreferrer" className="sl">Link</a>}
+                <span style={{fontSize:10,color:"#3A3A4E",marginLeft:"auto",fontFamily:"'JetBrains Mono',monospace"}}>{ago(item.published_at_utc||item.timestamp)}</span>
+              </div>
+            </div>
+          </div>;
+        })}
+        <div style={{fontSize:10,color:"#3A3A4E",textAlign:"center",padding:"12px 0",fontFamily:"'JetBrains Mono',monospace"}}>Showing {fyItems.length} personalised signals · refreshes every 30s</div>
+      </div>}
+    </div>;
+  };
+
   /* ===== ANALYTICS PAGE ===== */
   var AnalyticsPage = function(){
     return <div style={{flex:1,overflowY:"auto",padding:20}}>
@@ -1156,7 +1372,7 @@ function App(){
       </div>
       {/* Right: refresh + live/stop */}
       <div style={{display:"flex",gap:6,alignItems:"center",paddingRight:16,flexShrink:0}}>
-        <button className="b" onClick={function(){sRef(true);fetch(API+"/api/refresh",{method:"POST"}).then(function(){setTimeout(function(){F("/api/alerts?limit=300").then(function(d){if(d.alerts)sAl(d.alerts)}).catch(function(){});sRef(false)},3000)}).catch(function(){sRef(false)})}} style={{background:"#0F0F1A",color:"#7A7A8E",padding:"7px 12px",borderRadius:7,fontSize:11,border:"1px solid #1C1C28",display:"flex",alignItems:"center",gap:5}}>
+        <button className="b" onClick={function(){sRef(true);fetch(API+"/api/refresh",{method:"POST"}).then(function(){setTimeout(function(){F("/api/alerts?limit=300&sort="+(alertSortRef.current||"time")).then(function(d){if(d.alerts)sAl(d.alerts)}).catch(function(){});sRef(false)},3000)}).catch(function(){sRef(false)})}} style={{background:"#0F0F1A",color:"#7A7A8E",padding:"7px 12px",borderRadius:7,fontSize:11,border:"1px solid #1C1C28",display:"flex",alignItems:"center",gap:5}}>
           <svg width="12" height="12" viewBox="0 0 12 12" fill="none" style={{animation:ref?"spin 1s linear infinite":"none"}}><path d="M11 6A5 5 0 1 1 8.5 1.8" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round"/><polyline points="8,0 8.5,2.5 11,2" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round"/></svg>
           Refresh
         </button>
@@ -1175,6 +1391,7 @@ function App(){
       {/* Main content */}
       <div style={{flex:1,display:"flex",flexDirection:"column",overflow:"hidden",minWidth:0}}>
         {!conn&&<div style={{background:"#2A141A",borderBottom:"1px solid #FF453A25",padding:"6px 20px",fontSize:11,color:"#FF453A",flexShrink:0,fontFamily:"'JetBrains Mono',monospace"}}>Backend not reachable — check that SIGINT server is running</div>}
+        <div style={{display:mv==="foryou"?"flex":"none",flex:1,flexDirection:"column",minHeight:0,overflow:"hidden"}}><ForYouPage/></div>
         <div style={{display:mv==="alerts"?"flex":"none",flex:1,flexDirection:"column",minHeight:0,overflow:"hidden"}}><AlertsPage/></div>
         <div style={{display:mv==="market"?"flex":"none",flex:1,flexDirection:"column",minHeight:0,overflow:"hidden"}}><MarketsPage/></div>
         <div style={{display:mv==="economy"?"flex":"none",flex:1,flexDirection:"column",minHeight:0,overflow:"hidden"}}><EconomyPage/></div>
@@ -1187,7 +1404,7 @@ function App(){
 
     {/* Version badge */}
     <div style={{position:"fixed",bottom:8,left:SIDEBAR_W+10,zIndex:5,pointerEvents:"none"}}>
-      <span style={{fontSize:9,color:"#1C1C28",fontFamily:"'JetBrains Mono',monospace",letterSpacing:"0.05em",userSelect:"none"}}>SIGINT v2.0.2 · 2026-04-15</span>
+      <span style={{fontSize:9,color:"#1C1C28",fontFamily:"'JetBrains Mono',monospace",letterSpacing:"0.05em",userSelect:"none"}}>SIGINT v2.0.7 · 2026-04-15</span>
     </div>
   </div>;
 }

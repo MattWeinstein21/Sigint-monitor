@@ -144,6 +144,24 @@ def init_data_store():
     c.execute("CREATE INDEX IF NOT EXISTS idx_chat_alert ON chat_logs(alert_id)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_corrections_url ON sentiment_corrections(article_url)")
 
+    # Signal match metadata table
+    c.execute("""CREATE TABLE IF NOT EXISTS signal_matches (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        article_url TEXT,
+        keyword_original TEXT,
+        keyword_canonical TEXT,
+        match_tier INTEGER,
+        match_type TEXT,
+        matched_variant TEXT,
+        matched_tokens TEXT,
+        match_score REAL,
+        source_query_used TEXT,
+        body_pass_required INTEGER DEFAULT 0,
+        created_at TEXT
+    )""")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_sm_url ON signal_matches(article_url)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_sm_keyword ON signal_matches(keyword_original)")
+
     # Add columns if they don't exist (for upgrades from older schema)
     for col, coltype in [("sectors", "TEXT DEFAULT ''"), ("entities", "TEXT DEFAULT ''"),
                           ("user_corrected_sentiment", "TEXT DEFAULT ''"),
@@ -153,7 +171,8 @@ def init_data_store():
                           ("word_market_impact", "TEXT DEFAULT ''"),
                           ("ai_market_impact", "TEXT DEFAULT ''"),
                           ("published_at_utc", "TEXT DEFAULT ''"),
-                          ("user_corrected_impact", "TEXT DEFAULT ''")]:
+                          ("user_corrected_impact", "TEXT DEFAULT ''"),
+                          ("match_metadata", "TEXT DEFAULT ''")]:
         try:
             c.execute(f"ALTER TABLE articles ADD COLUMN {col} {coltype}")
         except Exception:
@@ -1668,6 +1687,619 @@ def extract_snippet(text, keyword, context_chars=120):
     return snippet
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# LAYERED SIGNAL ARCHITECTURE
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage A: Keyword normalization
+# Stage B: Variant/alias generation  
+# Stage C: Retrieval query planning
+# Stage D: Candidate retrieval (replaces literal-only polling)
+# Stage E: Multi-tier local matching/scoring
+# Stage F: Explainable match metadata
+# ═══════════════════════════════════════════════════════════════════════════════
+
+import unicodedata
+
+
+# ─── Stage A: Keyword Normalization ──────────────────────────────────────────
+
+def normalize_keyword(raw: str) -> str:
+    """Normalize a raw user-entered keyword into a canonical internal form.
+    
+    Transformations applied:
+    - Unicode NFKD normalization (handles accented chars, ligatures)
+    - Strip surrounding whitespace and quotes
+    - Collapse internal whitespace
+    - Lowercase
+    - Normalize punctuation variants: dots in abbreviations, hyphens
+    
+    The canonical form is used as the cache key and for variant generation.
+    The original raw form is always preserved alongside it.
+    """
+    if not raw:
+        return ""
+    # Unicode normalize
+    text = unicodedata.normalize("NFKD", raw)
+    # Strip surrounding quotes (single, double, curly)
+    text = text.strip("\"'\u2018\u2019\u201c\u201d")
+    # Strip whitespace
+    text = text.strip()
+    # Lowercase
+    text = text.lower()
+    # Collapse whitespace
+    text = re.sub(r"\s+", " ", text)
+    # Normalize dots in abbreviations: u.s. -> us, u.k. -> uk
+    text = re.sub(r"(?<=\b[a-z])\.(?=[a-z]\.)" , "", text)  # u.s. -> us.  (intermediate)
+    text = re.sub(r"(?<=[a-z]{1,4})\.$", "", text)         # trailing dot after short word
+    text = re.sub(r"\.", "", text) if re.match(r"^([a-z]\.){2,}", text) else text  # u.s.a. -> usa
+    # Final collapse
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def tokenize_keyword(canonical: str) -> list:
+    """Split canonical keyword into meaningful tokens, dropping stopwords for multi-word phrases."""
+    STOPWORDS = {"the", "a", "an", "of", "by", "in", "on", "at", "to", "for",
+                 "and", "or", "is", "are", "was", "were", "be", "been"}
+    tokens = canonical.split()
+    # Only drop stopwords if phrase has 3+ tokens (keep them for short phrases)
+    if len(tokens) >= 3:
+        tokens = [t for t in tokens if t not in STOPWORDS]
+    return tokens if tokens else canonical.split()
+
+
+# ─── Stage B: Variant Generation ─────────────────────────────────────────────
+
+# Cache: canonical keyword -> list of variant strings
+_variant_cache: dict = {}
+
+
+def generate_variants(canonical: str, original: str) -> list:
+    """Generate a list of surface-form variants for a keyword.
+    
+    Entirely generic — no hardcoded topic packs. Works for any user-defined phrase.
+    Returns variants in priority order (most specific first).
+    
+    Variant types generated:
+    1. Exact canonical form
+    2. Original user-entered form (if different from canonical)  
+    3. Hyphen <-> space swaps (e.g. "trade-war" <-> "trade war")
+    4. Abbreviation expansion/contraction (u.s. <-> us, u.k. <-> uk)
+    5. Token reorderings for 2-token phrases (safe: only when both tokens are nouns/verbs)
+    6. Plural/singular simple suffix variants
+    7. Punctuation-stripped variant
+    """
+    if canonical in _variant_cache:
+        return _variant_cache[canonical]
+    
+    seen = set()
+    variants = []
+    
+    def add(v):
+        v = v.strip()
+        if v and v not in seen and len(v) >= 2:
+            seen.add(v)
+            variants.append(v)
+    
+    # 1. Canonical (exact match, highest priority)
+    add(canonical)
+    
+    # 2. Original user form
+    add(original.lower().strip())
+    
+    tokens = canonical.split()
+    
+    # 3. Hyphen variants
+    if " " in canonical:
+        add(canonical.replace(" ", "-"))
+    if "-" in canonical:
+        add(canonical.replace("-", " "))
+    
+    # 4. U.S./US abbreviation variants
+    # us -> u.s.
+    us_pattern = re.compile(r"\bus\b")
+    uk_pattern = re.compile(r"\buk\b")
+    if us_pattern.search(canonical):
+        add(us_pattern.sub("u.s.", canonical))
+        add(us_pattern.sub("united states", canonical))
+        add(us_pattern.sub("american", canonical))
+    if uk_pattern.search(canonical):
+        add(uk_pattern.sub("u.k.", canonical))
+        add(uk_pattern.sub("united kingdom", canonical))
+        add(uk_pattern.sub("british", canonical))
+    # u.s. -> us (reverse direction for display forms)
+    if "u.s." in canonical:
+        add(canonical.replace("u.s.", "us"))
+        add(canonical.replace("u.s.", "united states"))
+    if "u.k." in canonical:
+        add(canonical.replace("u.k.", "uk"))
+    
+    # 5. Token reordering for exactly 2 tokens (e.g. "oil embargo" -> "embargo oil")
+    # Only do this if both tokens are >= 4 chars (avoids "us ban" -> "ban us" false positives)
+    if len(tokens) == 2 and all(len(t) >= 4 for t in tokens):
+        add(f"{tokens[1]} {tokens[0]}")
+    
+    # 6. Simple plural/singular
+    for t in variants[:]:  # iterate copy
+        if t.endswith("s") and len(t) > 4:
+            add(t[:-1])  # desuffix: blockades -> blockade
+        elif not t.endswith("s") and len(t) > 3:
+            add(t + "s")  # suffixed: blockade -> blockades
+        # -ing forms
+        if t.endswith("ing") and len(t) > 5:
+            add(t[:-3])   # blocking -> block
+            add(t[:-3] + "e")  # blockading -> blockade
+    
+    # 7. Strip all punctuation variant (catches hyphenated forms in text)
+    stripped = re.sub(r"[^\w\s]", " ", canonical)
+    stripped = re.sub(r"\s+", " ", stripped).strip()
+    add(stripped)
+    
+    # Cap at 20 variants to keep matching bounded
+    result = variants[:20]
+    _variant_cache[canonical] = result
+    return result
+
+
+def invalidate_variant_cache(canonical: str = None):
+    """Invalidate variant cache. Pass canonical to invalidate one entry, or None for all."""
+    if canonical:
+        _variant_cache.pop(canonical, None)
+    else:
+        _variant_cache.clear()
+
+
+# ─── Stage C: Retrieval Query Planning ───────────────────────────────────────
+
+def build_retrieval_queries(canonical: str, original: str, source_type: str) -> list:
+    """Build source-appropriate query strings from a canonical keyword.
+    
+    Returns a list of query strings to try, in priority order.
+    Source types: 'newsapi_exact', 'newsapi_loose', 'google_rss', 'full_text'
+    
+    Design principles:
+    - newsapi_exact: quoted phrase query — high precision, lower recall
+    - newsapi_loose: AND of tokens — better recall for multi-word phrases
+    - google_rss: URL-safe query string for Google News RSS search
+    - full_text: pattern for local regex matching against fetched body text
+    """
+    variants = generate_variants(canonical, original)
+    tokens = tokenize_keyword(canonical)
+    
+    queries = []
+    
+    if source_type == "newsapi_exact":
+        # Primary: quoted exact phrase
+        queries.append(f'"{ canonical}"')
+        # Secondary: quoted original if different
+        if original.lower().strip() != canonical:
+            queries.append(f'"{original.lower().strip()}"')
+        # For multi-word: also try quoted first meaningful variant
+        for v in variants[2:5]:
+            if " " in v or len(v) > len(canonical):
+                queries.append(f'"{v}"')
+    
+    elif source_type == "newsapi_loose":
+        # AND of all tokens — catches phrase variants without exact ordering
+        if len(tokens) >= 2:
+            queries.append(" AND ".join(tokens))
+        # OR of top variants for single-word or short keywords
+        if len(tokens) == 1:
+            top_vars = [v for v in variants[:6] if " " not in v]
+            if top_vars:
+                queries.append(" OR ".join(f'"{v}"' for v in top_vars[:4]))
+    
+    elif source_type == "google_rss":
+        # Google News RSS search — space-separated (URL-encoded by feedparser)
+        queries.append(canonical)
+        if original.lower().strip() != canonical:
+            queries.append(original.lower().strip())
+        # Variant with US expansion
+        for v in variants[:4]:
+            if v != canonical:
+                queries.append(v)
+                break
+    
+    elif source_type == "full_text":
+        # Return the variant list itself as the pattern pool
+        return variants
+    
+    # Deduplicate while preserving order
+    seen = set()
+    result = []
+    for q in queries:
+        if q not in seen:
+            seen.add(q)
+            result.append(q)
+    return result[:6]
+
+
+# ─── Stage D: Query Scheduler ─────────────────────────────────────────────────
+# Manages which keywords get queried against which sources on each cycle.
+# Uses a round-robin with priority weighting so niche keywords get their turn.
+
+class QueryScheduler:
+    """Round-robin query scheduler with per-source budget management.
+    
+    Ensures all user-defined keywords get queried over time, not just the first N.
+    Tracks per-keyword hit rate to boost high-value keywords and still ensure
+    zero-hit keywords eventually get scheduled.
+    """
+    
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._hit_counts: dict = {}       # canonical -> total hits
+        self._query_counts: dict = {}     # canonical -> times queried
+        self._last_queried: dict = {}     # canonical -> timestamp
+        self._rotation_idx: int = 0
+    
+    def record_hit(self, canonical: str):
+        with self._lock:
+            self._hit_counts[canonical] = self._hit_counts.get(canonical, 0) + 1
+    
+    def _priority_score(self, canonical: str) -> float:
+        """Score a keyword for scheduling priority. Higher = more likely to be queried.
+        
+        Combines:
+        - Hit rate: keywords that find articles get priority (they're active topics)
+        - Recency: keywords not queried recently get a boost (fairness)
+        - Query count: rarely-queried keywords get a boost
+        """
+        queries = self._query_counts.get(canonical, 0)
+        hits = self._hit_counts.get(canonical, 0)
+        last = self._last_queried.get(canonical, 0)
+        age_seconds = time.time() - last
+        
+        hit_rate = hits / max(queries, 1)
+        freshness_boost = min(age_seconds / 300, 3.0)  # up to 3x boost after 5 min
+        base = hit_rate * 2.0 + freshness_boost
+        if queries == 0:
+            base += 5.0  # Never-queried keywords always get priority
+        return base
+    
+    def select_for_budget(self, canonicals: list, budget: int) -> list:
+        """Select up to `budget` keywords from the list, prioritized by score.
+        Always includes the top-priority keywords. Returns list of canonicals."""
+        if not canonicals:
+            return []
+        if len(canonicals) <= budget:
+            with self._lock:
+                for c in canonicals:
+                    self._query_counts[c] = self._query_counts.get(c, 0) + 1
+                    self._last_queried[c] = time.time()
+            return canonicals
+        
+        with self._lock:
+            scored = sorted(canonicals, key=lambda c: self._priority_score(c), reverse=True)
+            selected = scored[:budget]
+            for c in selected:
+                self._query_counts[c] = self._query_counts.get(c, 0) + 1
+                self._last_queried[c] = time.time()
+        return selected
+
+
+# Module-level scheduler instance
+_query_scheduler = QueryScheduler()
+
+
+# ─── Stage E: Multi-Tier Matching ────────────────────────────────────────────
+
+def tier1_exact_match(text: str, canonical: str) -> tuple:
+    """Tier 1: Exact canonical phrase match with word boundaries.
+    Returns (matched: bool, match_obj or None)."""
+    pattern = keyword_regex(canonical)
+    m = pattern.search(text)
+    return (True, m) if m else (False, None)
+
+
+def tier2_variant_match(text: str, variants: list) -> tuple:
+    """Tier 2: Match any known variant of the keyword.
+    Returns (matched: bool, matched_variant or None)."""
+    for variant in variants:
+        pattern = keyword_regex(variant)
+        if pattern.search(text):
+            return True, variant
+    return False, None
+
+
+def tier3_proximity_match(text: str, tokens: list, window: int = 80) -> tuple:
+    """Tier 3: All required tokens present within a proximity window.
+    
+    For multi-word keywords (2+ meaningful tokens), checks that all tokens
+    appear within `window` characters of each other. This catches phrase
+    variants without exact ordering or exact spelling.
+    
+    Returns (matched: bool, explanation str).
+    """
+    if len(tokens) < 2:
+        return False, ""
+    
+    text_lower = text.lower()
+    # Find positions of each token
+    positions = {}
+    for token in tokens:
+        pat = re.compile(rf"(?<!\w){re.escape(token)}(?!\w)", re.IGNORECASE)
+        matches = list(pat.finditer(text_lower))
+        if not matches:
+            return False, ""  # Token completely absent — no match
+        positions[token] = [m.start() for m in matches]
+    
+    # Check if all tokens co-occur within the window
+    # Use first occurrence of each token and compute span
+    first_positions = [positions[t][0] for t in tokens]
+    span = max(first_positions) - min(first_positions)
+    
+    if span <= window:
+        return True, f"tokens {tokens} within {span}ch"
+    
+    # Try all combination of positions (cap search for long lists)
+    import itertools
+    combos = list(itertools.product(*[positions[t][:3] for t in tokens]))
+    for combo in combos[:50]:
+        span = max(combo) - min(combo)
+        if span <= window:
+            return True, f"tokens {tokens} within {span}ch"
+    
+    return False, ""
+
+
+def score_candidate(text: str, canonical: str, original: str, variants: list = None) -> dict:
+    """Run all matching tiers against text and return a scored match result.
+    
+    Returns dict with keys:
+    - matched (bool)
+    - tier (int: 1/2/3/0)
+    - match_type (str)
+    - matched_variant (str)
+    - matched_tokens (list)
+    - match_score (float: 0.0-1.0)
+    - explanation (str)
+    
+    Score interpretation:
+    - 1.0: exact phrase match (tier 1)
+    - 0.8: variant match (tier 2)
+    - 0.6: proximity/token match (tier 3)
+    - 0.0: no match
+    """
+    if variants is None:
+        variants = generate_variants(canonical, original)
+    tokens = tokenize_keyword(canonical)
+    text_lower = text.lower() if text else ""
+    
+    # Tier 1: exact canonical
+    matched, m = tier1_exact_match(text_lower, canonical)
+    if matched:
+        return {
+            "matched": True, "tier": 1, "match_type": "exact_phrase",
+            "matched_variant": canonical, "matched_tokens": tokens,
+            "match_score": 1.0, "explanation": f"exact match: '{canonical}'"
+        }
+    
+    # Tier 2: variant match
+    matched, matched_variant = tier2_variant_match(text_lower, variants[1:])
+    if matched:
+        return {
+            "matched": True, "tier": 2, "match_type": "variant_phrase",
+            "matched_variant": matched_variant, "matched_tokens": tokens,
+            "match_score": 0.8, "explanation": f"variant match: '{matched_variant}'"
+        }
+    
+    # Tier 3: proximity match (multi-word keywords only)
+    if len(tokens) >= 2:
+        matched, explanation = tier3_proximity_match(text_lower, tokens)
+        if matched:
+            return {
+                "matched": True, "tier": 3, "match_type": "proximity_tokens",
+                "matched_variant": " ".join(tokens), "matched_tokens": tokens,
+                "match_score": 0.6, "explanation": explanation
+            }
+    
+    return {
+        "matched": False, "tier": 0, "match_type": "none",
+        "matched_variant": "", "matched_tokens": [], "match_score": 0.0,
+        "explanation": ""
+    }
+
+
+def severity_from_score_result(result: dict, position_in_text: int = 9999) -> str:
+    """Derive severity from match score + position."""
+    score = result.get("match_score", 0)
+    if score >= 1.0 and position_in_text < 140:
+        return "high"
+    elif score >= 0.8:
+        return "medium"
+    elif score >= 0.6:
+        return "low"
+    return "low"
+
+
+# ─── Stage F: Match Metadata Storage ─────────────────────────────────────────
+
+def log_signal_match(article_url: str, keyword_original: str, keyword_canonical: str,
+                     score_result: dict, source_query_used: str = "", body_pass: bool = False):
+    """Store explainable match metadata for debugging and future learning."""
+    try:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("""INSERT INTO signal_matches
+            (article_url, keyword_original, keyword_canonical, match_tier, match_type,
+             matched_variant, matched_tokens, match_score, source_query_used,
+             body_pass_required, created_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (article_url, keyword_original, keyword_canonical,
+             score_result.get("tier", 0), score_result.get("match_type", ""),
+             score_result.get("matched_variant", ""),
+             json.dumps(score_result.get("matched_tokens", [])),
+             score_result.get("match_score", 0.0),
+             source_query_used, 1 if body_pass else 0,
+             datetime.now(timezone.utc).isoformat()))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log.debug(f"signal_match log error: {e}")
+
+
+# ─── Article Body Fetcher (Tier 4: second-pass) ───────────────────────────────
+
+_body_cache: dict = {}        # url -> {text, ts}
+_BODY_CACHE_TTL = 3600        # 1 hour
+
+
+def fetch_article_body(url: str, timeout: int = 8) -> str:
+    """Fetch and extract article body text for second-pass matching.
+    
+    Only called for borderline candidates (tier 3 proximity hit or near-miss).
+    Uses BeautifulSoup paragraph extraction. Cached per-URL.
+    Returns extracted text or empty string on failure.
+    """
+    cached = _body_cache.get(url)
+    if cached and (time.time() - cached["ts"]) < _BODY_CACHE_TTL:
+        return cached["text"]
+    try:
+        resp = requests.get(url, timeout=timeout, headers={
+            "User-Agent": "Mozilla/5.0 (compatible; SIGINT Monitor/1.0)"
+        })
+        if resp.status_code != 200:
+            return ""
+        soup = BeautifulSoup(resp.text, "html.parser")
+        # Remove boilerplate
+        for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
+            tag.decompose()
+        # Prefer article body
+        body = soup.find("article") or soup.find("main") or soup.body
+        if not body:
+            return ""
+        paragraphs = body.find_all("p")
+        text = " ".join(p.get_text(" ", strip=True) for p in paragraphs)
+        text = normalize_whitespace(text)[:6000]
+        _body_cache[url] = {"text": text, "ts": time.time()}
+        return text
+    except Exception:
+        return ""
+
+
+# ─── High-level match function: replaces match_keywords() for retrieval ──────
+
+def match_keyword_layered(text: str, canonical: str, original: str,
+                           url: str = "", source_query: str = "",
+                           try_body_fetch: bool = False) -> dict:
+    """Full layered match for a single keyword against text.
+    
+    Args:
+        text: The text to match against (title + summary)
+        canonical: Normalized canonical keyword
+        original: Original user-entered keyword
+        url: Article URL (for body fetch + metadata logging)
+        source_query: The query string used to retrieve this candidate
+        try_body_fetch: If True and tier1/2 miss, attempt body-text second pass
+    
+    Returns score_result dict (see score_candidate docstring).
+    """
+    variants = generate_variants(canonical, original)
+    result = score_candidate(text, canonical, original, variants)
+    
+    # Body-text second pass: trigger if no match OR tier3 shallow match (score < 0.8).
+    # A weak shallow match may miss the real signal — body text can upgrade it.
+    if try_body_fetch and url and (not result["matched"] or result.get("match_score", 1.0) < 0.8):
+        body_text = fetch_article_body(url)
+        if body_text:
+            body_result = score_candidate(body_text, canonical, original, variants)
+            if body_result["matched"]:
+                body_result["explanation"] = "[body] " + body_result["explanation"]
+                # Discount score slightly (body-only match is weaker signal)
+                body_result["match_score"] = round(body_result["match_score"] * 0.85, 3)
+                # Only upgrade if body evidence is strictly stronger than shallow result.
+                # If the shallow match already exists and scored higher, keep it.
+                if not result["matched"] or body_result["match_score"] > result["match_score"]:
+                    if url:
+                        log_signal_match(url, original, canonical, body_result, source_query, body_pass=True)
+                    return body_result
+    
+    if result["matched"] and url:
+        log_signal_match(url, original, canonical, result, source_query)
+    
+    return result
+
+
+# ─── Keyword batch processor: replaces match_keywords() for polling ──────────
+
+def match_keywords_layered(text: str, keyword_pairs: list,
+                            url: str = "", source_query: str = "",
+                            min_score: float = 0.6,
+                            try_body_fetch: bool = False) -> list:
+    """Match text against multiple keywords using the layered engine.
+    
+    Args:
+        text: Text to match (title + summary)
+        keyword_pairs: List of (original, canonical) tuples
+        url: Article URL
+        source_query: Query that retrieved this candidate
+        min_score: Minimum score to count as a match (default 0.6 = tier3 threshold)
+        try_body_fetch: If True, attempt body-text upgrade for tier3/no-match candidates.
+                        Enable for article sources (RSS, WH). Disable for social posts
+                        where the entry text IS the full content.
+    
+    Returns list of (original_keyword, severity, score_result) tuples.
+    """
+    results = []
+    for original, canonical in keyword_pairs:
+        result = match_keyword_layered(
+            text, canonical, original,
+            url=url, source_query=source_query,
+            try_body_fetch=try_body_fetch
+        )
+        if result["matched"] and result["match_score"] >= min_score:
+            # Compute position for severity calculation
+            # Use index of matched variant in text
+            pos = 9999
+            mv = result.get("matched_variant", "")
+            if mv:
+                idx = text.lower().find(mv.lower())
+                if idx >= 0:
+                    pos = idx
+            sev = severity_from_score_result(result, pos)
+            results.append((original, sev, result))
+    return results
+
+
+def build_keyword_pairs(keywords: list) -> list:
+    """Convert a list of raw keyword strings into (original, canonical) pairs."""
+    pairs = []
+    for kw in keywords:
+        canonical = normalize_keyword(kw)
+        if canonical:
+            pairs.append((kw, canonical))
+    return pairs
+
+
+# ─── Dynamic Google News RSS feeds ───────────────────────────────────────────
+
+def build_google_news_feeds(keywords: list, max_feeds: int = 8) -> list:
+    """Build Google News RSS search URLs for a rotation of keywords.
+    
+    Returns list of (feed_url, query_str) tuples.
+    Uses the query scheduler to select which keywords get dynamic feeds this cycle.
+    """
+    if not keywords:
+        return []
+    
+    canonicals = [normalize_keyword(kw) for kw in keywords if kw.strip()]
+    canonicals = [c for c in canonicals if c]
+    # Use scheduler to pick which get dynamic feeds
+    selected = _query_scheduler.select_for_budget(canonicals, max_feeds)
+    
+    feeds = []
+    for canonical in selected:
+        # Find the original keyword
+        original = next((kw for kw in keywords if normalize_keyword(kw) == canonical), canonical)
+        queries = build_retrieval_queries(canonical, original, "google_rss")
+        for q in queries[:1]:  # One feed per keyword
+            encoded = requests.utils.quote(q)
+            url = f"https://news.google.com/rss/search?q={encoded}&hl=en-US&gl=US&ceid=US:en"
+            feeds.append((url, q))
+    return feeds
+
+
 # ─── Sentiment Analysis Engine ────────────────────────────────────────────────
 
 # Source credibility weights — higher = more market impact
@@ -2481,26 +3113,63 @@ _max_article_age_hours = 4
 
 
 def poll_rss(keywords):
-    """Poll all configured RSS feeds for keyword matches."""
-    for source_id, source in RSS_SOURCES.items():
+    """Poll all configured RSS feeds for keyword matches.
+    
+    Upgrade from original:
+    - Uses layered matching (tier 1/2/3) instead of exact-only
+    - Dynamic Google News feeds generated from full keyword list via scheduler
+    - Match metadata stored for debugging
+    """
+    keyword_pairs = build_keyword_pairs(keywords)
+    if not keyword_pairs:
+        return
+    
+    # Build combined source list: static RSS + dynamic Google News
+    all_sources = {}
+    for sid, src in RSS_SOURCES.items():
+        all_sources[sid] = src
+    
+    # Add dynamic Google News feeds for current keyword rotation
+    dynamic_feeds = build_google_news_feeds(keywords, max_feeds=8)
+    if dynamic_feeds:
+        all_sources["google_news_dynamic"] = {
+            "name": "Google News",
+            "feeds": [url for url, _ in dynamic_feeds],
+            "_query_labels": {url: q for url, q in dynamic_feeds},
+        }
+    
+    for source_id, source in all_sources.items():
+        query_labels = source.get("_query_labels", {})
         for feed_url in source["feeds"]:
+            source_query = query_labels.get(feed_url, feed_url)
             try:
                 feed = feedparser.parse(feed_url)
                 for entry in feed.entries[:20]:
-                    # Check freshness
                     entry_date = parse_entry_date(entry)
                     if not is_fresh(entry_date, _max_article_age_hours):
                         continue
-
                     title = normalize_whitespace(entry.get("title", ""))
                     summary = entry.get("summary", entry.get("description", ""))
                     link = normalize_whitespace(entry.get("link", ""))
                     if not title or not is_valid_source_url(link):
                         continue
                     full_text = cleaned_entry_text(title, summary)
-                    matches = match_keywords(full_text, keywords)
-                    for kw, sev in matches:
-                        snippet = extract_snippet(full_text, kw)
+                    
+                    # Layered matching — body fetch enabled for article sources
+                    matches = match_keywords_layered(
+                        full_text, keyword_pairs, url=link, source_query=source_query,
+                        try_body_fetch=True
+                    )
+                    for kw, sev, score_result in matches:
+                        display_kw = score_result.get("matched_variant") or kw
+                        # Use the text source that actually caused the match.
+                        # Body-matched results need snippet from body; cached so free.
+                        if score_result.get("explanation", "").startswith("[body]"):
+                            snippet_src = fetch_article_body(link) or full_text
+                        else:
+                            snippet_src = full_text
+                        snippet = extract_snippet(snippet_src, display_kw)
+                        _query_scheduler.record_hit(normalize_keyword(kw))
                         store.add(
                             source_id=source_id,
                             source_name=source["name"],
@@ -2516,59 +3185,136 @@ def poll_rss(keywords):
 
 
 def poll_newsapi(keywords, api_key):
-    """Poll NewsAPI for keyword matches (requires free API key from newsapi.org).
-    Config option newsapi_mode: 'trump_only' (legacy) or 'all_news' (default)."""
+    """Poll NewsAPI with layered query strategy.
+    
+    Upgrade from original:
+    - Uses QueryScheduler to rotate ALL keywords, not just first 10
+    - Per-keyword: tries exact phrase query first, then loose AND-token query
+    - Layered local matching on retrieved candidates
+    - Match metadata stored
+    """
     if not api_key:
         return
     try:
         config = load_config()
         newsapi_mode = config.get("newsapi_mode", "all_news")
-        priority_kw = keywords[:10]
-        for kw in priority_kw:
-            url = "https://newsapi.org/v2/everything"
+        keyword_pairs = build_keyword_pairs(keywords)
+        
+        # Schedule: up to 12 keywords per cycle (NewsAPI allows 100/day on free tier)
+        canonicals = [c for _, c in keyword_pairs]
+        scheduled = _query_scheduler.select_for_budget(canonicals, budget=12)
+        
+        # Map canonical -> original for query building
+        canonical_to_original = {c: o for o, c in keyword_pairs}
+        
+        url_base = "https://newsapi.org/v2/everything"
+        
+        for canonical in scheduled:
+            original = canonical_to_original.get(canonical, canonical)
+            
+            # Build queries for this keyword: exact first, loose second
+            exact_queries = build_retrieval_queries(canonical, original, "newsapi_exact")
+            loose_queries = build_retrieval_queries(canonical, original, "newsapi_loose")
+            
+            queries_to_try = []
             if newsapi_mode == "trump_only":
-                q_param = f'Trump AND "{kw}"'
+                queries_to_try = [(f'Trump AND {q}', "exact") for q in exact_queries[:1]]
             else:
-                q_param = f'"{kw}"'
-            params = {
-                "q": q_param,
-                "sortBy": "publishedAt",
-                "pageSize": 10,
-                "apiKey": api_key,
-                "language": "en",
-            }
-            resp = requests.get(url, params=params, timeout=15)
-            if resp.status_code != 200:
-                log.warning(f"NewsAPI error: {resp.status_code}")
-                continue
-            data = resp.json()
-            for article in data.get("articles", []):
-                # Check freshness
-                pub_date = parse_iso_date(article.get("publishedAt"))
-                if not is_fresh(pub_date, _max_article_age_hours):
-                    continue
-
-                title = normalize_whitespace(article.get("title", ""))
-                desc = normalize_whitespace(article.get("description", "") or "")
-                source_name = article.get("source", {}).get("name", "NewsAPI")
-                link = normalize_whitespace(article.get("url", ""))
-                if not title or not is_valid_source_url(link):
-                    continue
-                full_text = cleaned_entry_text(title, desc)
-                matches = match_keywords(full_text, keywords)
-                for matched_kw, sev in matches:
-                    snippet = extract_snippet(full_text, matched_kw)
-                    store.add(
-                        source_id="newsapi",
-                        source_name=source_name,
-                        title=title,
-                        url=link,
-                        snippet=snippet,
-                        keyword=matched_kw,
-                        severity=sev,
-                        published_at=pub_date,
-                    )
-            time.sleep(1)
+                queries_to_try = [(q, "exact") for q in exact_queries[:2]]
+                queries_to_try += [(q, "loose") for q in loose_queries[:1]]
+            
+            seen_urls_this_kw = set()
+            
+            for q_param, q_style in queries_to_try:
+                params = {
+                    "q": q_param,
+                    "sortBy": "publishedAt",
+                    "pageSize": 10,
+                    "apiKey": api_key,
+                    "language": "en",
+                }
+                try:
+                    resp = requests.get(url_base, params=params, timeout=15)
+                    if resp.status_code == 429:
+                        log.warning("NewsAPI rate limited (429) — skipping remaining queries")
+                        return
+                    if resp.status_code != 200:
+                        log.warning(f"NewsAPI error: {resp.status_code} for query '{q_param}'")
+                        continue
+                    data = resp.json()
+                    
+                    for article in data.get("articles", []):
+                        pub_date = parse_iso_date(article.get("publishedAt"))
+                        if not is_fresh(pub_date, _max_article_age_hours):
+                            continue
+                        title = normalize_whitespace(article.get("title", ""))
+                        desc = normalize_whitespace(article.get("description", "") or "")
+                        source_name = article.get("source", {}).get("name", "NewsAPI")
+                        link = normalize_whitespace(article.get("url", ""))
+                        if not title or not is_valid_source_url(link):
+                            continue
+                        if link in seen_urls_this_kw:
+                            continue
+                        seen_urls_this_kw.add(link)
+                        
+                        full_text = cleaned_entry_text(title, desc)
+                        
+                        # Layered local matching — even though NewsAPI retrieved it,
+                        # we still score locally to get tier/variant/explanation
+                        matches = match_keywords_layered(
+                            full_text, keyword_pairs, url=link, source_query=q_param,
+                            min_score=0.5  # slightly lower threshold since NewsAPI pre-filtered
+                        )
+                        
+                        if not matches:
+                            # NewsAPI says relevant but local match failed — try body fetch
+                            # for borderline cases (loose query style)
+                            if q_style == "loose":
+                                result = match_keyword_layered(
+                                    full_text, canonical, original, url=link,
+                                    source_query=q_param, try_body_fetch=True
+                                )
+                                if result["matched"] and result["match_score"] >= 0.5:
+                                    _query_scheduler.record_hit(canonical)
+                                    sev = severity_from_score_result(result)
+                                    # Use the actual text source that caused the match for the snippet.
+                                    # If the match came from body fetch, re-use cached body text
+                                    # so the snippet contains the matched term.
+                                    if result.get("explanation", "").startswith("[body]"):
+                                        snippet_src = fetch_article_body(link) or full_text
+                                    else:
+                                        snippet_src = full_text
+                                    snippet = extract_snippet(snippet_src, result.get("matched_variant") or original)
+                                    store.add(
+                                        source_id="newsapi",
+                                        source_name=source_name,
+                                        title=title,
+                                        url=link,
+                                        snippet=snippet,
+                                        keyword=original,
+                                        severity=sev,
+                                        published_at=pub_date,
+                                    )
+                            continue
+                        
+                        for kw, sev, score_result in matches:
+                            _query_scheduler.record_hit(normalize_keyword(kw))
+                            snippet = extract_snippet(full_text, score_result.get("matched_variant") or kw)
+                            store.add(
+                                source_id="newsapi",
+                                source_name=source_name,
+                                title=title,
+                                url=link,
+                                snippet=snippet,
+                                keyword=kw,
+                                severity=sev,
+                                published_at=pub_date,
+                            )
+                    time.sleep(0.5)
+                except requests.exceptions.RequestException as e:
+                    log.warning(f"NewsAPI request error for '{q_param}': {e}")
+            
+            time.sleep(1)  # Rate limit between keywords
     except Exception as e:
         log.warning(f"NewsAPI error: {e}")
 
@@ -2576,6 +3322,10 @@ def poll_newsapi(keywords, api_key):
 def poll_whitehouse(keywords):
     """Scrape White House presidential actions page for new items.
     Prefers article containers, filters nav links, checks freshness."""
+    # Build once per poll cycle — variant generation is cached but normalization still loops
+    keyword_pairs = build_keyword_pairs(keywords)
+    if not keyword_pairs:
+        return
     try:
         resp = requests.get(WHITEHOUSE_URL, timeout=15, headers={
             "User-Agent": "Mozilla/5.0 (compatible; KeywordMonitor/1.0)"
@@ -2615,14 +3365,24 @@ def poll_whitehouse(keywords):
             # Skip non-content URLs
             if any(x in href.lower() for x in ["/search", "/contact", "/privacy", "/accessibility", "#", "javascript:"]):
                 continue
-            matches = match_keywords(text, keywords)
-            for kw, sev in matches:
+            matches = match_keywords_layered(
+                text, keyword_pairs,
+                url=href, source_query="whitehouse_scrape",
+                try_body_fetch=True
+            )
+            for kw, sev, score_result in matches:
+                display_kw = score_result.get("matched_variant") or kw
+                # Use body text for snippet if the match came from body fetch.
+                if score_result.get("explanation", "").startswith("[body]"):
+                    snippet_src = fetch_article_body(href) or text
+                else:
+                    snippet_src = text
                 store.add(
                     source_id="whitehouse",
                     source_name="White House",
                     title=text,
                     url=href,
-                    snippet=extract_snippet(text, kw),
+                    snippet=extract_snippet(snippet_src, display_kw),
                     keyword=kw,
                     severity="high",
                 )
@@ -2729,6 +3489,10 @@ def poll_truthsocial(keywords, accounts):
     Poll Truth Social for each monitored account via RSSHub proxy.
     accounts: list of {"username": "...", "label": "..."} dicts
     """
+    # Build once — shared across all accounts this cycle
+    keyword_pairs = build_keyword_pairs(keywords)
+    if not keyword_pairs:
+        return
     for acct in accounts:
         username = acct.get("username", "")
         label = acct.get("label", "") or f"@{username}"
@@ -2752,9 +3516,14 @@ def poll_truthsocial(keywords, accounts):
                 clean = cleaned_entry_text(title, summary)
                 if not clean:
                     continue
-                matches = match_keywords(clean, keywords)
-                for kw, sev in matches:
-                    snippet = extract_snippet(clean, kw)
+                # No body fetch — post text IS the full content for social sources
+                matches = match_keywords_layered(
+                    clean, keyword_pairs,
+                    url=link, source_query="truthsocial_rss"
+                )
+                for kw, sev, score_result in matches:
+                    display_kw = score_result.get("matched_variant") or kw
+                    snippet = extract_snippet(clean, display_kw)
                     store.add(
                         source_id="truthsocial",
                         source_name=f"Truth Social – {label}",
@@ -2775,6 +3544,10 @@ def poll_twitter(keywords, bearer_token, accounts):
       1. If bearer_token is set, try the user timeline API (requires Basic $100/mo tier).
       2. Always try RSSHub RSS proxy as fallback (free, no key needed).
     """
+    # Build once — shared across all accounts and both fetch paths this cycle
+    keyword_pairs = build_keyword_pairs(keywords)
+    if not keyword_pairs:
+        return
     for acct in accounts:
         username = acct.get("username", "")
         label = acct.get("label", "") or f"@{username}"
@@ -2808,9 +3581,14 @@ def poll_twitter(keywords, bearer_token, accounts):
                                 if not text or not tweet_id:
                                     continue
                                 link = f"https://x.com/{username}/status/{tweet_id}"
-                                matches = match_keywords(text, keywords)
-                                for matched_kw, sev in matches:
-                                    snippet = extract_snippet(text, matched_kw)
+                                # No body fetch — tweet text IS the full content
+                                matches = match_keywords_layered(
+                                    text, keyword_pairs,
+                                    url=link, source_query="twitter_api"
+                                )
+                                for matched_kw, sev, score_result in matches:
+                                    display_kw = score_result.get("matched_variant") or matched_kw
+                                    snippet = extract_snippet(text, display_kw)
                                     store.add(
                                         source_id="x_twitter",
                                         source_name=f"X – @{username}",
@@ -2851,9 +3629,14 @@ def poll_twitter(keywords, bearer_token, accounts):
                     clean = cleaned_entry_text(title, summary)
                     if not clean:
                         continue
-                    matches = match_keywords(clean, keywords)
-                    for kw, sev in matches:
-                        snippet = extract_snippet(clean, kw)
+                    # No body fetch — post text IS the full content
+                    matches = match_keywords_layered(
+                        clean, keyword_pairs,
+                        url=link, source_query="twitter_rss"
+                    )
+                    for kw, sev, score_result in matches:
+                        display_kw = score_result.get("matched_variant") or kw
+                        snippet = extract_snippet(clean, display_kw)
                         store.add(
                             source_id="x_twitter",
                             source_name=f"X – @{username}",
@@ -2970,6 +3753,27 @@ def get_alerts():
 def clear_alerts():
     store.clear()
     return jsonify({"status": "cleared"})
+
+
+@app.route("/api/signal/matches")
+def get_signal_matches():
+    """Return recent signal match metadata for debugging."""
+    keyword = request.args.get("keyword", "")
+    limit = request.args.get("limit", 50, type=int)
+    try:
+        conn = get_db()
+        c = conn.cursor()
+        if keyword:
+            c.execute("""SELECT * FROM signal_matches 
+                WHERE keyword_original = ? OR keyword_canonical = ?
+                ORDER BY id DESC LIMIT ?""", (keyword, keyword, limit))
+        else:
+            c.execute("SELECT * FROM signal_matches ORDER BY id DESC LIMIT ?", (limit,))
+        rows = [dict(r) for r in c.fetchall()]
+        conn.close()
+        return jsonify({"matches": rows, "count": len(rows)})
+    except Exception as e:
+        return jsonify({"matches": [], "error": str(e)})
 
 
 @app.route("/api/keywords")

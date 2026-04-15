@@ -1730,7 +1730,7 @@ def normalize_keyword(raw: str) -> str:
     text = re.sub(r"\s+", " ", text)
     # Normalize dots in abbreviations: u.s. -> us, u.k. -> uk
     text = re.sub(r"(?<=\b[a-z])\.(?=[a-z]\.)" , "", text)  # u.s. -> us.  (intermediate)
-    text = re.sub(r"(?<=[a-z]{1,4})\.$", "", text)         # trailing dot after short word
+    text = re.sub(r"([a-z]{1,4})\.$", r"\1", text)         # trailing dot after short word
     text = re.sub(r"\.", "", text) if re.match(r"^([a-z]\.){2,}", text) else text  # u.s.a. -> usa
     # Final collapse
     text = re.sub(r"\s+", " ", text).strip()

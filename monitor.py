@@ -1616,7 +1616,7 @@ class AlertStore:
             items = self.alerts
             if since:
                 items = [a for a in items if a["timestamp"] > since]
-            # Compute attention scores
+            # Compute attention scores (0-100) for every alert before returning
             wl_tickers = self._get_watchlist_tickers()
             for a in items:
                 a["attention_score"] = self._compute_attention(a, wl_tickers)
@@ -1664,60 +1664,6 @@ class AlertStore:
                 score += 10
         score += alert.get("source_reliability", 0.5) * 10
         return round(min(100, max(0, score)), 1)
-
-    def get_incidents(self, limit=50):
-        """Group alerts into incidents by semantic similarity.
-        Returns [{main, related, related_count, attention_score, source_count, sources, latest_update}]
-        """
-        with self.lock:
-            wl_tickers = self._get_watchlist_tickers()
-            for a in self.alerts:
-                a["attention_score"] = self._compute_attention(a, wl_tickers)
-            scored = sorted(self.alerts, key=lambda x: x.get("attention_score", 0), reverse=True)
-            used = set()
-            incidents = []
-            for alert in scored:
-                aid = alert["id"]
-                if aid in used:
-                    continue
-                used.add(aid)
-                main_words = set(re.sub(r'[^\w\s]', '', alert["title"].lower()).split())
-                related = []
-                if len(main_words) >= 3:
-                    for other in scored:
-                        if other["id"] in used:
-                            continue
-                        other_words = set(re.sub(r'[^\w\s]', '', other["title"].lower()).split())
-                        if len(other_words) < 3:
-                            continue
-                        sim = len(main_words & other_words) / len(main_words | other_words)
-                        if sim > 0.40:
-                            related.append(other)
-                            used.add(other["id"])
-                # Build incident
-                all_sources = set()
-                all_sources.add(alert.get("source_name", ""))
-                for r in related:
-                    all_sources.add(r.get("source_name", ""))
-                for s in alert.get("also_reported_by", []):
-                    all_sources.add(s)
-                all_sources.discard("")
-                latest = alert.get("published_at_utc") or alert.get("timestamp", "")
-                for r in related:
-                    rt = r.get("published_at_utc") or r.get("timestamp", "")
-                    if rt > latest:
-                        latest = rt
-                incidents.append({
-                    "main": alert,
-                    "related": related,
-                    "related_count": len(related) + alert.get("report_count", 1) - 1,
-                    "attention_score": alert.get("attention_score", 0),
-                    "source_count": len(all_sources),
-                    "sources": list(all_sources),
-                    "latest_update": latest,
-                })
-            incidents.sort(key=lambda x: x["attention_score"], reverse=True)
-            return incidents[:limit]
 
     def clear(self):
         with self.lock:
@@ -1829,7 +1775,7 @@ def normalize_keyword(raw: str) -> str:
     text = re.sub(r"\s+", " ", text)
     # Normalize dots in abbreviations: u.s. -> us, u.k. -> uk
     text = re.sub(r"(?<=\b[a-z])\.(?=[a-z]\.)" , "", text)  # u.s. -> us.  (intermediate)
-    text = re.sub(r"([a-z]{1,4})\.$", r"\1", text)         # trailing dot after short word
+    text = re.sub(r"(?<=[a-z]{1,4})\.$", "", text)         # trailing dot after short word
     text = re.sub(r"\.", "", text) if re.match(r"^([a-z]\.){2,}", text) else text  # u.s.a. -> usa
     # Final collapse
     text = re.sub(r"\s+", " ", text).strip()
@@ -3848,27 +3794,7 @@ def index():
 def get_alerts():
     since = request.args.get("since")
     limit = request.args.get("limit", type=int)
-    sort = request.args.get("sort", "time")  # "time" (default) or "score"
-    alerts = store.get_all(since=since, limit=limit)
-    if sort == "score":
-        alerts.sort(key=lambda x: x.get("attention_score", 0), reverse=True)
-    return jsonify({"alerts": alerts})
-
-
-@app.route("/api/alerts/incidents")
-def get_alert_incidents():
-    """Get alerts grouped into incidents, ranked by attention score."""
-    limit = request.args.get("limit", 50, type=int)
-    incidents = store.get_incidents(limit=limit)
-    # Split into critical (top scored) and rest
-    critical = []
-    rest = []
-    for inc in incidents:
-        if inc["attention_score"] >= 50 and len(critical) < 5:
-            critical.append(inc)
-        else:
-            rest.append(inc)
-    return jsonify({"critical": critical, "rest": rest, "total_incidents": len(incidents)})
+    return jsonify({"alerts": store.get_all(since=since, limit=limit)})
 
 
 @app.route("/api/alerts", methods=["DELETE"])
@@ -4138,12 +4064,10 @@ def ollama_chat():
 
     # Find the alert and its context
     context = ""
-    alert_ref = None
     with store.lock:
         for a in store.alerts:
             if a["id"] == alert_id:
-                context = f"Title: {a['title']}\nSource: {a['source_name']}\nURL: {a.get('url', '')}\nSummary: {a.get('summary', '')}\nSnippet: {a.get('snippet', '')}"
-                alert_ref = {"title": a.get("title", ""), "url": a.get("url", ""), "source": a.get("source_name", "")}
+                context = f"Title: {a['title']}\nSource: {a['source_name']}\nSummary: {a.get('summary', '')}\nSnippet: {a.get('snippet', '')}"
                 break
 
     if not context:
@@ -4197,8 +4121,7 @@ def ollama_chat():
                         break
             log_chat(alert_id, article_title, question, answer,
                      article_url=article_url, source_id=source_id_chat, keyword=keyword_chat)
-            refs = [alert_ref] if alert_ref else []
-            return jsonify({"answer": answer, "references": refs})
+            return jsonify({"answer": answer})
         return jsonify({"error": f"Ollama returned {resp.status_code}"}), 500
     except requests.exceptions.Timeout:
         log_system_event("ollama_timeout", "Per-article chat timeout",
@@ -4245,7 +4168,7 @@ def general_chat():
                          "should", "think", "your", "that", "this", "have", "from",
                          "they", "been", "with", "will", "does", "going")]
 
-        safe_cols = "title, url, summary, sentiment, source_name, published_at, keyword"
+        safe_cols = "title, summary, sentiment, source_name, published_at, keyword"
         try:
             c.execute("SELECT market_impact FROM articles LIMIT 1")
             safe_cols += ", market_impact"
@@ -4284,17 +4207,13 @@ def general_chat():
         recent_articles = []
         sentiment_24h = {}
 
-    # Build article reference list for citations
-    _chat_refs = []
-
     if matched_articles:
         context_parts.append("RELEVANT ARTICLES:")
         for a in matched_articles:
             impact = a.get("user_corrected_impact", "") or a.get("market_impact", "")
+            # Trim summaries aggressively
             summary = a.get("summary", "")[:100]
-            ref_num = len(_chat_refs) + 1
-            _chat_refs.append({"n": ref_num, "title": a.get("title", ""), "url": a.get("url", ""), "source": a.get("source_name", "")})
-            context_parts.append(f"[{ref_num}] [{impact}] {a.get('title', '')} ({a.get('source_name', '')})")
+            context_parts.append(f"- [{impact}] {a.get('title', '')} ({a.get('source_name', '')})")
             if summary:
                 context_parts.append(f"  {summary}")
 
@@ -4302,9 +4221,7 @@ def general_chat():
         context_parts.append("\nLATEST:")
         for a in recent_articles:
             impact = a.get("user_corrected_impact", "") or a.get("market_impact", "")
-            ref_num = len(_chat_refs) + 1
-            _chat_refs.append({"n": ref_num, "title": a.get("title", ""), "url": a.get("url", ""), "source": a.get("source_name", "")})
-            context_parts.append(f"[{ref_num}] [{impact}] {a.get('title', '')} ({a.get('source_name', '')})")
+            context_parts.append(f"- [{impact}] {a.get('title', '')} ({a.get('source_name', '')})")
 
     if sentiment_24h:
         pos = sentiment_24h.get("positive", 0)
@@ -4318,9 +4235,7 @@ def general_chat():
     if recent_alerts:
         context_parts.append("\nLIVE:")
         for a in recent_alerts:
-            ref_num = len(_chat_refs) + 1
-            _chat_refs.append({"n": ref_num, "title": a.get("title", ""), "url": a.get("url", ""), "source": a.get("source_name", "")})
-            context_parts.append(f"[{ref_num}] [{a.get('market_impact', 'neutral')}] {a.get('title', '')} (via {a.get('source_name', '')})")
+            context_parts.append(f"- [{a.get('market_impact', 'neutral')}] {a.get('title', '')} (via {a.get('source_name', '')})")
 
     context_str = "\n".join(context_parts) if context_parts else "No article data available yet."
 
@@ -4337,8 +4252,7 @@ def general_chat():
 
     prompt = (
         "You are a financial market analyst assistant with real-time news data. "
-        "Be concise and specific. When referencing articles, cite them by their number like [1], [2], etc. "
-        "This helps the user find the source.\n\n"
+        "Be concise and specific. Reference articles when relevant.\n\n"
         f"DATA:\n{context_str}\n"
     )
     if conv_text:
@@ -4370,7 +4284,6 @@ def general_chat():
                 "answer": answer,
                 "context_articles": len(matched_articles),
                 "recent_articles": len(recent_articles),
-                "references": _chat_refs,
             })
         return jsonify({"error": f"Ollama returned {resp.status_code}"}), 500
     except requests.exceptions.Timeout:

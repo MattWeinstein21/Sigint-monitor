@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- SIGINT build: 2026-04-15 v2.0.1 scroll-fix -->
+<!-- SIGINT build: 2026-04-15 v2.0.2 score-fix -->
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -706,7 +706,7 @@ function App(){
               {/* Row 1: source badge + title + score + count */}
               <div style={{display:"flex",alignItems:"flex-start",gap:10,marginBottom:6}}>
                 <span style={{fontSize:9,fontWeight:700,background:sr.color+"22",color:sr.color,padding:"2px 6px",borderRadius:4,flexShrink:0,marginTop:2,fontFamily:"'JetBrains Mono',monospace",letterSpacing:0.3}}>{sr.icon}</span>
-                {score>0&&<span style={{fontSize:9,fontWeight:700,background:score>=0.8?"#FF453A20":score>=0.5?"#FF9F0A20":"#5448C820",color:score>=0.8?"#FF453A":score>=0.5?"#FF9F0A":"#8B80F0",padding:"1px 5px",borderRadius:4,flexShrink:0,marginTop:2,fontFamily:"'JetBrains Mono',monospace"}}>{Math.round(score*100)}</span>}
+                {score>0&&<span style={{fontSize:9,fontWeight:700,background:score>=80?"#FF453A20":score>=50?"#FF9F0A20":"#5448C820",color:score>=80?"#FF453A":score>=50?"#FF9F0A":"#8B80F0",padding:"1px 5px",borderRadius:4,flexShrink:0,marginTop:2,fontFamily:"'JetBrains Mono',monospace"}}>{Math.round(score)}</span>}
                 <div style={{fontSize:13,fontWeight:500,color:a.is_duplicate?"#3A3A4E":"#EDEDF0",lineHeight:1.4,flex:1,textDecoration:a.is_duplicate?"line-through":"none"}}>{a.title}</div>
                 {a.report_count>1&&<span style={{fontSize:9,padding:"2px 6px",borderRadius:4,background:"#5448C815",color:"#8B80F0",flexShrink:0,marginTop:2,fontFamily:"'JetBrains Mono',monospace"}}>x{a.report_count}</span>}
               </div>
@@ -1187,7 +1187,7 @@ function App(){
 
     {/* Version badge */}
     <div style={{position:"fixed",bottom:8,left:SIDEBAR_W+10,zIndex:5,pointerEvents:"none"}}>
-      <span style={{fontSize:9,color:"#1C1C28",fontFamily:"'JetBrains Mono',monospace",letterSpacing:"0.05em",userSelect:"none"}}>SIGINT v2.0.1 · 2026-04-15</span>
+      <span style={{fontSize:9,color:"#1C1C28",fontFamily:"'JetBrains Mono',monospace",letterSpacing:"0.05em",userSelect:"none"}}>SIGINT v2.0.2 · 2026-04-15</span>
     </div>
   </div>;
 }

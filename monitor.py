@@ -1616,9 +1616,108 @@ class AlertStore:
             items = self.alerts
             if since:
                 items = [a for a in items if a["timestamp"] > since]
+            # Compute attention scores
+            wl_tickers = self._get_watchlist_tickers()
+            for a in items:
+                a["attention_score"] = self._compute_attention(a, wl_tickers)
             if limit is not None:
                 items = items[:limit]
             return list(items)
+
+    def _get_watchlist_tickers(self):
+        try:
+            wl = load_watchlist()
+            return set(item["symbol"].upper() for item in wl)
+        except Exception:
+            return set()
+
+    def _compute_attention(self, alert, watchlist_tickers=None):
+        """Compute attention score (0-100) for alert ranking.
+
+        Factors:
+          severity     : high=25, medium=15, low=5               max 25
+          confidence   : confidence * 20                          max 20
+          recency      : exp decay, half-life 2h                  max 20
+          confirmation : log2(report_count) * 5                   max 15
+          watchlist    : affected ticker in watchlist              max 10
+          source_rel   : source_reliability * 10                  max 10
+        """
+        if alert.get("is_duplicate"):
+            return 5
+        score = 0.0
+        sev_map = {"high": 25, "medium": 15, "low": 5}
+        score += sev_map.get(alert.get("severity", "medium"), 10)
+        score += alert.get("confidence", 0.3) * 20
+        try:
+            pub = alert.get("published_at_utc") or alert.get("timestamp", "")
+            if pub:
+                age_h = (datetime.now(timezone.utc) - datetime.fromisoformat(pub.replace("Z", "+00:00"))).total_seconds() / 3600
+                score += max(0, 20 * (0.5 ** (age_h / 2)))
+        except Exception:
+            score += 5
+        rc = alert.get("report_count", 1)
+        if rc > 1:
+            import math
+            score += min(15, math.log2(rc) * 5)
+        if watchlist_tickers:
+            if any(t.upper() in watchlist_tickers for t in alert.get("affected_tickers", [])):
+                score += 10
+        score += alert.get("source_reliability", 0.5) * 10
+        return round(min(100, max(0, score)), 1)
+
+    def get_incidents(self, limit=50):
+        """Group alerts into incidents by semantic similarity.
+        Returns [{main, related, related_count, attention_score, source_count, sources, latest_update}]
+        """
+        with self.lock:
+            wl_tickers = self._get_watchlist_tickers()
+            for a in self.alerts:
+                a["attention_score"] = self._compute_attention(a, wl_tickers)
+            scored = sorted(self.alerts, key=lambda x: x.get("attention_score", 0), reverse=True)
+            used = set()
+            incidents = []
+            for alert in scored:
+                aid = alert["id"]
+                if aid in used:
+                    continue
+                used.add(aid)
+                main_words = set(re.sub(r'[^\w\s]', '', alert["title"].lower()).split())
+                related = []
+                if len(main_words) >= 3:
+                    for other in scored:
+                        if other["id"] in used:
+                            continue
+                        other_words = set(re.sub(r'[^\w\s]', '', other["title"].lower()).split())
+                        if len(other_words) < 3:
+                            continue
+                        sim = len(main_words & other_words) / len(main_words | other_words)
+                        if sim > 0.40:
+                            related.append(other)
+                            used.add(other["id"])
+                # Build incident
+                all_sources = set()
+                all_sources.add(alert.get("source_name", ""))
+                for r in related:
+                    all_sources.add(r.get("source_name", ""))
+                for s in alert.get("also_reported_by", []):
+                    all_sources.add(s)
+                all_sources.discard("")
+                latest = alert.get("published_at_utc") or alert.get("timestamp", "")
+                for r in related:
+                    rt = r.get("published_at_utc") or r.get("timestamp", "")
+                    if rt > latest:
+                        latest = rt
+                incidents.append({
+                    "main": alert,
+                    "related": related,
+                    "related_count": len(related) + alert.get("report_count", 1) - 1,
+                    "attention_score": alert.get("attention_score", 0),
+                    "source_count": len(all_sources),
+                    "sources": list(all_sources),
+                    "latest_update": latest,
+                })
+            incidents.sort(key=lambda x: x["attention_score"], reverse=True)
+            return incidents[:limit]
 
     def clear(self):
         with self.lock:
@@ -3749,7 +3848,27 @@ def index():
 def get_alerts():
     since = request.args.get("since")
     limit = request.args.get("limit", type=int)
-    return jsonify({"alerts": store.get_all(since=since, limit=limit)})
+    sort = request.args.get("sort", "time")  # "time" (default) or "score"
+    alerts = store.get_all(since=since, limit=limit)
+    if sort == "score":
+        alerts.sort(key=lambda x: x.get("attention_score", 0), reverse=True)
+    return jsonify({"alerts": alerts})
+
+
+@app.route("/api/alerts/incidents")
+def get_alert_incidents():
+    """Get alerts grouped into incidents, ranked by attention score."""
+    limit = request.args.get("limit", 50, type=int)
+    incidents = store.get_incidents(limit=limit)
+    # Split into critical (top scored) and rest
+    critical = []
+    rest = []
+    for inc in incidents:
+        if inc["attention_score"] >= 50 and len(critical) < 5:
+            critical.append(inc)
+        else:
+            rest.append(inc)
+    return jsonify({"critical": critical, "rest": rest, "total_incidents": len(incidents)})
 
 
 @app.route("/api/alerts", methods=["DELETE"])

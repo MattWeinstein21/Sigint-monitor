@@ -126,6 +126,7 @@ function App(){
   var[srcType,sSrcType]=s("all"); // "all","news","social"
   var ALERTS_PER_PAGE=30;
   var[alertPage,sAlertPage]=s(0);
+  var[alertSort,sAlertSort]=s("time"); // "time" or "score"
   // Markets: collapsible sections
   var[mCollapsed,sMCollapsed]=s({indices:false,watchlist:false,sectors:false,sec:false});
   var togC=function(k){sMCollapsed(function(p){var n=Object.assign({},p);n[k]=!n[k];return n})};
@@ -239,7 +240,7 @@ function App(){
   // Status poll
   u(function(){var iv=setInterval(function(){fetch(API+"/api/status").then(function(r){if(r.ok)sConn(true);else throw 0}).catch(function(){sConn(false)})},15000);return function(){clearInterval(iv)}},[]);
   // Alert poll
-  u(function(){if(!mon)return;var c=false;var p=function(){F("/api/alerts?limit=300").then(function(d){if(!c&&d.alerts){sAl(d.alerts);sConn(true)}}).catch(function(){if(!c)sConn(false)})};p();var iv=setInterval(p,8000);return function(){c=true;clearInterval(iv)}},[mon]);
+  u(function(){if(!mon)return;var c=false;var p=function(){F("/api/alerts?limit=300&sort="+alertSort).then(function(d){if(!c&&d.alerts){sAl(d.alerts);sConn(true)}}).catch(function(){if(!c)sConn(false)})};p();var iv=setInterval(p,8000);return function(){c=true;clearInterval(iv)}},[mon,alertSort]);
   // Tick
   u(function(){var iv=setInterval(function(){sTk(function(t){return t+1})},10000);return function(){clearInterval(iv)}},[]);
   // Clock tick every second
@@ -665,14 +666,18 @@ function App(){
               </div>}
             </div>
             <span style={{fontSize:9,color:"#444"}}>{filt.length} alerts{fi!=="all"?" · "+fi:""}{tfMin>0?" · "+[{v:30,l:"30m"},{v:60,l:"1h"},{v:180,l:"3h"},{v:300,l:"5h"},{v:1440,l:"24h"},{v:2880,l:"48h"}].filter(function(t){return t.v===tfMin}).map(function(t){return t.l})[0]:""}</span>
+            <div style={{display:"flex",gap:3,marginLeft:"auto"}}>
+              {[{v:"time",l:"⏱ Recent"},{v:"score",l:"⚡ Priority"}].map(function(o){return <button key={o.v} className="b" onClick={function(){sAlertSort(o.v);sAlertPage(0)}} style={{fontSize:9,padding:"3px 8px",borderRadius:4,background:alertSort===o.v?"#5448C8":"#14141F",color:alertSort===o.v?"#fff":"#555",border:"1px solid "+(alertSort===o.v?"#5448C833":"#2A2A35")}}>{o.l}</button>})}
+            </div>
           </div>
           <div style={{flex:1,overflowY:"auto"}}>
             {filt.length===0&&<div style={{textAlign:"center",padding:60,color:"#333"}}><div style={{fontSize:32,marginBottom:8}}>◎</div><div style={{fontSize:13}}>{conn?"No alerts":"Connecting..."}</div></div>}
             {function(){var totalAlertPages=Math.ceil(filt.length/ALERTS_PER_PAGE);var safePage=Math.min(alertPage,Math.max(0,totalAlertPages-1));var pageAlerts=filt.slice(safePage*ALERTS_PER_PAGE,(safePage+1)*ALERTS_PER_PAGE);return <div>
-            {pageAlerts.map(function(a){var sr=SM[a.source]||{icon:"?",name:a.source_name||a.source,color:"#888"};var tn=a.article_tone||a.sentiment||"neutral";var im=a.market_impact||"neutral";var ic=iC[im]||"#8E8E93";var tc2=tC[tn]||"#8E8E93";var isX=exp.has(a.id);return <div key={a.id} className="arow" style={{display:"flex",gap:12,padding:"12px 20px",borderBottom:"1px solid #111118",borderLeft:"3px solid "+ic+"44"}}>
+            {pageAlerts.map(function(a){var sr=SM[a.source]||{icon:"?",name:a.source_name||a.source,color:"#888"};var tn=a.article_tone||a.sentiment||"neutral";var im=a.market_impact||"neutral";var ic=iC[im]||"#8E8E93";var tc2=tC[tn]||"#8E8E93";var isX=exp.has(a.id);var attn=a.attention_score||0;var attnColor=attn>=60?"#FF3B30":attn>=40?"#FF9500":attn>=25?"#5448C8":"#333";return <div key={a.id} className="arow" style={{display:"flex",gap:12,padding:"12px 20px",borderBottom:"1px solid #111118",borderLeft:"3px solid "+ic+"44"}}>
               <div style={{display:"flex",flexDirection:"column",alignItems:"center",gap:4,width:40,flexShrink:0,paddingTop:2}}>
-                <div style={{width:8,height:8,borderRadius:"50%",background:svC[a.severity]||"#888"}}/>
-                <span style={{fontSize:9,fontWeight:700,color:sr.color,background:sr.color+"18",padding:"3px 5px",borderRadius:3,textAlign:"center",letterSpacing:0.5,lineHeight:1}}>{sr.icon}</span>
+                <div style={{fontSize:9,fontWeight:700,color:attnColor,background:attnColor+"18",padding:"2px 4px",borderRadius:3,textAlign:"center",minWidth:28}}>{Math.round(attn)}</div>
+                <span style={{fontSize:9,fontWeight:700,color:sr.color,background:sr.color+"18",padding:"2px 5px",borderRadius:3,textAlign:"center",letterSpacing:0.5,lineHeight:1}}>{sr.icon}</span>
+                {a.report_count>1&&<span style={{fontSize:7,color:"#8B80F0",background:"#5448C815",padding:"1px 4px",borderRadius:2}}>{a.report_count}×</span>}
               </div>
               <div style={{flex:1,minWidth:0}}>
                 <div style={{display:"flex",gap:6,marginBottom:4}}>

@@ -1,4 +1,5 @@
 <!DOCTYPE html>
+<!-- SIGINT build: 2026-04-15 v1.4.0 signal-arch+ui-overhaul -->
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -354,110 +355,156 @@ function App(){
       </div>}
 
       {/* Stock Detail Popup — mousedown guard prevents close during resize */}
-      {detailSym&&wq[detailSym]&&<div style={{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.7)",zIndex:200,display:"flex",alignItems:"center",justifyContent:"center"}} onMouseDown={function(e){if(e.target===e.currentTarget)modalMouseDown.current=true}} onMouseUp={function(e){if(e.target===e.currentTarget&&modalMouseDown.current){sDetailSym(null);sHoverIdx(-1)}modalMouseDown.current=false}} onClick={function(){}}>
-        <div style={{background:"#14141F",borderRadius:12,padding:24,border:"1px solid #2A2A35",width:700,maxWidth:"95vw",maxHeight:"90vh",overflowY:"auto",resize:"both",overflow:"auto",minWidth:400,minHeight:300}} onMouseDown={function(){modalMouseDown.current=false}}>
+      {detailSym&&wq[detailSym]&&<div style={{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.75)",zIndex:200,display:"flex",alignItems:"center",justifyContent:"center"}} onMouseDown={function(e){if(e.target===e.currentTarget)modalMouseDown.current=true}} onMouseUp={function(e){if(e.target===e.currentTarget&&modalMouseDown.current){sDetailSym(null);sHoverIdx(-1)}modalMouseDown.current=false}} onClick={function(){}}>
+        <div style={{background:"#0F0F18",borderRadius:16,border:"1px solid #2A2A35",width:860,maxWidth:"96vw",maxHeight:"92vh",display:"flex",flexDirection:"column",boxShadow:"0 24px 64px rgba(0,0,0,0.7)"}} onMouseDown={function(){modalMouseDown.current=false}}>
           {function(){
             var q=wq[detailSym];if(!q)return null;var up=q.change>=0;
+            var chgColor=up?"#34C759":"#FF3B30";
             var cd=q.chart||[];
-            var cw=650,ch2=280,padL=50,padR=10,padT=10,padB=20;
+            var cw=800,ch2=300,padL=56,padR=12,padT=12,padB=24;
             var drawW=cw-padL-padR,drawH=ch2-padT-padB;
-            return <div>
-              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
-                <div><span style={{fontSize:22,fontWeight:700,color:"#E8E8ED"}}>{detailSym}</span><span style={{fontSize:12,color:"#555",marginLeft:8}}>{q.name}</span></div>
-                <button className="b" onClick={function(){sDetailSym(null);sHoverIdx(-1)}} style={{fontSize:16,color:"#555",background:"none",padding:"4px 8px"}}>✕</button>
-              </div>
-              <div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",marginBottom:12}}>
-                <span style={{fontSize:30,fontWeight:700,color:"#E8E8ED",fontFamily:"'Space Grotesk',sans-serif"}}>{"$"+(q.price||0).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})}</span>
-                <span style={{fontSize:14,color:up?"#34C759":"#FF3B30",fontWeight:600}}>{up?"▲":"▼"} {q.change} ({q.change_pct}%)</span>
-              </div>
-              <div style={{display:"flex",gap:6,marginBottom:10,flexWrap:"wrap"}}>
-                <button className="b" onClick={function(){sChartType("line")}} style={{padding:"5px 14px",borderRadius:4,fontSize:10,background:chartType==="line"?"#5448C8":"#0A0A0F",color:chartType==="line"?"#fff":"#AAA"}}>Line</button>
-                <button className="b" onClick={function(){sChartType("candle")}} style={{padding:"5px 14px",borderRadius:4,fontSize:10,background:chartType==="candle"?"#5448C8":"#0A0A0F",color:chartType==="candle"?"#fff":"#AAA"}}>Candlestick</button>
-                <div style={{marginLeft:"auto",display:"flex",gap:4}}>
-                  {[["1d","1D"],["5d","5D"],["1mo","1M"],["3mo","3M"],["6mo","6M"],["1y","1Y"]].map(function(p){return <button key={p[0]} className="b" onClick={function(){sModalRng(p[0]);sZoomStart(0);sZoomEnd(-1);sHoverIdx(-1);var item=wl.find(function(w){return w.symbol===detailSym});var atype=item?item.type:"stock";var iv2=p[0]==="1d"?"5m":p[0]==="5d"?"15m":"1d";F("/api/market/quote/"+detailSym+"?type="+atype+"&range="+p[0]+"&interval="+iv2).then(function(d){if(d.quote)sWq(function(pr){var n=Object.assign({},pr);n[detailSym]=d.quote;return n})}).catch(function(){})}} style={{padding:"4px 10px",borderRadius:4,fontSize:10,background:modalRng===p[0]?"#5448C8":"#0A0A0F",color:modalRng===p[0]?"#fff":"#555"}}>{p[1]}</button>})}
+            return <div style={{display:"flex",flexDirection:"column",height:"100%"}}>
+              {/* ── Modal header ── */}
+              <div style={{padding:"20px 24px 0",flexShrink:0}}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:4}}>
+                  <div style={{display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}}>
+                    <span style={{fontSize:26,fontWeight:700,color:"#E8E8ED",fontFamily:"'Space Grotesk',sans-serif",letterSpacing:-0.5}}>{detailSym}</span>
+                    <span style={{fontSize:13,color:"#555",fontWeight:400}}>{q.name}</span>
+                    <span style={{fontSize:9,padding:"2px 7px",borderRadius:4,background:q.type==="crypto"?"#F7931A20":"#5448C820",color:q.type==="crypto"?"#F7931A":"#8B80F0",fontWeight:600,letterSpacing:0.5}}>{(q.type||"stock").toUpperCase()}</span>
+                    {q.exchange&&<span style={{fontSize:9,color:"#444",padding:"2px 6px",borderRadius:3,border:"1px solid #2A2A35"}}>{q.exchange}</span>}
+                  </div>
+                  <button className="b" onClick={function(){sDetailSym(null);sHoverIdx(-1)}} style={{fontSize:18,color:"#444",background:"none",padding:"2px 8px",lineHeight:1,flexShrink:0}}>✕</button>
+                </div>
+                <div style={{display:"flex",alignItems:"baseline",gap:14,marginBottom:16}}>
+                  <span style={{fontSize:38,fontWeight:700,color:"#E8E8ED",fontFamily:"'Space Grotesk',sans-serif",letterSpacing:-1}}>{"$"+(q.price||0).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})}</span>
+                  <span style={{fontSize:16,color:chgColor,fontWeight:600}}>{up?"▲":"▼"} {q.change} <span style={{fontSize:13,opacity:0.8}}>({q.change_pct}%)</span></span>
+                  {(q.day_low||0)<(q.day_high||0)&&function(){
+                    var lo=q.day_low||0;var hi=q.day_high||0;var cur=q.price||0;
+                    var pct=Math.max(0,Math.min(100,((cur-lo)/(hi-lo))*100));
+                    return <div style={{display:"flex",alignItems:"center",gap:6,marginLeft:8}}>
+                      <span style={{fontSize:9,color:"#444"}}>{"$"+lo.toFixed(2)}</span>
+                      <div style={{position:"relative",width:80,height:4,background:"#1A1A25",borderRadius:2}}>
+                        <div style={{position:"absolute",left:0,top:0,height:"100%",width:pct+"%",background:chgColor+"70",borderRadius:2}}/>
+                        <div style={{position:"absolute",top:-3,left:pct+"%",transform:"translateX(-50%)",width:10,height:10,borderRadius:"50%",background:chgColor,border:"2px solid #0F0F18"}}/>
+                      </div>
+                      <span style={{fontSize:9,color:"#444"}}>{"$"+hi.toFixed(2)}</span>
+                    </div>;
+                  }()}
+                </div>
+                {/* Chart type + range controls */}
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
+                  <div style={{display:"flex",gap:4}}>
+                    <button className="b" onClick={function(){sChartType("line")}} style={{padding:"5px 14px",borderRadius:6,fontSize:10,background:chartType==="line"?"#5448C8":"#14141F",color:chartType==="line"?"#fff":"#666",border:"1px solid "+(chartType==="line"?"#5448C8":"#2A2A35")}}>Line</button>
+                    <button className="b" onClick={function(){sChartType("candle")}} style={{padding:"5px 14px",borderRadius:6,fontSize:10,background:chartType==="candle"?"#5448C8":"#14141F",color:chartType==="candle"?"#fff":"#666",border:"1px solid "+(chartType==="candle"?"#5448C8":"#2A2A35")}}>Candle</button>
+                  </div>
+                  <div style={{display:"flex",gap:3}}>
+                    {[["1d","1D"],["5d","5D"],["1mo","1M"],["3mo","3M"],["6mo","6M"],["1y","1Y"]].map(function(p){return <button key={p[0]} className="b" onClick={function(){sModalRng(p[0]);sZoomStart(0);sZoomEnd(-1);sHoverIdx(-1);var item=wl.find(function(w){return w.symbol===detailSym});var atype=item?item.type:"stock";var iv2=p[0]==="1d"?"5m":p[0]==="5d"?"15m":"1d";F("/api/market/quote/"+detailSym+"?type="+atype+"&range="+p[0]+"&interval="+iv2).then(function(d){if(d.quote)sWq(function(pr){var n=Object.assign({},pr);n[detailSym]=d.quote;return n})}).catch(function(){})}} style={{padding:"5px 12px",borderRadius:6,fontSize:10,background:modalRng===p[0]?"#5448C8":"#14141F",color:modalRng===p[0]?"#fff":"#555",border:"1px solid "+(modalRng===p[0]?"#5448C8":"#2A2A35")}}>{p[1]}</button>})}
+                  </div>
                 </div>
               </div>
-              {/* Interactive chart with crosshair + zoom */}
+              {/* ── Chart ── */}
+              <div style={{padding:"0 24px",flexShrink:0}}>
               {cd.length>1?function(){
-                // Apply zoom
                 var zs=zoomStart,ze=zoomEnd<0?cd.length:Math.min(zoomEnd,cd.length);
-                var vd=cd.slice(zs,ze); // visible data
+                var vd=cd.slice(zs,ze);
                 if(vd.length<2)vd=cd;
+                // Filter out candles with bad wicks (spike guard: wick > 3x body is corrupt data)
                 var mn2=Infinity,mx2=-Infinity;
-                vd.forEach(function(d){var hi=d.high||d.close;var lo=d.low||d.close;if(hi>mx2)mx2=hi;if(lo<mn2)mn2=lo});
+                vd.forEach(function(d){
+                  var o=d.open||d.close;var c2=d.close;
+                  var bodySize=Math.abs(c2-o)||0.01;
+                  var hi=d.high||Math.max(o,c2);var lo=d.low||Math.min(o,c2);
+                  var wickUp=hi-Math.max(o,c2);var wickDn=Math.min(o,c2)-lo;
+                  // Cap outlier wicks — don't let them blow up the y scale
+                  var cappedHi=wickUp>bodySize*4?Math.max(o,c2)+bodySize*0.5:hi;
+                  var cappedLo=wickDn>bodySize*4?Math.min(o,c2)-bodySize*0.5:lo;
+                  if(cappedHi>mx2)mx2=cappedHi;
+                  if(cappedLo<mn2)mn2=cappedLo;
+                });
+                var pad2=Math.max((mx2-mn2)*0.04,0.01);
+                mn2=mn2-pad2;mx2=mx2+pad2;
                 var rn2=mx2-mn2||1;
                 var yScale=function(v){return padT+drawH-((v-mn2)/rn2)*drawH};
                 var xScale=function(i){return padL+Math.floor((i/(vd.length-1))*drawW)};
-                // Price labels
                 var labels=[];for(var li=0;li<5;li++){var lv=mn2+(rn2*(li/4));labels.push({y:yScale(lv),label:"$"+lv.toFixed(2)})}
-                // Hovered data (relative to visible range)
                 var hd=hoverIdx>=0&&hoverIdx<vd.length?vd[hoverIdx]:null;
-                // Wheel zoom handler
                 var onWheel=function(e){
                   e.preventDefault();
                   var total=cd.length;
                   var curStart=zoomStart;var curEnd=zoomEnd<0?total:zoomEnd;
                   var visLen=curEnd-curStart;
                   var zoomAmt=Math.max(1,Math.floor(visLen*0.15));
-                  if(e.deltaY<0){
-                    // Zoom in
-                    var ns2=Math.min(curStart+zoomAmt,curEnd-10);
-                    var ne2=Math.max(curEnd-zoomAmt,curStart+10);
-                    sZoomStart(ns2);sZoomEnd(ne2);
-                  }else{
-                    // Zoom out
-                    var ns3=Math.max(0,curStart-zoomAmt);
-                    var ne3=Math.min(total,curEnd+zoomAmt);
-                    if(ns3===0&&ne3>=total){sZoomStart(0);sZoomEnd(-1)}
-                    else{sZoomStart(ns3);sZoomEnd(ne3)}
-                  }
+                  if(e.deltaY<0){var ns2=Math.min(curStart+zoomAmt,curEnd-10);var ne2=Math.max(curEnd-zoomAmt,curStart+10);sZoomStart(ns2);sZoomEnd(ne2);}
+                  else{var ns3=Math.max(0,curStart-zoomAmt);var ne3=Math.min(total,curEnd+zoomAmt);if(ns3===0&&ne3>=total){sZoomStart(0);sZoomEnd(-1)}else{sZoomStart(ns3);sZoomEnd(ne3)}}
                   sHoverIdx(-1);
                 };
-                return <div style={{background:"#06060E",borderRadius:10,padding:8,marginBottom:16,position:"relative",border:"1px solid #1A1A25"}}>
+                return <div style={{background:"#06060E",borderRadius:10,border:"1px solid #1A1A25",position:"relative",marginBottom:8}}>
                   <svg width="100%" height={ch2} viewBox={"0 0 "+cw+" "+ch2} style={{display:"block",cursor:"crosshair"}}
                     onMouseMove={function(e){var rect=e.currentTarget.getBoundingClientRect();var mx3=(e.clientX-rect.left)/rect.width*cw;var idx2=Math.round(((mx3-padL)/drawW)*(vd.length-1));idx2=Math.max(0,Math.min(vd.length-1,idx2));sHoverIdx(idx2)}}
                     onMouseLeave={function(){sHoverIdx(-1)}}
                     onWheel={onWheel}>
-                    {/* Grid lines + price labels */}
-                    {labels.map(function(l,i){return <g key={i}><line x1={padL} y1={l.y} x2={cw-padR} y2={l.y} stroke="#1A1A25" strokeWidth="0.5"/><text x={padL-4} y={l.y+3} fill="#444" fontSize="8" textAnchor="end" fontFamily="'JetBrains Mono'">{l.label}</text></g>})}
+                    {/* Grid lines + Y price labels */}
+                    {labels.map(function(l,i){return <g key={i}><line x1={padL} y1={l.y} x2={cw-padR} y2={l.y} stroke="#ffffff08" strokeWidth="1"/><text x={padL-6} y={l.y+4} fill="#3A3A4A" fontSize="9" textAnchor="end" fontFamily="'JetBrains Mono'">{l.label}</text></g>})}
                     {/* X-axis time labels */}
-                    {function(){var lblCount=5;var out=[];for(var ti=0;ti<lblCount;ti++){var tidx=Math.floor(ti*(vd.length-1)/(lblCount-1));if(tidx>=vd.length)continue;var tx=xScale(tidx);var td2=vd[tidx];if(!td2)continue;var tStr=function(raw){var d=new Date(raw);return isNaN(d.getTime())?"":d.toLocaleTimeString("en-US",{hour:"2-digit",minute:"2-digit",hour12:false});}(td2.time||"");out.push(<text key={ti} x={tx} y={ch2-2} fill="#333" fontSize="7" textAnchor="middle" fontFamily="'JetBrains Mono'">{tStr}</text>);}return out;}()}
+                    {function(){var lblCount=6;var out=[];for(var ti=0;ti<lblCount;ti++){var tidx=Math.floor(ti*(vd.length-1)/(lblCount-1));if(tidx>=vd.length)continue;var tx=xScale(tidx);var td2=vd[tidx];if(!td2)continue;var tStr=function(raw){var d=new Date(raw);if(isNaN(d.getTime()))return"";if(modalRng==="1d"||modalRng==="5d")return d.toLocaleTimeString("en-US",{hour:"2-digit",minute:"2-digit",hour12:false});return d.toLocaleDateString("en-US",{month:"short",day:"numeric"});}(td2.time||"");out.push(<text key={ti} x={tx} y={ch2-6} fill="#3A3A4A" fontSize="8" textAnchor="middle" fontFamily="'JetBrains Mono'">{tStr}</text>);}return out;}()}
+                    {/* Current price line */}
+                    {q.price&&<line x1={padL} y1={yScale(q.price)} x2={cw-padR} y2={yScale(q.price)} stroke={chgColor+"40"} strokeWidth="1" strokeDasharray="4,4"/>}
                     {/* Chart data */}
                     {chartType==="candle"?vd.map(function(d,i){
-                      var x=xScale(i);var bw2=Math.max(2,Math.floor(drawW/vd.length)-2);
+                      var x=xScale(i);var bw2=Math.max(2,Math.floor(drawW/vd.length*0.7));
                       var o=d.open||d.close;var c2=d.close;var hi=d.high||Math.max(o,c2);var lo=d.low||Math.min(o,c2);
+                      var bodySize=Math.abs(c2-o)||0.01;
+                      var wickUp=hi-Math.max(o,c2);var wickDn=Math.min(o,c2)-lo;
+                      var drawHi=wickUp>bodySize*4?Math.max(o,c2)+bodySize*0.5:hi;
+                      var drawLo=wickDn>bodySize*4?Math.min(o,c2)-bodySize*0.5:lo;
                       var col=c2>=o?"#34C759":"#FF3B30";
                       var bodyTop=Math.min(yScale(o),yScale(c2));var bodyH=Math.max(Math.abs(yScale(o)-yScale(c2)),1);
-                      return <g key={i}><line x1={x} y1={yScale(hi)} x2={x} y2={yScale(lo)} stroke={col} strokeWidth="1"/><rect x={x-bw2/2} y={bodyTop} width={bw2} height={bodyH} fill={col}/></g>
-                    }):<polyline points={vd.map(function(d,i){return xScale(i)+","+yScale(d.close)}).join(" ")} fill="none" stroke={up?"#34C759":"#FF3B30"} strokeWidth="1.5"/>}
+                      return <g key={i}><line x1={x} y1={yScale(drawHi)} x2={x} y2={yScale(drawLo)} stroke={col+"AA"} strokeWidth="1"/><rect x={x-bw2/2} y={bodyTop} width={bw2} height={bodyH} fill={col} rx="0.5"/></g>
+                    }):function(){
+                      var pts=vd.map(function(d,i){return xScale(i)+","+yScale(d.close)}).join(" ");
+                      var areaBot=padT+drawH;
+                      var firstX=xScale(0);var lastX=xScale(vd.length-1);
+                      var areaPath="M"+firstX+","+areaBot+" L"+pts.split(" ").map(function(p){return p}).join(" L")+" L"+lastX+","+areaBot+" Z";
+                      return <g>
+                        <defs><linearGradient id="lg1" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor={chgColor} stopOpacity="0.25"/><stop offset="100%" stopColor={chgColor} stopOpacity="0"/></linearGradient></defs>
+                        <path d={areaPath} fill="url(#lg1)"/>
+                        <polyline points={pts} fill="none" stroke={chgColor} strokeWidth="2"/>
+                      </g>;
+                    }()}
                     {/* Crosshair */}
                     {hoverIdx>=0&&hoverIdx<vd.length&&<g>
                       <line x1={xScale(hoverIdx)} y1={padT} x2={xScale(hoverIdx)} y2={ch2-padB} stroke="#5448C8" strokeWidth="1" strokeDasharray="3,3"/>
                       <line x1={padL} y1={yScale(vd[hoverIdx].close)} x2={cw-padR} y2={yScale(vd[hoverIdx].close)} stroke="#5448C844" strokeWidth="0.5"/>
-                      <circle cx={xScale(hoverIdx)} cy={yScale(vd[hoverIdx].close)} r="4" fill="#5448C8"/>
+                      <circle cx={xScale(hoverIdx)} cy={yScale(vd[hoverIdx].close)} r="4" fill="#5448C8" stroke="#0F0F18" strokeWidth="2"/>
                     </g>}
                   </svg>
                   {/* Hover tooltip */}
-                  {hd&&<div style={{position:"absolute",top:8,right:12,background:"#14141F",padding:"6px 10px",borderRadius:6,border:"1px solid #2A2A35",fontSize:9,color:"#AAA",lineHeight:1.6}}>
-                    <div style={{color:"#E8E8ED",fontWeight:600}}>{"$"+(hd.close||0).toFixed(2)}</div>
-                    {hd.open&&<div>O: ${hd.open.toFixed(2)} H: ${(hd.high||hd.close).toFixed(2)}</div>}
-                    {hd.low&&<div>L: ${hd.low.toFixed(2)} V: {(hd.volume||0).toLocaleString()}</div>}
-                    <div style={{color:"#555"}}>{function(){var t=hd.time||"";var d=new Date(t);return isNaN(d.getTime())?t.replace("T"," ").substring(0,16):(d.toLocaleDateString("en-US",{month:"short",day:"numeric"})+" "+d.toLocaleTimeString("en-US",{hour:"2-digit",minute:"2-digit",hour12:true}));}()}</div>
+                  {hd&&<div style={{position:"absolute",top:10,left:padL+8,background:"#14141F",padding:"8px 12px",borderRadius:8,border:"1px solid #2A2A35",fontSize:10,color:"#AAA",lineHeight:1.7,minWidth:140,boxShadow:"0 4px 16px rgba(0,0,0,0.5)"}}>
+                    <div style={{color:"#E8E8ED",fontWeight:700,fontSize:14,fontFamily:"'Space Grotesk',sans-serif"}}>{"$"+(hd.close||0).toFixed(2)}</div>
+                    {hd.open&&<div style={{fontSize:9}}><span style={{color:"#555"}}>O </span>{hd.open.toFixed(2)} <span style={{color:"#555"}}>H </span>{(hd.high||hd.close).toFixed(2)}</div>}
+                    {hd.low&&<div style={{fontSize:9}}><span style={{color:"#555"}}>L </span>{hd.low.toFixed(2)} <span style={{color:"#555"}}>V </span>{(hd.volume||0).toLocaleString()}</div>}
+                    <div style={{color:"#444",fontSize:9,marginTop:2}}>{function(){var t=hd.time||"";var d=new Date(t);if(isNaN(d.getTime()))return t.substring(0,16);if(modalRng==="1d"||modalRng==="5d")return d.toLocaleDateString("en-US",{month:"short",day:"numeric"})+" "+d.toLocaleTimeString("en-US",{hour:"2-digit",minute:"2-digit",hour12:true});return d.toLocaleDateString("en-US",{year:"numeric",month:"short",day:"numeric"});}()}</div>
                   </div>}
+                  {/* Zoom hint */}
+                  <div style={{position:"absolute",bottom:6,right:10,fontSize:8,color:"#2A2A35"}}>scroll to zoom{(zoomStart>0||zoomEnd>0)?" · ":""}{(zoomStart>0||zoomEnd>0)&&<span style={{color:"#5448C8",cursor:"pointer"}} onClick={function(){sZoomStart(0);sZoomEnd(-1);sHoverIdx(-1)}}>reset</span>}</div>
                 </div>;
-              }():<div style={{color:"#555",fontSize:11,padding:20,textAlign:"center"}}>No chart data</div>}
-              {/* Zoom controls */}
-              {cd.length>1&&<div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
-                <span style={{fontSize:8,color:"#444"}}>Scroll to zoom · Showing {zoomEnd<0?cd.length:(zoomEnd-zoomStart)} of {cd.length} points</span>
-                {(zoomStart>0||zoomEnd>0)&&<button className="b" onClick={function(){sZoomStart(0);sZoomEnd(-1);sHoverIdx(-1)}} style={{fontSize:8,color:"#5448C8",background:"none",padding:"2px 6px"}}>Reset Zoom</button>}
-              </div>}
-              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:14}}>
-                {[["Day High","$"+(q.day_high||0)],["Day Low","$"+(q.day_low||0)],["Prev Close","$"+(q.prev_close||0)],["Volume",(q.volume||0).toLocaleString()],["52w High","$"+(q.fifty_two_wk_high||0)],["52w Low","$"+(q.fifty_two_wk_low||0)],["Exchange",q.exchange||""],["Mkt Cap",q.market_cap?(q.market_cap>1e12?(q.market_cap/1e12).toFixed(1)+"T":q.market_cap>1e9?(q.market_cap/1e9).toFixed(1)+"B":(q.market_cap/1e6).toFixed(0)+"M"):"N/A"],["Type",q.type||"stock"]].map(function(p2){return <div key={p2[0]} style={{background:"#0A0A0F",borderRadius:4,padding:"6px 8px"}}><div style={{fontSize:8,color:"#555",textTransform:"uppercase",letterSpacing:1,marginBottom:2}}>{p2[0]}</div><div style={{fontSize:11,color:"#E8E8ED",fontWeight:600}}>{p2[1]}</div></div>})}
+              }():<div style={{height:120,display:"flex",alignItems:"center",justifyContent:"center",color:"#333",fontSize:11,background:"#06060E",borderRadius:10,marginBottom:8}}>No chart data</div>}
               </div>
-              {sn.length>0&&<div style={{borderTop:"1px solid #1A1A25",paddingTop:12}}>
-                <div style={{fontSize:10,fontWeight:600,color:"#666",letterSpacing:1,textTransform:"uppercase",marginBottom:8}}>Related News</div>
-                {sn.slice(0,6).map(function(n,i){return <a key={i} href={n.url} target="_blank" rel="noopener noreferrer" style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:8,padding:"7px 8px",background:"#0A0A0F",borderRadius:4,textDecoration:"none",marginBottom:4}}><div style={{fontSize:11,color:"#CCC",lineHeight:1.4,flex:1}}>{n.title}</div><span style={{fontSize:8,padding:"1px 5px",borderRadius:3,background:"#5448C820",color:"#8B80F0",flexShrink:0,marginTop:1}}>{n.source}</span></a>})}
-              </div>}
+              {/* ── Scrollable body ── */}
+              <div style={{overflowY:"auto",padding:"0 24px 24px",flex:1}}>
+                {/* Stats grid */}
+                <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:6,marginBottom:16}}>
+                  {[["Day High","$"+(q.day_high||0),"#34C759"],["Day Low","$"+(q.day_low||0),"#FF3B30"],["Prev Close","$"+(q.prev_close||0),"#AAA"],["Volume",(q.volume||0).toLocaleString(),"#8B80F0"],["52w High","$"+(q.fifty_two_wk_high||0),"#34C759"],["52w Low","$"+(q.fifty_two_wk_low||0),"#FF3B30"],["Mkt Cap",q.market_cap?(q.market_cap>1e12?(q.market_cap/1e12).toFixed(2)+"T":q.market_cap>1e9?(q.market_cap/1e9).toFixed(2)+"B":(q.market_cap/1e6).toFixed(0)+"M"):"N/A","#AAA"],["Exchange",q.exchange||"—","#555"]].map(function(p2){return <div key={p2[0]} style={{background:"#14141F",borderRadius:6,padding:"8px 10px",border:"1px solid #1E1E2A"}}><div style={{fontSize:8,color:"#444",textTransform:"uppercase",letterSpacing:1,marginBottom:4}}>{p2[0]}</div><div style={{fontSize:12,color:p2[2],fontWeight:600,fontFamily:"'Space Grotesk',sans-serif"}}>{p2[1]}</div></div>})}
+                </div>
+                {/* Related news */}
+                {sn.length>0&&<div>
+                  <div style={{fontSize:9,fontWeight:600,color:"#444",letterSpacing:2,textTransform:"uppercase",marginBottom:8}}>Related News</div>
+                  {sn.slice(0,6).map(function(n,i){return <a key={i} href={n.url} target="_blank" rel="noopener noreferrer" style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:10,padding:"9px 10px",background:"#14141F",borderRadius:6,border:"1px solid #1E1E2A",textDecoration:"none",marginBottom:5,transition:"border-color 0.15s"}}>
+                    <div style={{fontSize:12,color:"#CCC",lineHeight:1.45,flex:1}}>{n.title}</div>
+                    <span style={{fontSize:8,padding:"2px 7px",borderRadius:4,background:"#5448C820",color:"#8B80F0",flexShrink:0,marginTop:2,whiteSpace:"nowrap"}}>{n.source}</span>
+                  </a>})}
+                </div>}
+              </div>
             </div>;
           }()}
         </div>
@@ -939,6 +986,11 @@ function App(){
       </div>
 
       {/* Chat panel */}
+      {/* ═══ VERSION BADGE ═══ */}
+      <div style={{position:"fixed",bottom:10,left:14,zIndex:49,pointerEvents:"none"}}>
+        <span style={{fontSize:9,color:"#2A2A3A",fontFamily:"'JetBrains Mono',monospace",letterSpacing:"0.04em",userSelect:"none"}}>SIGINT v1.4.0 · 2026-04-15</span>
+      </div>
+
       {chatOpen&&<div style={{position:"fixed",bottom:24,right:24,width:420,maxWidth:"calc(100vw - 48px)",height:520,maxHeight:"calc(100vh - 100px)",background:"#0F0F18",borderRadius:16,border:"1px solid #2A2A35",display:"flex",flexDirection:"column",zIndex:50,boxShadow:"0 8px 32px rgba(0,0,0,0.5)"}}>
         {/* Header */}
         <div style={{padding:"14px 16px",borderBottom:"1px solid #1A1A25",display:"flex",justifyContent:"space-between",alignItems:"center",flexShrink:0}}>

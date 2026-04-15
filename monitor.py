@@ -3181,7 +3181,7 @@ def poll_rss(keywords):
                             published_at=entry_date,
                         )
             except Exception as e:
-                log.warning(f"RSS error [{source_id}] {feed_url}: {e}")
+                log.exception(f"RSS error [{source_id}] {feed_url}: {e}")
 
 
 def poll_newsapi(keywords, api_key):
@@ -3316,7 +3316,7 @@ def poll_newsapi(keywords, api_key):
             
             time.sleep(1)  # Rate limit between keywords
     except Exception as e:
-        log.warning(f"NewsAPI error: {e}")
+        log.exception(f"NewsAPI error: {e}")
 
 
 def poll_whitehouse(keywords):
@@ -3387,7 +3387,7 @@ def poll_whitehouse(keywords):
                     severity="high",
                 )
     except Exception as e:
-        log.warning(f"White House scrape error: {e}")
+        log.exception(f"White House scrape error: {e}")
 
 
 # ─── SEC EDGAR Filing Monitor ────────────────────────────────────────────────
@@ -3534,7 +3534,7 @@ def poll_truthsocial(keywords, accounts):
                         severity="high",
                     )
         except Exception as e:
-            log.warning(f"Truth Social error [@{username}]: {e}")
+            log.exception(f"Truth Social error [@{username}]: {e}")
 
 
 def poll_twitter(keywords, bearer_token, accounts):
@@ -3605,7 +3605,7 @@ def poll_twitter(keywords, bearer_token, accounts):
                     log.warning(f"Twitter API 403 for @{username} — free tier is limited, using RSS fallback")
                 time.sleep(1)
             except Exception as e:
-                log.warning(f"Twitter API error [@{username}]: {e}")
+                log.exception(f"Twitter API error [@{username}]: {e}")
 
         # ── Attempt 2: RSSHub proxy (always works, no key needed) ──
         if not fetched_via_api:
@@ -3649,7 +3649,7 @@ def poll_twitter(keywords, bearer_token, accounts):
                 if feed.entries:
                     log.info(f"X/@{username}: fetched {len(feed.entries)} posts via RSS")
             except Exception as e:
-                log.warning(f"X RSS fallback error [@{username}]: {e}")
+                log.exception(f"X RSS fallback error [@{username}]: {e}")
 
 
 _refresh_requested = threading.Event()
@@ -3695,7 +3695,10 @@ def monitor_loop():
                     record_poll(source_id, alerts_found=max(0, after - before))
                 except Exception as e:
                     record_poll(source_id, error=e)
-                    log.warning(f"Poll error [{source_id}]: {e}")
+                    # Use exception() to capture full stack trace, not just the
+                    # message. A bare log.warning(e) hides the line number and
+                    # makes TypeError / AttributeError nearly impossible to diagnose.
+                    log.exception(f"Poll error [{source_id}]: {e}")
 
             if config.get("rss_enabled", True):
                 _tracked_poll("rss_all", poll_rss, keywords)
@@ -3725,7 +3728,7 @@ def monitor_loop():
                 time.sleep(1)
 
         except Exception as e:
-            log.error(f"Monitor loop error: {e}")
+            log.exception(f"Monitor loop error: {e}")
             time.sleep(30)
 
 
@@ -5677,7 +5680,13 @@ def _start_monitor():
         _monitor_started = True
     t = threading.Thread(target=monitor_loop, daemon=True)
     t.start()
-    log.info("Monitor thread launched")
+    # Emit the function signature of match_keywords_layered at startup so the
+    # systemd journal confirms which revision is actually running. If you see
+    # this log line WITHOUT 'try_body_fetch' in it, the deployed file is stale.
+    import inspect
+    sig = inspect.signature(match_keywords_layered)
+    log.info(f"Monitor thread launched | match_keywords_layered sig: {sig}")
+    log.info(f"match_keyword_layered sig: {inspect.signature(match_keyword_layered)}")
 
 
 # NOTE: If using gunicorn, run with --workers 1 to avoid duplicate polling.

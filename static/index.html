@@ -56,6 +56,48 @@ var h = React.useState, ue = React.useEffect;
 
 var API = window.location.port ? (window.location.protocol + "//" + window.location.hostname + ":" + window.location.port) : window.location.origin;
 
+// ─── Clock component (isolated so its 1s tick never re-renders App) ──────────
+function Clock(props) {
+  var tz = props.tz || "America/New_York";
+  var s = React.useState;
+  var u = React.useEffect;
+  var tick = s(0);
+  var setTick = tick[1];
+  u(function() {
+    var iv = setInterval(function() { setTick(function(t) { return t + 1; }); }, 1000);
+    return function() { clearInterval(iv); };
+  }, []);
+  var now = new Date();
+  var et = new Date(now.toLocaleString("en-US", { timeZone: "America/New_York" }));
+  var h2 = et.getHours(), m2 = et.getMinutes();
+  var mins = h2 * 60 + m2;
+  var openMin = 9 * 60 + 30, closeMin = 16 * 60;
+  var day = et.getDay();
+  var open = day >= 1 && day <= 5 && mins >= openMin && mins < closeMin;
+  var clr = open ? "#30D158" : "#FF453A";
+  var countdownStr = "";
+  if (open) {
+    var left = closeMin - mins;
+    countdownStr = Math.floor(left / 60) + "h " + (left % 60) + "m to close";
+  } else {
+    var nextOpen = new Date(et);
+    if (day === 0) { nextOpen.setDate(nextOpen.getDate() + 1); }
+    else if (day === 6) { nextOpen.setDate(nextOpen.getDate() + 2); }
+    else if (mins >= closeMin) { nextOpen.setDate(nextOpen.getDate() + (day === 5 ? 3 : 1)); }
+    nextOpen.setHours(9, 30, 0, 0);
+    var diff = nextOpen.getTime() - et.getTime();
+    var dh = Math.floor(diff / 3600000), dm = Math.floor((diff % 3600000) / 60000);
+    countdownStr = (dh >= 24 ? Math.floor(dh / 24) + "d " + Math.floor(dh % 24) + "h" : dh + "h " + dm + "m") + " to open";
+  }
+  var nowStr = now.toLocaleTimeString("en-US", { timeZone: tz, hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: true });
+  return <div style={{display:"flex",alignItems:"center",gap:8,padding:"6px 16px",borderRadius:8,background:"#0F0F1A",border:"1px solid #1C1C28"}}>
+    <div style={{width:7,height:7,borderRadius:"50%",background:clr,animation:open?"pulse 2s infinite":"none"}}/>
+    <span style={{fontSize:11,color:clr,fontWeight:600,fontFamily:"'Space Grotesk',sans-serif"}}>{open ? "Market Open" : "Market Closed"}</span>
+    <span style={{fontSize:10,color:"#7A7A8E",fontFamily:"'JetBrains Mono',monospace"}}>{countdownStr}</span>
+    <span style={{fontSize:11,color:"#EDEDF0",fontFamily:"'Space Grotesk',sans-serif",fontWeight:500}}>{nowStr}</span>
+  </div>;
+}
+
 var SRC = [
   {id:"truthsocial",name:"Truth Social",icon:"TS",color:"#5448C8"},
   {id:"x_twitter",name:"X / Twitter",icon:"X",color:"#1DA1F2"},
@@ -131,7 +173,6 @@ function App(){
   var[acd,sAcd]=s(null);var[at,sAt]=s("stock");var[ade,sAde]=s("");var[adg,sAdg]=s(false);
   var[mn,sMn]=s([]);var[sn,sSn]=s([]);var[mns,sMns]=s({});
   var[fg,sFg]=s(null);var[fd,sFd]=s(null);var[hn,sHn]=s([]);var[bt,sBt]=s(null);
-  var[tk,sTk]=s(0);
   var[corrUrl,sCorrUrl]=s(null);
   var[corrCtx,sCorrCtx]=s("");
   var[corrPick,sCorrPick]=s("");
@@ -146,7 +187,6 @@ function App(){
   var[sectors,sSectors]=s([]);
   var[newsFilter,sNewsFilter]=s([]);
   var[hoverIdx,sHoverIdx]=s(-1);
-  var[clockTick,sClockTick]=s(0);
   var[userTz,sUserTz]=s(Intl.DateTimeFormat().resolvedOptions().timeZone||"America/New_York");
   var[cgTrending,sCgTrending]=s([]);
   var[cgGlobal,sCgGlobal]=s(null);
@@ -247,30 +287,6 @@ function App(){
     });
   };
 
-  var getMarketClock=function(){
-    var now=new Date();
-    var et=new Date(now.toLocaleString("en-US",{timeZone:"America/New_York"}));
-    var h2=et.getHours(),m2=et.getMinutes();
-    var mins=h2*60+m2;
-    var openMin=9*60+30,closeMin=16*60;
-    var day=et.getDay();
-    if(day>=1&&day<=5&&mins>=openMin&&mins<closeMin){
-      var left=closeMin-mins;
-      var lh=Math.floor(left/60),lm=left%60;
-      return {open:true,text:"Market Open",countdown:lh+"h "+lm+"m to close",color:"#30D158"};
-    }else{
-      var nextOpen=new Date(et);
-      if(day===0){nextOpen.setDate(nextOpen.getDate()+1);}
-      else if(day===6){nextOpen.setDate(nextOpen.getDate()+2);}
-      else if(mins>=closeMin){nextOpen.setDate(nextOpen.getDate()+(day===5?3:1));}
-      nextOpen.setHours(9,30,0,0);
-      var diff=nextOpen.getTime()-et.getTime();
-      var dh=Math.floor(diff/3600000),dm=Math.floor((diff%3600000)/60000);
-      var countdown=dh>=24?Math.floor(dh/24)+"d "+Math.floor(dh%24)+"h":dh+"h "+dm+"m";
-      return {open:false,text:"Market Closed",countdown:countdown+" to open",color:"#FF453A"};
-    }
-  };
-
   u(function(){
     F("/api/keywords").then(function(d){if(d.keywords)sKw(d.keywords);sConn(true)}).catch(function(){sConn(false)});
     F("/api/accounts").then(function(d){if(d.accounts)sAcc(d.accounts)}).catch(function(){});
@@ -278,8 +294,6 @@ function App(){
   },[]);
   u(function(){var iv=setInterval(function(){fetch(API+"/api/status").then(function(r){if(r.ok)sConn(true);else throw 0}).catch(function(){sConn(false)})},15000);return function(){clearInterval(iv)}},[]);
   u(function(){if(!mon)return;var c=false;var p=function(){F("/api/alerts?limit=300").then(function(d){if(!c&&d.alerts){sAl(d.alerts);sConn(true)}}).catch(function(){if(!c)sConn(false)})};p();var iv=setInterval(p,8000);return function(){c=true;clearInterval(iv)}},[mon]);
-  u(function(){var iv=setInterval(function(){sTk(function(t){return t+1})},10000);return function(){clearInterval(iv)}},[]);
-  u(function(){var iv=setInterval(function(){sClockTick(function(t){return t+1})},1000);return function(){clearInterval(iv)}},[]);
   u(function(){if(mv!=="market")return;var dead=false;
     var iv2=rng==="1d"?"5m":rng==="5d"?"15m":"1d";
     var priceKey=rng+":"+iv2;
@@ -295,9 +309,6 @@ function App(){
   u(function(){if(mv!=="economy")return;var dead=false;var applyEconomy=function(d){if(dead||!d)return;if(d.fear_greed)sFg(d.fear_greed);if(d.indicators)sFd(d.indicators);if(d.stories)sHn(d.stories);if(d.btc&&!d.btc.error)sBt(d.btc);if(d.trending)sCgTrending(d.trending);if(d.global)sCgGlobal(d.global)};var loadEconomy=function(force){var entry=tabCache.current.economy;if(!force&&cacheFresh(entry,60000)){applyEconomy(entry.data);return;}Promise.all([F("/api/economy/fred-dashboard"),F("/api/market/fear-greed"),F("/api/news/hackernews?limit=10"),F("/api/crypto/binance/BTC"),F("/api/crypto/trending"),F("/api/crypto/global")]).then(function(res){var data={indicators:res[0].indicators||{},fear_greed:res[1].fear_greed||[],stories:res[2].stories||[],btc:res[3]||null,trending:res[4].trending||[],global:res[5]||null};tabCache.current.economy={ts:Date.now(),data:data};applyEconomy(data)}).catch(function(){})};loadEconomy(false);var iv=setInterval(function(){loadEconomy(true)},60000);return function(){dead=true;clearInterval(iv)}},[mv]);
 
   var Sp=function(p){if(!p.data||p.data.length<2)return null;var v=p.data.map(function(d){return d.close});var mi=Math.min.apply(null,v),ma=Math.max.apply(null,v),r=ma-mi||1;var pts=v.map(function(val,i){return(i/(v.length-1))*p.width+","+(p.height-((val-mi)/r)*p.height)}).join(" ");return <svg width={p.width} height={p.height} style={{display:"block"}}><polyline points={pts} fill="none" stroke={p.color} strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>};
-
-  var mClock=getMarketClock();
-  var nowStr=new Date().toLocaleTimeString("en-US",{timeZone:userTz,hour:"2-digit",minute:"2-digit",second:"2-digit",hour12:true});
 
   var filt=al.filter(function(a){
     if(fi!=="all"&&a.keyword!==fi)return false;
@@ -1137,12 +1148,7 @@ function App(){
       </div>
       {/* Center: clock + status */}
       <div style={{flex:1,display:"flex",justifyContent:"center",alignItems:"center",gap:12}}>
-        <div style={{display:"flex",alignItems:"center",gap:8,padding:"6px 16px",borderRadius:8,background:"#0F0F1A",border:"1px solid #1C1C28"}}>
-          <div style={{width:7,height:7,borderRadius:"50%",background:mClock.color,animation:mClock.open?"pulse 2s infinite":"none"}}/>
-          <span style={{fontSize:11,color:mClock.color,fontWeight:600}}>{mClock.text}</span>
-          <span style={{fontSize:10,color:"#7A7A8E",fontFamily:"'JetBrains Mono',monospace"}}>{mClock.countdown}</span>
-          <span style={{fontSize:11,color:"#EDEDF0",fontFamily:"'Space Grotesk',sans-serif",fontWeight:500}}>{nowStr}</span>
-        </div>
+        <Clock tz={userTz}/>
         <div style={{display:"flex",alignItems:"center",gap:5,padding:"5px 10px",borderRadius:7,background:"#0F0F1A",border:"1px solid #1C1C28"}}>
           <div style={{width:6,height:6,borderRadius:"50%",background:conn?"#30D158":"#FF453A"}}/>
           <span style={{fontSize:10,color:conn?"#30D158":"#FF453A",fontFamily:"'JetBrains Mono',monospace",fontWeight:600}}>{conn?"LIVE":"OFFLINE"}</span>

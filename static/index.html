@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- SIGINT build: 2026-04-15 v2.0.0 ui-redesign -->
+<!-- SIGINT build: 2026-04-15 v2.0.1 scroll-fix -->
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -1175,10 +1175,10 @@ function App(){
       {/* Main content */}
       <div style={{flex:1,display:"flex",flexDirection:"column",overflow:"hidden",minWidth:0}}>
         {!conn&&<div style={{background:"#2A141A",borderBottom:"1px solid #FF453A25",padding:"6px 20px",fontSize:11,color:"#FF453A",flexShrink:0,fontFamily:"'JetBrains Mono',monospace"}}>Backend not reachable — check that SIGINT server is running</div>}
-        {mv==="alerts"&&<AlertsPage/>}
-        {mv==="market"&&<MarketsPage/>}
-        {mv==="economy"&&<EconomyPage/>}
-        {mv==="analytics"&&<AnalyticsPage/>}
+        <div style={{display:mv==="alerts"?"flex":"none",flex:1,flexDirection:"column",minHeight:0,overflow:"hidden"}}><AlertsPage/></div>
+        <div style={{display:mv==="market"?"flex":"none",flex:1,flexDirection:"column",minHeight:0,overflow:"hidden"}}><MarketsPage/></div>
+        <div style={{display:mv==="economy"?"flex":"none",flex:1,flexDirection:"column",minHeight:0,overflow:"hidden"}}><EconomyPage/></div>
+        <div style={{display:mv==="analytics"?"flex":"none",flex:1,flexDirection:"column",minHeight:0,overflow:"hidden"}}><AnalyticsPage/></div>
       </div>
     </div>
 
@@ -1187,7 +1187,7 @@ function App(){
 
     {/* Version badge */}
     <div style={{position:"fixed",bottom:8,left:SIDEBAR_W+10,zIndex:5,pointerEvents:"none"}}>
-      <span style={{fontSize:9,color:"#1C1C28",fontFamily:"'JetBrains Mono',monospace",letterSpacing:"0.05em",userSelect:"none"}}>SIGINT v2.0.0 · 2026-04-15</span>
+      <span style={{fontSize:9,color:"#1C1C28",fontFamily:"'JetBrains Mono',monospace",letterSpacing:"0.05em",userSelect:"none"}}>SIGINT v2.0.1 · 2026-04-15</span>
     </div>
   </div>;
 }

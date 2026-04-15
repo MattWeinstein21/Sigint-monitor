@@ -17,6 +17,7 @@ import time
 import hashlib
 import logging
 import threading
+from collections import deque
 import re
 import sqlite3
 from datetime import datetime, timezone, timedelta
@@ -50,9 +51,20 @@ log = logging.getLogger("sigint")
 DATA_STORE_PATH = Path("sigint_data.db")
 
 
+def get_db():
+    """Open SQLite with WAL journal mode and a 5-second busy timeout.
+    WAL allows concurrent reads during writes (critical for the polling loop).
+    busy_timeout prevents 'database is locked' exceptions under load."""
+    conn = sqlite3.connect(str(DATA_STORE_PATH))
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
 def init_data_store():
     """Initialize the SQLite database with required tables."""
-    conn = sqlite3.connect(str(DATA_STORE_PATH))
+    conn = get_db()
     c = conn.cursor()
 
     # Core article storage
@@ -315,7 +327,7 @@ def log_article(alert_data, article_text=""):
         if not url:
             return
 
-        conn = sqlite3.connect(str(DATA_STORE_PATH))
+        conn = get_db()
         c = conn.cursor()
 
         # Try INSERT first (only fires if url is new)
@@ -398,7 +410,7 @@ def log_article(alert_data, article_text=""):
 def log_chat(alert_id, article_title, question, answer, article_url="", source_id="", keyword=""):
     """Log a chat interaction to the data store."""
     try:
-        conn = sqlite3.connect(str(DATA_STORE_PATH))
+        conn = get_db()
         c = conn.cursor()
         c.execute("""INSERT INTO chat_logs
             (timestamp, alert_id, article_title, article_url, question, answer, source_id, keyword)
@@ -414,7 +426,7 @@ def log_chat(alert_id, article_title, question, answer, article_url="", source_i
 def log_system_event(event_type, message, details=""):
     """Log a system event for debugging."""
     try:
-        conn = sqlite3.connect(str(DATA_STORE_PATH))
+        conn = get_db()
         c = conn.cursor()
         c.execute("INSERT INTO system_logs (timestamp, event_type, message, details) VALUES (?,?,?,?)",
                   (datetime.now(timezone.utc).isoformat(), event_type, message, details))
@@ -428,7 +440,7 @@ def log_sentiment_correction(url, title, original, corrected, source_id="", keyw
                               original_impact="", corrected_impact="", user_context=""):
     """Log a user sentiment correction with optional impact correction and context."""
     try:
-        conn = sqlite3.connect(str(DATA_STORE_PATH))
+        conn = get_db()
         c = conn.cursor()
         c.execute("""INSERT INTO sentiment_corrections
             (timestamp, article_url, article_title, original_sentiment, corrected_sentiment,
@@ -456,7 +468,7 @@ def get_related_articles(keyword="", sector="", limit=5):
     Includes user-corrected labels when available for trend context.
     """
     try:
-        conn = sqlite3.connect(str(DATA_STORE_PATH))
+        conn = get_db()
         conn.row_factory = sqlite3.Row
         c = conn.cursor()
         cols = "title, summary, sentiment, market_impact, published_at, source_name, user_corrected_sentiment"
@@ -514,7 +526,7 @@ def get_correction_stats(source_id="", keyword=""):
     Uses AND when both filters provided, falls back to global stats if sample too small.
     """
     try:
-        conn = sqlite3.connect(str(DATA_STORE_PATH))
+        conn = get_db()
         c = conn.cursor()
 
         # Build query — AND when both provided, not OR
@@ -561,7 +573,7 @@ def get_correction_stats(source_id="", keyword=""):
             result["sample_size"] = total
         elif where_parts:
             # Fallback to global stats if filtered sample is too small
-            c2 = sqlite3.connect(str(DATA_STORE_PATH)).cursor()
+            c2 = get_db().cursor()
             c2.execute("""SELECT
                 SUM(CASE WHEN sc.corrected_sentiment = a.ai_sentiment THEN 1 ELSE 0 END),
                 SUM(CASE WHEN sc.corrected_sentiment = a.word_sentiment THEN 1 ELSE 0 END),
@@ -595,7 +607,7 @@ def recalibrate_thresholds():
     Run periodically (daily/weekly) or on-demand.
     """
     try:
-        conn = sqlite3.connect(str(DATA_STORE_PATH))
+        conn = get_db()
         c = conn.cursor()
 
         c.execute("""
@@ -657,7 +669,7 @@ def compute_source_accuracy():
     Sources with high correction rates may need confidence discounting.
     """
     try:
-        conn = sqlite3.connect(str(DATA_STORE_PATH))
+        conn = get_db()
         c = conn.cursor()
 
         c.execute("""
@@ -701,7 +713,7 @@ def calibrate_confidence():
     Returns calibration data for each confidence bucket.
     """
     try:
-        conn = sqlite3.connect(str(DATA_STORE_PATH))
+        conn = get_db()
         c = conn.cursor()
 
         buckets = [(0, 0.3, "low"), (0.3, 0.5, "medium-low"), (0.5, 0.7, "medium"),
@@ -745,7 +757,7 @@ def get_disagreement_outcomes():
     Tracks both tone and impact disagreements from corrections data.
     """
     try:
-        conn = sqlite3.connect(str(DATA_STORE_PATH))
+        conn = get_db()
         c = conn.cursor()
 
         # ─── Tone disagreements ───
@@ -1210,7 +1222,7 @@ class AlertStore:
         # Chat lane config (used by worker 2 when chat is idle)
         self.ollama_chat_url = ""
         self.ollama_chat_model = "llama3"
-        self._ai_queue = []
+        self._ai_queue = deque(maxlen=100)
         self._ai_lock = threading.Lock()
         # Worker 1: analysis lane (always runs, yields to chat)
         self._ai_thread = threading.Thread(target=self._ai_worker, args=("analysis",), daemon=True)
@@ -1261,7 +1273,7 @@ class AlertStore:
             job = None
             with self._ai_lock:
                 if self._ai_queue:
-                    job = self._ai_queue.pop(0)
+                    job = self._ai_queue.popleft()
             if job:
                 try:
                     # Choose which model to use based on role
@@ -1867,6 +1879,10 @@ HIGH_IMPACT_COMBOS = [
 
 SIGNAL_SETS_PATH = Path("signal_sets.json")
 
+# File-level cache — avoids re-reading signal_sets.json on every article
+_signal_sets_cache = None
+_signal_sets_mtime = 0.0
+
 
 def load_signal_sets():
     """Load signal sets from file, or create defaults."""
@@ -1879,12 +1895,23 @@ def load_signal_sets():
 
 
 def save_signal_sets(sets):
+    global _signal_sets_cache
     SIGNAL_SETS_PATH.write_text(json.dumps(sets, indent=2))
+    _signal_sets_cache = None  # invalidate cache on write
 
 
 def get_active_signals():
-    """Merge all enabled signal sets into flat positive/negative dicts."""
-    sets = load_signal_sets()
+    """Merge all enabled signal sets into flat positive/negative dicts.
+    Uses a file-mtime cache so the JSON is only re-parsed when the file changes."""
+    global _signal_sets_cache, _signal_sets_mtime
+    try:
+        mtime = SIGNAL_SETS_PATH.stat().st_mtime if SIGNAL_SETS_PATH.exists() else 0.0
+    except OSError:
+        mtime = 0.0
+    if _signal_sets_cache is None or mtime != _signal_sets_mtime:
+        _signal_sets_cache = load_signal_sets()
+        _signal_sets_mtime = mtime
+    sets = _signal_sets_cache
     pos = {}
     neg = {}
     for cat_id, cat in sets.items():
@@ -2201,9 +2228,11 @@ def compute_position_weight(idx, total):
     return 0.8
 
 
-def quick_polarity(text_fragment):
-    """Fast polarity check on a text fragment for contrast clause handling."""
-    pos_signals, neg_signals = get_active_signals()
+def quick_polarity(text_fragment, pos_signals=None, neg_signals=None):
+    """Fast polarity check on a text fragment for contrast clause handling.
+    Accepts pre-loaded signal dicts to avoid redundant get_active_signals() calls."""
+    if pos_signals is None or neg_signals is None:
+        pos_signals, neg_signals = get_active_signals()
     score = 0.0
     text_lower = text_fragment.lower()
     for word, weight in pos_signals.items():
@@ -2248,8 +2277,8 @@ def score_sentence(sentence, pos_signals, neg_signals):
         if f" {cw} " in f" {tokens} ":
             parts = tokens.split(cw, 1)
             if len(parts) == 2 and len(parts[1]) > 15:
-                before = quick_polarity(parts[0])
-                after = quick_polarity(parts[1])
+                before = quick_polarity(parts[0], pos_signals, neg_signals)
+                after = quick_polarity(parts[1], pos_signals, neg_signals)
                 score = (before + after * 2.0) / 3.0
 
     # 4. Expectation framing
@@ -3277,7 +3306,7 @@ def general_chat():
     context_parts = []
 
     try:
-        conn = sqlite3.connect(str(DATA_STORE_PATH))
+        conn = get_db()
         conn.row_factory = sqlite3.Row
         c = conn.cursor()
 
@@ -3661,6 +3690,33 @@ def _fetch_yahoo_raw(symbol, range_str="1d", interval="5m"):
         return None
 
 
+# CoinGecko response cache — avoids hammering the free-tier rate limit
+_cg_cache = {}
+_CG_TTL = 60  # seconds
+
+
+def _cg_get(path, params=None, ttl=_CG_TTL):
+    """Cached GET wrapper for CoinGecko API.
+    Returns cached data if fresh, handles 429 by returning stale data."""
+    key = f"{path}:{sorted((params or {}).items())}"
+    cached = _cg_cache.get(key)
+    if cached and (time.time() - cached["ts"]) < ttl:
+        return cached["data"]
+    try:
+        resp = requests.get(f"{COINGECKO_URL}/{path}", params=params, timeout=10)
+        if resp.status_code == 429:
+            log.warning("CoinGecko rate limited (429) — returning stale data if available")
+            return cached["data"] if cached else None
+        if resp.status_code == 200:
+            data = resp.json()
+            _cg_cache[key] = {"data": data, "ts": time.time()}
+            return data
+        return None
+    except Exception as e:
+        log.warning(f"CoinGecko request error: {e}")
+        return cached["data"] if cached else None
+
+
 def fetch_crypto_quote(crypto_id, range_str="1d"):
     """Fetch crypto data from CoinGecko (free, no key needed)."""
     try:
@@ -3668,23 +3724,22 @@ def fetch_crypto_quote(crypto_id, range_str="1d"):
         days_map = {"1d": "1", "5d": "5", "1mo": "30", "3mo": "90", "6mo": "180", "1y": "365"}
         days = days_map.get(range_str, "1")
 
-        # Get current price + market data
-        resp = requests.get(f"{COINGECKO_URL}/coins/{crypto_id}", params={
+        # Get current price + market data (cached, 60s TTL)
+        coin = _cg_get(f"coins/{crypto_id}", params={
             "localization": "false", "tickers": "false", "community_data": "false",
             "developer_data": "false", "sparkline": "false"
-        }, timeout=10)
-        if resp.status_code != 200:
+        })
+        if not coin:
             return None
-        coin = resp.json()
         md = coin.get("market_data", {})
 
-        # Get chart data
-        chart_resp = requests.get(f"{COINGECKO_URL}/coins/{crypto_id}/market_chart", params={
+        # Get chart data (cached, 60s TTL)
+        chart_raw = _cg_get(f"coins/{crypto_id}/market_chart", params={
             "vs_currency": "usd", "days": days
-        }, timeout=10)
+        })
         chart_data = []
-        if chart_resp.status_code == 200:
-            prices = chart_resp.json().get("prices", [])
+        if chart_raw:
+            prices = chart_raw.get("prices", [])
             for ts, price in prices:
                 chart_data.append({
                     "time": datetime.fromtimestamp(ts / 1000, tz=timezone.utc).isoformat(),
@@ -4079,7 +4134,7 @@ def edit_signal_weight():
 def data_stats():
     """Get data store statistics for debugging and trend overview."""
     try:
-        conn = sqlite3.connect(str(DATA_STORE_PATH))
+        conn = get_db()
         c = conn.cursor()
         c.execute("SELECT COUNT(*) FROM articles")
         total = c.fetchone()[0]
@@ -4125,7 +4180,7 @@ def data_trends():
     sector = request.args.get("sector", "")
     days = request.args.get("days", 7, type=int)
     try:
-        conn = sqlite3.connect(str(DATA_STORE_PATH))
+        conn = get_db()
         c = conn.cursor()
         cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
 
@@ -4161,7 +4216,7 @@ def data_trends():
 def data_sectors():
     """Get sector breakdown from stored articles."""
     try:
-        conn = sqlite3.connect(str(DATA_STORE_PATH))
+        conn = get_db()
         c = conn.cursor()
         c.execute("SELECT sectors FROM articles WHERE sectors != '' AND sectors != '[]'")
         sector_counts = {}
@@ -4244,7 +4299,7 @@ def data_recent():
     """Get recent articles from the data store."""
     limit = request.args.get("limit", 20, type=int)
     try:
-        conn = sqlite3.connect(str(DATA_STORE_PATH))
+        conn = get_db()
         conn.row_factory = sqlite3.Row
         c = conn.cursor()
         c.execute("SELECT * FROM articles ORDER BY id DESC LIMIT ?", (min(limit, 100),))
@@ -4259,7 +4314,7 @@ def data_recent():
 def data_export():
     """Export all articles as JSON for analysis."""
     try:
-        conn = sqlite3.connect(str(DATA_STORE_PATH))
+        conn = get_db()
         conn.row_factory = sqlite3.Row
         c = conn.cursor()
         c.execute("SELECT * FROM articles ORDER BY id DESC")
@@ -4275,7 +4330,7 @@ def system_logs():
     """Get recent system logs for debugging."""
     limit = request.args.get("limit", 50, type=int)
     try:
-        conn = sqlite3.connect(str(DATA_STORE_PATH))
+        conn = get_db()
         conn.row_factory = sqlite3.Row
         c = conn.cursor()
         c.execute("SELECT * FROM system_logs ORDER BY id DESC LIMIT ?", (min(limit, 200),))

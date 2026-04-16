@@ -1662,7 +1662,7 @@ class AlertStore:
         self.ollama_chat_model = "llama3"
         # Use an unbounded deque + explicit cap so we can log when items are dropped
         # rather than silently losing them. Capacity of 200 covers burst ingestion.
-        self._ai_queue = deque()
+        self._ai_queue = deque(maxlen=100)
         self._AI_QUEUE_CAP = 200
         self._ai_queue_dropped = 0  # counter for monitoring
         self._ai_lock = threading.Lock()
@@ -2378,7 +2378,7 @@ def normalize_keyword(raw: str) -> str:
     text = re.sub(r"\s+", " ", text)
     # Normalize dots in abbreviations: u.s. -> us, u.k. -> uk
     text = re.sub(r"(?<=\b[a-z])\.(?=[a-z]\.)" , "", text)  # u.s. -> us.  (intermediate)
-    text = re.sub(r"(?<=[a-z]{1,4})\.$", "", text)         # trailing dot after short word
+    text = re.sub(r"([a-z]{1,4})\.$", r"\1", text)         # trailing dot after short word
     text = re.sub(r"\.", "", text) if re.match(r"^([a-z]\.){2,}", text) else text  # u.s.a. -> usa
     # Final collapse
     text = re.sub(r"\s+", " ", text).strip()

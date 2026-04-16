@@ -212,6 +212,7 @@ function App(){
   var[searchResults,sSearchResults]=s([]);
   var searchTimer=React.useRef(null);
   var[alertSort,sAlertSort]=s("time");
+  var[alertView,sAlertView]=s("all"); // "all" | "priority" | "foryou"
   // Ref mirrors alertSort so the poll closure can read current value without
   // being added to the effect dep array (adding it would remount and reset scroll).
   var alertSortRef=React.useRef("time");
@@ -343,7 +344,7 @@ function App(){
   u(function(){if(mv!=="analytics")return;var dead=false;var entry=tabCache.current.analytics;if(cacheFresh(entry,60000)&&entry.data){sAcd(entry.data);}else{F("/api/data/accuracy").then(function(d){if(dead)return;tabCache.current.analytics={ts:Date.now(),data:d};sAcd(d)}).catch(function(){})}return function(){dead=true}},[mv]);
   // For You: load when tab is active, poll every 30s
   u(function(){
-    if(mv!=="foryou")return;
+    if(mv!=="alerts"||alertView!=="foryou")return;
     var dead=false;
     var load=function(){
       sFyLoading(true);sFyError("");
@@ -365,7 +366,7 @@ function App(){
     load();
     var iv=setInterval(load,30000);
     return function(){dead=true;clearInterval(iv)};
-  },[mv]);
+  },[mv,alertView]);
 
   // Explain/Summarize helper — Layer 3 on-demand AI
   var requestExplain=function(alertId){
@@ -413,7 +414,6 @@ function App(){
   /* ===== SIDEBAR ===== */
   var renderNavSidebar = function(){
     var navItems=[
-      {id:"foryou",icon:"foryou",label:"For You"},
       {id:"alerts",icon:"signals",label:"Alerts"},
       {id:"market",icon:"markets",label:"Markets"},
       {id:"economy",icon:"economy",label:"Economy"},
@@ -736,25 +736,35 @@ function App(){
 
   /* ===== ALERTS PAGE ===== */
   var renderAlertsPage = function(){
-    var totalAlertPages=Math.ceil(sortedFilt.length/ALERTS_PER_PAGE);
+    // For You view: render personalized feed from /api/for-you
+    if(alertView==="foryou"){
+      return renderForYouSection();
+    }
+    // Priority view forces attention-score sort regardless of alertSort toggle
+    var effectiveSorted=alertView==="priority"?sortedFilt.slice().sort(function(a,b){return (b.attention_score||0)-(a.attention_score||0)}):sortedFilt;
+    var totalAlertPages=Math.ceil(effectiveSorted.length/ALERTS_PER_PAGE);
     var safePage=Math.min(alertPage,Math.max(0,totalAlertPages-1));
-    var pageAlerts=sortedFilt.slice(safePage*ALERTS_PER_PAGE,(safePage+1)*ALERTS_PER_PAGE);
+    var pageAlerts=effectiveSorted.slice(safePage*ALERTS_PER_PAGE,(safePage+1)*ALERTS_PER_PAGE);
     return <div style={{flex:1,display:"flex",flexDirection:"column",minHeight:0}}>
       {/* Stat strip + controls */}
       <div style={{padding:"14px 20px",borderBottom:"1px solid #1C1C28",flexShrink:0}}>
         <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:12}}>
           <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
-            {[{l:"Total",v:al.length,c:"#5448C8"},{l:"Bullish",v:al.filter(function(a){return a.market_impact==="bullish"}).length,c:"#30D158"},{l:"Bearish",v:al.filter(function(a){return a.market_impact==="bearish"}).length,c:"#FF453A"},{l:"Mixed",v:al.filter(function(a){return a.mixed_signals}).length,c:"#FF9F0A"},{l:"High",v:al.filter(function(a){return a.severity==="high"}).length,c:"#FF9F0A"},{l:"AI",v:al.filter(function(a){return a.ai_summary}).length,c:"#8B80F0"}].map(function(x,i){return <div key={i} style={{padding:"6px 12px",borderRadius:8,background:"#0F0F1A",border:"1px solid #1C1C28",display:"flex",alignItems:"center",gap:6}}>
+            {[{l:"Total",v:al.length,c:"#5448C8"},{l:"Bullish",v:al.filter(function(a){return a.market_impact==="bullish"}).length,c:"#30D158"},{l:"Bearish",v:al.filter(function(a){return a.market_impact==="bearish"}).length,c:"#FF453A"},{l:"Mixed",v:al.filter(function(a){return a.mixed_signals}).length,c:"#FF9F0A"},{l:"High",v:al.filter(function(a){return a.severity==="high"}).length,c:"#FF9F0A"},{l:"Intel",v:al.filter(function(a){return a.intelligence}).length,c:"#8B80F0"}].map(function(x,i){return <div key={i} style={{padding:"6px 12px",borderRadius:8,background:"#0F0F1A",border:"1px solid #1C1C28",display:"flex",alignItems:"center",gap:6}}>
               <span style={{fontSize:16,fontWeight:700,color:x.c,fontFamily:"'Space Grotesk',sans-serif",lineHeight:1}}>{x.v}</span>
               <span style={{fontSize:10,color:"#7A7A8E",fontFamily:"'JetBrains Mono',monospace",letterSpacing:0.5}}>{x.l}</span>
             </div>})}
           </div>
           <div style={{display:"flex",gap:6,alignItems:"center",flexShrink:0}}>
-            {/* Sort toggle */}
+            {/* View mode switcher: All / Priority / For You */}
             <div style={{display:"flex",borderRadius:7,overflow:"hidden",border:"1px solid #1C1C28"}}>
-              <button className="b" onClick={function(){switchSort("time")}} style={{padding:"6px 12px",fontSize:10,background:alertSort==="time"?"#141420":"transparent",color:alertSort==="time"?"#EDEDF0":"#7A7A8E",fontFamily:"'JetBrains Mono',monospace"}}>Recent</button>
-              <button className="b" onClick={function(){switchSort("score")}} style={{padding:"6px 12px",fontSize:10,background:alertSort==="score"?"#141420":"transparent",color:alertSort==="score"?"#EDEDF0":"#7A7A8E",fontFamily:"'JetBrains Mono',monospace"}}>Priority</button>
+              {[{v:"all",l:"All"},{v:"priority",l:"Priority"},{v:"foryou",l:"For You"}].map(function(m){return <button key={m.v} className="b" onClick={function(){sAlertView(m.v);sAlertPage(0)}} style={{padding:"6px 12px",fontSize:10,background:alertView===m.v?"#5448C825":"transparent",color:alertView===m.v?"#8B80F0":"#7A7A8E",fontFamily:"'JetBrains Mono',monospace",fontWeight:alertView===m.v?600:400}}>{m.l}</button>})}
             </div>
+            {/* Sort toggle — only visible in All view */}
+            {alertView==="all"&&<div style={{display:"flex",borderRadius:7,overflow:"hidden",border:"1px solid #1C1C28"}}>
+              <button className="b" onClick={function(){switchSort("time")}} style={{padding:"6px 12px",fontSize:10,background:alertSort==="time"?"#141420":"transparent",color:alertSort==="time"?"#EDEDF0":"#7A7A8E",fontFamily:"'JetBrains Mono',monospace"}}>Recent</button>
+              <button className="b" onClick={function(){switchSort("score")}} style={{padding:"6px 12px",fontSize:10,background:alertSort==="score"?"#141420":"transparent",color:alertSort==="score"?"#EDEDF0":"#7A7A8E",fontFamily:"'JetBrains Mono',monospace"}}>Score</button>
+            </div>}
             {/* Filter button */}
             <div style={{position:"relative"}}>
               <button className="b" onClick={function(){sShowFilters(!showFilters)}} style={{padding:"6px 12px",borderRadius:7,fontSize:11,background:activeFilterCount>0?"#5448C820":"#0F0F1A",color:activeFilterCount>0?"#8B80F0":"#7A7A8E",border:"1px solid "+(activeFilterCount>0?"#5448C844":"#1C1C28"),display:"flex",alignItems:"center",gap:5}}>
@@ -1159,24 +1169,20 @@ function App(){
     </div>;
   };
 
-  /* ===== FOR YOU PAGE ===== */
+  /* ===== FOR YOU SECTION (renders inside Alerts tab when alertView==="foryou") ===== */
   var FOR_YOU_REASON_LABELS = {
-    watchlist_ticker: "Watchlist match",
-    watchlist_sector: "Sector match",
-    keyword_match: "Keyword match",
-    high_priority: "High priority",
-    multi_confirmed: "Multi-source",
-    macro_adjacent: "Macro relevance",
-    recent_topic: "Recent topic",
+    watchlist_ticker: "Affects holdings",
+    watchlist_sector: "Sector relevant",
+    macro_adjacent: "Macro to holdings",
+    recent_topic: "Recent interest",
   };
-  var renderForYouPage = function(){
+  var renderForYouSection = function(){
     var hasFy = fyItems.length > 0;
     return <div style={{flex:1,overflowY:"auto",padding:"20px"}}>
       {/* Header */}
       <div style={{display:"flex",alignItems:"flex-start",justifyContent:"space-between",marginBottom:20,flexWrap:"wrap",gap:12}}>
         <div>
-          <div style={{fontSize:20,fontWeight:700,color:"#EDEDF0",fontFamily:"'Space Grotesk',sans-serif",marginBottom:4}}>For You</div>
-          <div style={{fontSize:11,color:"#7A7A8E",maxWidth:560,lineHeight:1.55}}>Personalised signal feed based on your watchlist, keywords, and recent activity. Direct matches come first, followed by adjacent macro context.</div>
+          <div style={{fontSize:11,color:"#7A7A8E",maxWidth:560,lineHeight:1.55}}>Personalized to your holdings, sectors, macro adjacency, and recent questions — and only when the signal is meaningful. Tracked keywords show up in <span style={{color:"#8B80F0"}}>All</span>; broad market moves show in <span style={{color:"#8B80F0"}}>Priority</span>.</div>
           {fyGeneratedAt&&<div style={{fontSize:9,color:"#3A3A4E",marginTop:6,fontFamily:"'JetBrains Mono',monospace"}}>Generated {ago(fyGeneratedAt)}</div>}
         </div>
         <button className="b" onClick={function(){sFyLoading(true);sFyError("");F("/api/for-you").then(function(d){sFyItems(d.items||[]);sFyGeneratedAt(d.generated_at||null);sFyLoading(false);sIntelMap(function(prev){var next=Object.assign({},prev);(d.items||[]).forEach(function(item){if(item.intelligence&&!next[item.id]){next[item.id]={intelligence:item.intelligence,source:item.intelligence_source||"auto",loading:false,error:""};}});return next;});}).catch(function(){sFyLoading(false);sFyError("Failed to refresh")})}} disabled={fyLoading} style={{padding:"8px 16px",borderRadius:8,background:"#0F0F1A",color:"#7A7A8E",border:"1px solid #1C1C28",fontSize:11,display:"flex",alignItems:"center",gap:6,flexShrink:0}}>
@@ -1190,12 +1196,12 @@ function App(){
       {fyLoading&&fyItems.length===0&&<div style={{display:"flex",flexDirection:"column",gap:8}}>
         {[1,2,3].map(function(i){return <div key={i} style={{height:80,borderRadius:10,background:"#0F0F1A",border:"1px solid #1C1C28",animation:"pulse 1.5s infinite"}}></div>})}
       </div>}
-      {/* Empty state — no watchlist */}
+      {/* Empty state */}
       {!fyLoading&&fyItems.length===0&&!fyError&&<div style={{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:"60px 20px",gap:14,textAlign:"center"}}>
         <svg width="48" height="48" viewBox="0 0 48 48" fill="none"><circle cx="24" cy="24" r="20" stroke="#1C1C28" strokeWidth="2"/><path d="M24 14C24 14 16 18 16 24.5a8 8 0 0 0 16 0C32 18 24 14 24 14z" stroke="#242434" strokeWidth="1.8" strokeLinejoin="round" fill="none"/><path d="M24 22v5" stroke="#242434" strokeWidth="1.8" strokeLinecap="round"/></svg>
-        <div style={{fontSize:14,color:"#3A3A4E",fontWeight:600}}>Nothing personalised yet</div>
-        <div style={{fontSize:11,color:"#3A3A4E",maxWidth:340}}>Add tickers or keywords to your watchlist and let SIGINT collect some signals. Come back once alerts start flowing in.</div>
-        <button className="b" onClick={function(){sMv("market");sCfg(false)}} style={{padding:"9px 18px",borderRadius:8,background:"#5448C820",color:"#8B80F0",border:"1px solid #5448C844",fontSize:11,fontWeight:600}}>Go to Watchlist</button>
+        <div style={{fontSize:14,color:"#3A3A4E",fontWeight:600}}>Nothing personalized yet</div>
+        <div style={{fontSize:11,color:"#3A3A4E",maxWidth:360}}>For You needs both a personal hook (watchlist, sector, macro adjacency, or recent chat topic) and a significant signal. Add tickers to your watchlist to populate this view.</div>
+        <button className="b" onClick={function(){sMv("market")}} style={{padding:"9px 18px",borderRadius:8,background:"#5448C820",color:"#8B80F0",border:"1px solid #5448C844",fontSize:11,fontWeight:600}}>Go to Watchlist</button>
       </div>}
       {/* Feed */}
       {hasFy&&<div style={{display:"flex",flexDirection:"column",gap:8}}>
@@ -1204,7 +1210,7 @@ function App(){
           var im2=item.market_impact||"neutral";
           var ic2=iC[im2]||"#7A7A8E";
           var reasonKey=item.reason_key||"";
-          var reasonLabel=FOR_YOU_REASON_LABELS[reasonKey]||reasonKey||"Recommended";
+          var reasonLabel=FOR_YOU_REASON_LABELS[reasonKey]||item.reason_label||reasonKey||"Recommended";
           var isAdj=item.is_adjacent;
           var fyScore=item.fy_score||0;
           var itemIntel=intelMap[item.id];
@@ -1217,7 +1223,6 @@ function App(){
               <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:8,flexWrap:"wrap"}}>
                 <span style={{fontSize:9,fontWeight:700,padding:"2px 8px",borderRadius:4,background:isAdj?"#FF9F0A18":"#5448C820",color:isAdj?"#FF9F0A":"#8B80F0",border:"1px solid "+(isAdj?"#FF9F0A30":"#5448C840"),fontFamily:"'JetBrains Mono',monospace",letterSpacing:0.3}}>{isAdj?"ADJACENT":"DIRECT"}</span>
                 <span style={{fontSize:9,padding:"2px 8px",borderRadius:4,background:"#141420",color:"#7A7A8E",border:"1px solid #1C1C28",fontFamily:"'JetBrains Mono',monospace"}}>{reasonLabel}</span>
-                {item.reason_label&&item.reason_label!==reasonLabel&&<span style={{fontSize:10,color:"#7A7A8E",fontStyle:"normal"}}>{item.reason_label}</span>}
                 <span style={{marginLeft:"auto",fontSize:9,color:fyScore>=80?"#FF453A":fyScore>=50?"#FF9F0A":"#8B80F0",fontFamily:"'JetBrains Mono',monospace",background:fyScore>=80?"#FF453A18":fyScore>=50?"#FF9F0A18":"#5448C818",padding:"1px 6px",borderRadius:4}}>fy:{Math.round(fyScore)}</span>
               </div>
               {/* Title row */}
@@ -1232,7 +1237,7 @@ function App(){
               </div>}
               {/* Event */}
               {item.event&&item.event.action&&<div style={{fontSize:10,color:"#7A7A8E",marginBottom:5}}><span style={{color:"#EDEDF0"}}>{item.event.actor}</span> <span style={{color:"#8B80F0"}}>{(item.event.action||"").replace(/_/g," ")}</span>{item.event.target&&<span style={{color:"#EDEDF0"}}> to {item.event.target}</span>}{item.event.magnitude&&<span style={{color:"#FF9F0A"}}> ({item.event.magnitude})</span>}</div>}
-              {/* Intelligence — auto-expanded when present, collapsible */}
+              {/* Intelligence */}
               <div style={{marginTop:6}}>
                 {hasIntel&&<button className="b" onClick={toggleFy} style={{fontSize:10,color:"#8B80F0",background:"none",padding:"0",marginBottom:isExpanded?6:0,display:"flex",alignItems:"center",gap:5}}>
                   <svg width="10" height="10" viewBox="0 0 10 10" fill="none" style={{transform:isExpanded?"rotate(90deg)":"rotate(0deg)",transition:"transform 0.2s",flexShrink:0}}><polyline points="2,2 8,5 2,8" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>
@@ -1252,7 +1257,7 @@ function App(){
             </div>
           </div>;
         })}
-        <div style={{fontSize:10,color:"#3A3A4E",textAlign:"center",padding:"12px 0",fontFamily:"'JetBrains Mono',monospace"}}>Showing {fyItems.length} personalised signals · refreshes every 30s</div>
+        <div style={{fontSize:10,color:"#3A3A4E",textAlign:"center",padding:"12px 0",fontFamily:"'JetBrains Mono',monospace"}}>Showing {fyItems.length} personalized signals · refreshes every 30s</div>
       </div>}
     </div>;
   };
@@ -1390,7 +1395,6 @@ function App(){
       {/* Main content */}
       <div style={{flex:1,display:"flex",flexDirection:"column",overflow:"hidden",minWidth:0}}>
         {!conn&&<div style={{background:"#2A141A",borderBottom:"1px solid #FF453A25",padding:"6px 20px",fontSize:11,color:"#FF453A",flexShrink:0,fontFamily:"'JetBrains Mono',monospace"}}>Backend not reachable — check that SIGINT server is running</div>}
-        <div style={{display:mv==="foryou"?"flex":"none",flex:1,flexDirection:"column",minHeight:0,overflow:"hidden"}}>{renderForYouPage()}</div>
         <div style={{display:mv==="alerts"?"flex":"none",flex:1,flexDirection:"column",minHeight:0,overflow:"hidden"}}>{renderAlertsPage()}</div>
         <div style={{display:mv==="market"?"flex":"none",flex:1,flexDirection:"column",minHeight:0,overflow:"hidden"}}>{renderMarketsPage()}</div>
         <div style={{display:mv==="economy"?"flex":"none",flex:1,flexDirection:"column",minHeight:0,overflow:"hidden"}}>{renderEconomyPage()}</div>

@@ -1479,14 +1479,10 @@ def _generate_intelligence(alert_id, title, source_name, keyword, text, ollama_u
 
 # Reason-label templates for UI display
 FOR_YOU_REASONS = {
-    "watchlist_direct":  "Matches your watchlist",
-    "watchlist_sector":  "Related sector to your holdings",
-    "keyword_match":     "Matches your tracked keyword",
-    "high_priority":     "High-priority signal",
-    "multi_confirmed":   "Confirmed by multiple sources",
-    "macro_adjacent":    "Macro signal with likely second-order effect",
-    "recent_topic":      "Related to your recent AI question",
-    "watchlist_ticker":  "Directly mentions your holdings",
+    "watchlist_ticker":  "Affects your holdings",
+    "watchlist_sector":  "Sector tied to your holdings",
+    "macro_adjacent":    "Macro signal likely to touch your holdings",
+    "recent_topic":      "Related to your recent questions",
 }
 
 # Broad macro/sector keywords that signal second-order effects
@@ -1520,79 +1516,98 @@ def _score_for_you(alert, watchlist_tickers, watchlist_sectors, recent_topics, m
     Compute a For You relevance score (0-100) and a reason label.
     Returns (score, reason_key, is_adjacent).
 
-    monitored_keywords: list of strings from the user's config (the actual keyword
-    watchlist), used for keyword_match reason. Distinct from watchlist_tickers
-    (the stock/ETF holdings list).
+    Design rule: For You requires BOTH a personal relevance reason AND
+    a significance reason. An item is never surfaced here just because it
+    matches a tracked keyword (those already appear in Alerts) or just
+    because it's high priority (that's what the Priority view is for).
+
+    Personal relevance reasons:
+      - watchlist_ticker : affected ticker is in user's holdings
+      - watchlist_sector : sector tied to holdings
+      - macro_adjacent   : macro signal with broad 2nd-order effects on holdings
+      - recent_topic     : related to user's recent chat questions
+
+    Significance reasons (must also have at least one):
+      - attention_score >= 50
+      - report_count >= 3 (multi-source confirmation)
+      - scope == "broad_market" (widespread impact)
+      - severity == "high"
+
+    monitored_keywords: the user's tracked keyword list. NOT used here
+    as a personal-relevance reason since keyword matches already appear
+    in the Alerts feed. Kept in signature for API compatibility.
     """
-    score = 0.0
-    reason_key = None
-    is_adjacent = False
-    monitored_keywords = monitored_keywords or []
+    if alert.get("is_duplicate"):
+        return 0, None, False
 
     title_lower = (alert.get("title") or "").lower()
-    kw = (alert.get("keyword") or "").lower()
     affected = {t.upper() for t in alert.get("affected_tickers", [])}
     attn = alert.get("attention_score", 0)
+    rc = alert.get("report_count", 1)
+    scope = alert.get("scope", "")
+    severity = alert.get("severity", "")
 
-    # 1. Direct watchlist ticker hit (strongest signal)
+    # ─── Step 1: Identify personal relevance reason (must have at least one) ──
+    personal_score = 0
+    personal_reason = None
+    is_adjacent = False
+
     if affected & watchlist_tickers:
-        score += 40
-        reason_key = "watchlist_ticker"
-
-    # 2. Alert's trigger keyword is one the user explicitly monitors.
-    # Compare against the actual keywords list from config, not watchlist tickers.
-    if kw and monitored_keywords:
-        if any(kw == mk.lower() or kw in mk.lower() or mk.lower() in kw
-               for mk in monitored_keywords):
-            score += 20
-            if not reason_key:
-                reason_key = "keyword_match"
-
-    # 3. Sector overlap with watchlist holdings
-    if not reason_key:
-        for t in watchlist_tickers:
+        personal_score = 40
+        personal_reason = "watchlist_ticker"
+    elif watchlist_sectors:
+        for t in affected:
             sec = _get_sector_for_ticker(t)
             if sec and sec in watchlist_sectors:
-                # check if alert affects that sector
-                if any(sec in _get_sector_for_ticker(at) or "" for at in affected):
-                    score += 20
-                    reason_key = "watchlist_sector"
-                    is_adjacent = True
-                    break
-
-    # 4. Macro signal that has broad second-order effects
-    if not reason_key:
-        text_check = f"{title_lower} {kw}"
-        if any(mk in text_check for mk in MACRO_KEYWORDS):
-            score += 15
-            reason_key = "macro_adjacent"
-            is_adjacent = True
-
-    # 5. Recent AI topic match
-    if recent_topics:
-        for topic in recent_topics:
-            if any(w in title_lower for w in topic.lower().split() if len(w) > 4):
-                score += 15
-                if not reason_key:
-                    reason_key = "recent_topic"
+                personal_score = 25
+                personal_reason = "watchlist_sector"
+                is_adjacent = True
                 break
 
-    # 6. High attention score bonus
-    if attn >= AI_AUTO_THRESHOLD:
-        score += 15
-        if not reason_key:
-            reason_key = "high_priority"
+    if not personal_reason:
+        # Macro signals adjacent to holdings
+        if watchlist_tickers:
+            text_check = f"{title_lower} {(alert.get('keyword') or '').lower()}"
+            if any(mk in text_check for mk in MACRO_KEYWORDS):
+                personal_score = 18
+                personal_reason = "macro_adjacent"
+                is_adjacent = True
 
-    # 7. Multi-source confirmation
-    if alert.get("report_count", 1) >= 3:
-        score += 10
-        if not reason_key:
-            reason_key = "multi_confirmed"
+    if not personal_reason and recent_topics:
+        for topic in recent_topics:
+            words = [w for w in topic.lower().split() if len(w) > 4]
+            if words and any(w in title_lower for w in words):
+                personal_score = 15
+                personal_reason = "recent_topic"
+                break
 
-    # 8. Base attention blended in (max 20 additional points)
-    score += min(20, attn * 0.2)
+    # No personal relevance reason → not For You
+    if not personal_reason:
+        return 0, None, False
 
-    return min(100, round(score, 1)), reason_key, is_adjacent
+    # ─── Step 2: Require a significance reason ───────────────────────────────
+    significance_score = 0
+    significant = False
+    if attn >= 50:
+        significance_score += 15
+        significant = True
+    if rc >= 3:
+        significance_score += 10
+        significant = True
+    if scope == "broad_market":
+        significance_score += 8
+        significant = True
+    if severity == "high":
+        significance_score += 8
+        significant = True
+
+    # Not significant → not For You (goes to Alerts only)
+    if not significant:
+        return 0, None, False
+
+    # ─── Step 3: Final score combines personal + significance + attention ───
+    score = personal_score + significance_score + min(20, attn * 0.2)
+    return min(100, round(score, 1)), personal_reason, is_adjacent
 
 
 def _build_for_you(alerts, watchlist, recent_topics=None, monitored_keywords=None):
@@ -1624,12 +1639,15 @@ def _build_for_you(alerts, watchlist, recent_topics=None, monitored_keywords=Non
             a, watchlist_tickers, watchlist_sectors, recent_topics,
             monitored_keywords=monitored_keywords,
         )
-        if fy_score >= 10 or reason_key:  # minimum bar to appear
+        # Require BOTH a personal reason AND a non-zero score (which in turn
+        # requires significance). The scorer returns (0, None, False) if either
+        # check fails — no fall-through to a generic "high_priority" reason.
+        if reason_key and fy_score > 0:
             candidates.append({
                 "alert": a,
                 "fy_score": fy_score,
-                "reason_key": reason_key or "high_priority",
-                "reason_label": FOR_YOU_REASONS.get(reason_key or "high_priority", "Relevant signal"),
+                "reason_key": reason_key,
+                "reason_label": FOR_YOU_REASONS.get(reason_key, "Personal relevance"),
                 "is_adjacent": is_adjacent,
             })
 
@@ -2228,14 +2246,18 @@ class AlertStore:
             return set()
 
     def _compute_attention(self, alert, watchlist_tickers=None):
-        """Compute attention score (0-100) for alert ranking.
+        """Compute MARKET IMPORTANCE score (0-100) for Priority ranking.
+
+        This is the "how much does the market care" score.
+        Pure market importance — NO watchlist, NO keyword bonus. Those
+        are personal-relevance signals and belong in For You, not Priority.
 
         Factors:
-          severity     : high=25, medium=15, low=5               max 25
+          severity     : high=25, medium=15, low=5                max 25
           confidence   : confidence * 20                          max 20
-          recency      : exp decay, half-life 2h                  max 20
+          recency      : exp decay, half-life 4h                  max 20
           confirmation : log2(report_count) * 5                   max 15
-          watchlist    : affected ticker in watchlist              max 10
+          scope        : broad_market=10, sector=6, company=3      max 10
           source_rel   : source_reliability * 10                  max 10
         """
         if alert.get("is_duplicate"):
@@ -2245,8 +2267,6 @@ class AlertStore:
         score += sev_map.get(alert.get("severity", "medium"), 10)
         score += alert.get("confidence", 0.3) * 20
         try:
-            # Use last_seen_at for recency so developing stories that keep
-            # getting reconfirmed don't decay like stale news.
             freshness_ts = (
                 alert.get("last_seen_at")
                 or alert.get("published_at_utc")
@@ -2254,7 +2274,6 @@ class AlertStore:
             )
             if freshness_ts:
                 age_h = (datetime.now(timezone.utc) - datetime.fromisoformat(freshness_ts.replace("Z", "+00:00"))).total_seconds() / 3600
-                # Half-life 4h (was 2h) — keeps actionable items visible longer
                 score += max(0, 20 * (0.5 ** (age_h / 4)))
         except Exception:
             score += 5
@@ -2262,9 +2281,10 @@ class AlertStore:
         if rc > 1:
             import math
             score += min(15, math.log2(rc) * 5)
-        if watchlist_tickers:
-            if any(t.upper() in watchlist_tickers for t in alert.get("affected_tickers", [])):
-                score += 10
+        # Scope: broader impact = more market-relevant
+        scope = alert.get("scope", "broad_market")
+        scope_map = {"broad_market": 10, "sector": 6, "company": 3, "other": 2}
+        score += scope_map.get(scope, 5)
         score += alert.get("source_reliability", 0.5) * 10
         return round(min(100, max(0, score)), 1)
 

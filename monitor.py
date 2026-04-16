@@ -1958,7 +1958,10 @@ class AlertStore:
 
         # Phase 3 runs OUTSIDE the store lock to avoid holding it during Ollama call.
         # Check per-cycle cap before committing to an intelligence call.
-        if success and _should_auto_ai(_alert_snap):
+        # Guard: if the alert was evicted from store.alerts between Phase 2 and here
+        # (very rare — only happens if store.clear() was called mid-flight),
+        # _alert_snap will be the empty dict we initialised above. Skip Phase 3.
+        if success and _alert_snap.get("id") and _should_auto_ai(_alert_snap):
             global _auto_intel_this_cycle
             _run_phase3 = False
             with _auto_intel_cycle_lock:

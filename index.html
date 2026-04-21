@@ -212,7 +212,7 @@ function App(){
   var[searchResults,sSearchResults]=s([]);
   var searchTimer=React.useRef(null);
   var[alertSort,sAlertSort]=s("time");
-  var[alertView,sAlertView]=s("all"); // "all" | "priority" | "foryou"
+  var[alertView,sAlertView]=s("all"); // "all" | "priority" | "foryou" | "trends"
   // Ref mirrors alertSort so the poll closure can read current value without
   // being added to the effect dep array (adding it would remount and reset scroll).
   var alertSortRef=React.useRef("time");
@@ -229,6 +229,11 @@ function App(){
   var[fyLoading,sFyLoading]=s(false);
   var[fyError,sFyError]=s("");
   var[fyGeneratedAt,sFyGeneratedAt]=s(null);
+  // Story blocks (Trends view)
+  var[storyBlocks,sStoryBlocks]=s([]);
+  var[sbLoading,sSbLoading]=s(false);
+  var[sbExpanded,sSbExpanded]=s(null); // block_id or null
+  var[sbDetail,sSbDetail]=s(null);     // full block with articles
   // Per-alert intelligence state: {alertId: {intelligence, source, loading, error}}
   var[intelMap,sIntelMap]=s({});
   var fyPollRef=React.useRef(null);
@@ -367,6 +372,31 @@ function App(){
     var iv=setInterval(load,30000);
     return function(){dead=true;clearInterval(iv)};
   },[mv,alertView]);
+
+  // Story blocks: load when Trends view is active
+  u(function(){
+    if(mv!=="alerts"||alertView!=="trends")return;
+    var dead=false;
+    var load=function(){
+      sSbLoading(true);
+      F("/api/story-blocks?min=2&limit=30").then(function(d){
+        if(dead)return;
+        sStoryBlocks(d.blocks||[]);sSbLoading(false);
+      }).catch(function(){if(!dead)sSbLoading(false)});
+    };
+    load();
+    var iv=setInterval(load,15000);
+    return function(){dead=true;clearInterval(iv)};
+  },[mv,alertView]);
+
+  // Story block detail loader
+  var loadBlockDetail=function(blockId){
+    if(sbExpanded===blockId){sSbExpanded(null);sSbDetail(null);return;}
+    sSbExpanded(blockId);sSbDetail(null);
+    F("/api/story-blocks/"+blockId).then(function(d){
+      sSbDetail(d);
+    }).catch(function(){});
+  };
 
   // Explain/Summarize helper — Layer 3 on-demand AI
   var requestExplain=function(alertId){
@@ -740,6 +770,10 @@ function App(){
     if(alertView==="foryou"){
       return renderForYouSection();
     }
+    // Trends view: render story blocks
+    if(alertView==="trends"){
+      return renderTrendsView();
+    }
     // Priority view forces attention-score sort regardless of alertSort toggle
     var effectiveSorted=alertView==="priority"?sortedFilt.slice().sort(function(a,b){return (b.attention_score||0)-(a.attention_score||0)}):sortedFilt;
     var totalAlertPages=Math.ceil(effectiveSorted.length/ALERTS_PER_PAGE);
@@ -756,9 +790,9 @@ function App(){
             </div>})}
           </div>
           <div style={{display:"flex",gap:6,alignItems:"center",flexShrink:0}}>
-            {/* View mode switcher: All / Priority / For You */}
+            {/* View mode switcher */}
             <div style={{display:"flex",borderRadius:7,overflow:"hidden",border:"1px solid #1C1C28"}}>
-              {[{v:"all",l:"All"},{v:"priority",l:"Priority"},{v:"foryou",l:"For You"}].map(function(m){return <button key={m.v} className="b" onClick={function(){sAlertView(m.v);sAlertPage(0)}} style={{padding:"6px 12px",fontSize:10,background:alertView===m.v?"#5448C825":"transparent",color:alertView===m.v?"#8B80F0":"#7A7A8E",fontFamily:"'JetBrains Mono',monospace",fontWeight:alertView===m.v?600:400}}>{m.l}</button>})}
+              {[{v:"all",l:"All"},{v:"priority",l:"Priority"},{v:"foryou",l:"For You"},{v:"trends",l:"Trends"}].map(function(m){return <button key={m.v} className="b" onClick={function(){sAlertView(m.v);sAlertPage(0)}} style={{padding:"6px 12px",fontSize:10,background:alertView===m.v?"#5448C825":"transparent",color:alertView===m.v?"#8B80F0":"#7A7A8E",fontFamily:"'JetBrains Mono',monospace",fontWeight:alertView===m.v?600:400}}>{m.l}</button>})}
             </div>
             {/* Sort toggle — only visible in All view */}
             {alertView==="all"&&<div style={{display:"flex",borderRadius:7,overflow:"hidden",border:"1px solid #1C1C28"}}>
@@ -1166,6 +1200,112 @@ function App(){
         <span style={{fontSize:11,color:"#FF9F0A",fontWeight:700,minWidth:32,textAlign:"right",fontFamily:"'JetBrains Mono',monospace"}}>{"+" +s2.score}</span>
         <div style={{flex:1}}><div style={{fontSize:12,color:"#EDEDF0",lineHeight:1.4}}>{s2.title}</div><div style={{fontSize:9,color:"#3A3A4E",marginTop:3,fontFamily:"'JetBrains Mono',monospace"}}>{s2.comments} comments</div></div>
       </a>}):<div style={{color:"#3A3A4E",fontSize:12,padding:"30px 0",textAlign:"center"}}>Loading...</div>}
+    </div>;
+  };
+
+  /* ===== TRENDS VIEW (story blocks as dashboard cards) ===== */
+  var renderTrendsView = function(){
+    var impColor=function(sc){return sc>=70?"#FF453A":sc>=45?"#FF9F0A":sc>=25?"#8B80F0":"#3A3A4E"};
+    var impBg=function(sc){return sc>=70?"#FF453A12":sc>=45?"#FF9F0A12":sc>=25?"#8B80F018":"#14141F"};
+    var sentIcon=function(s2){return s2==="positive"?"#30D158":s2==="negative"?"#FF453A":"#7A7A8E"};
+    return <div style={{flex:1,display:"flex",flexDirection:"column",minHeight:0}}>
+      {/* Header bar — shared stat strip + view switcher rendered by parent */}
+      <div style={{padding:"14px 20px",borderBottom:"1px solid #1C1C28",flexShrink:0}}>
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:12}}>
+          <div style={{display:"flex",alignItems:"center",gap:10}}>
+            <span style={{fontSize:14,fontWeight:700,color:"#EDEDF0",fontFamily:"'Space Grotesk',sans-serif"}}>Developing Stories</span>
+            <span style={{fontSize:10,color:"#3A3A4E",fontFamily:"'JetBrains Mono',monospace"}}>{storyBlocks.length} active</span>
+            {sbLoading&&<span style={{fontSize:9,color:"#8B80F0",fontFamily:"'JetBrains Mono',monospace"}}><span className="thk">Updating</span></span>}
+          </div>
+          <div style={{display:"flex",gap:6,alignItems:"center"}}>
+            {/* View mode switcher */}
+            <div style={{display:"flex",borderRadius:7,overflow:"hidden",border:"1px solid #1C1C28"}}>
+              {[{v:"all",l:"All"},{v:"priority",l:"Priority"},{v:"foryou",l:"For You"},{v:"trends",l:"Trends"}].map(function(m){return <button key={m.v} className="b" onClick={function(){sAlertView(m.v);sAlertPage(0)}} style={{padding:"6px 12px",fontSize:10,background:alertView===m.v?"#5448C825":"transparent",color:alertView===m.v?"#8B80F0":"#7A7A8E",fontFamily:"'JetBrains Mono',monospace",fontWeight:alertView===m.v?600:400}}>{m.l}</button>})}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Card grid */}
+      <div style={{flex:1,overflowY:"auto",padding:20}}>
+        {storyBlocks.length===0&&!sbLoading&&<div style={{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:"80px 20px",gap:14,textAlign:"center"}}>
+          <svg width="48" height="48" viewBox="0 0 48 48" fill="none"><rect x="6" y="10" width="36" height="28" rx="4" stroke="#242434" strokeWidth="2" fill="none"/><line x1="6" y1="20" x2="42" y2="20" stroke="#242434" strokeWidth="1.5"/><line x1="22" y1="20" x2="22" y2="38" stroke="#242434" strokeWidth="1.5"/></svg>
+          <div style={{fontSize:14,color:"#3A3A4E",fontWeight:600}}>No story blocks yet</div>
+          <div style={{fontSize:11,color:"#3A3A4E",maxWidth:360}}>Story blocks form automatically when multiple articles cover the same developing story. Keep monitoring — blocks will appear as coverage clusters.</div>
+        </div>}
+
+        {storyBlocks.length>0&&<div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill, minmax(320px, 1fr))",gap:16}}>
+          {storyBlocks.map(function(blk){
+            var isOpen=sbExpanded===blk.id;
+            var ic=impColor(blk.importance_score);
+            var ibg=impBg(blk.importance_score);
+            var sc=sentIcon(blk.sentiment);
+            var mImp=blk.market_impact||"neutral";
+            var mColor=mImp==="bullish"?"#30D158":mImp==="bearish"?"#FF453A":"#7A7A8E";
+            return <div key={blk.id} className="arow" onClick={function(){if(!isOpen)loadBlockDetail(blk.id)}} style={{background:isOpen?"#0D0D16":"#0F0F1A",borderRadius:12,border:"1px solid "+(isOpen?"#5448C844":"#1C1C28"),overflow:"hidden",cursor:isOpen?"default":"pointer",gridColumn:isOpen?"1 / -1":"auto",transition:"all 0.2s ease"}}>
+              {/* Card header */}
+              <div style={{padding:"14px 16px"}}>
+                <div style={{display:"flex",alignItems:"flex-start",gap:10,marginBottom:10}}>
+                  {/* Importance badge */}
+                  <div style={{background:ibg,border:"1px solid "+ic+"30",borderRadius:8,padding:"6px 8px",textAlign:"center",minWidth:42,flexShrink:0}}>
+                    <div style={{fontSize:16,fontWeight:700,color:ic,fontFamily:"'Space Grotesk',sans-serif",lineHeight:1}}>{Math.round(blk.importance_score)}</div>
+                    <div style={{fontSize:7,color:ic,marginTop:2,fontFamily:"'JetBrains Mono',monospace",letterSpacing:0.5}}>IMP</div>
+                  </div>
+                  <div style={{flex:1,minWidth:0}}>
+                    <div style={{fontSize:14,fontWeight:600,color:"#EDEDF0",lineHeight:1.35,marginBottom:4}}>{blk.title}</div>
+                    <div style={{fontSize:11,color:"#7A7A8E",lineHeight:1.5}}>{(blk.summary||"").substring(0,120)}{blk.summary&&blk.summary.length>120?"...":""}</div>
+                  </div>
+                </div>
+                {/* Meta row */}
+                <div style={{display:"flex",gap:5,alignItems:"center",flexWrap:"wrap"}}>
+                  <span style={{fontSize:9,padding:"2px 7px",borderRadius:4,background:mColor+"15",color:mColor,border:"1px solid "+mColor+"30",fontWeight:600,fontFamily:"'JetBrains Mono',monospace"}}>{mImp==="bullish"?"BULL":mImp==="bearish"?"BEAR":"NEUT"}</span>
+                  <span style={{fontSize:9,padding:"2px 7px",borderRadius:4,background:"#5448C815",color:"#8B80F0",fontFamily:"'JetBrains Mono',monospace"}}>{blk.article_count} articles</span>
+                  <span style={{fontSize:9,padding:"2px 7px",borderRadius:4,background:"#141420",color:"#7A7A8E",fontFamily:"'JetBrains Mono',monospace"}}>{(blk.sources||[]).length} sources</span>
+                  {blk.severity==="high"&&<span style={{fontSize:9,padding:"2px 7px",borderRadius:4,background:"#FF453A15",color:"#FF453A",fontWeight:600,fontFamily:"'JetBrains Mono',monospace"}}>HIGH</span>}
+                  {(blk.market_tags||[]).slice(0,3).map(function(t){return <span key={t} style={{fontSize:9,padding:"2px 6px",borderRadius:4,background:"#30D15812",color:"#30D158",fontFamily:"'JetBrains Mono',monospace",fontWeight:600}}>{"$"+t}</span>})}
+                  <span style={{fontSize:9,color:"#3A3A4E",marginLeft:"auto",fontFamily:"'JetBrains Mono',monospace"}}>{ago(blk.updated_at)}</span>
+                </div>
+                {/* Keywords row */}
+                {blk.keywords&&blk.keywords.length>0&&<div style={{display:"flex",gap:4,flexWrap:"wrap",marginTop:8}}>
+                  {blk.keywords.slice(0,5).map(function(kk,ki){return <span key={ki} style={{fontSize:9,padding:"1px 6px",borderRadius:3,background:"#1C1C28",color:"#7A7A8E",fontFamily:"'JetBrains Mono',monospace"}}>{kk}</span>})}
+                </div>}
+              </div>
+              {/* Expanded detail panel */}
+              {isOpen&&<div style={{borderTop:"1px solid #1C1C28",padding:"16px",background:"#0A0A12"}}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
+                  <span style={{fontSize:11,fontWeight:600,color:"#7A7A8E",fontFamily:"'JetBrains Mono',monospace",letterSpacing:1}}>RELATED ARTICLES</span>
+                  <button className="b" onClick={function(e){e.stopPropagation();sSbExpanded(null);sSbDetail(null)}} style={{fontSize:10,padding:"4px 10px",borderRadius:6,background:"#141420",color:"#7A7A8E",border:"1px solid #1C1C28",fontFamily:"'JetBrains Mono',monospace"}}>Collapse</button>
+                </div>
+                {!sbDetail&&<div style={{padding:"20px 0",textAlign:"center",color:"#8B80F0",fontSize:11}}><span className="thk">Loading articles</span></div>}
+                {sbDetail&&sbDetail.articles&&<div style={{display:"flex",flexDirection:"column",gap:6}}>
+                  {sbDetail.articles.map(function(art){
+                    var artSr=SM[art.source]||{icon:"?",color:"#7A7A8E",name:art.source_name||""};
+                    var artImp=art.market_impact||"neutral";
+                    var artIc=artImp==="bullish"?"#30D158":artImp==="bearish"?"#FF453A":"#7A7A8E";
+                    return <div key={art.id} style={{display:"flex",gap:10,padding:"10px 12px",background:"#0F0F1A",borderRadius:8,border:"1px solid #1C1C28",borderLeft:"3px solid "+artIc+"55"}}>
+                      <span style={{fontSize:8,fontWeight:700,background:artSr.color+"22",color:artSr.color,padding:"2px 5px",borderRadius:3,flexShrink:0,marginTop:2,fontFamily:"'JetBrains Mono',monospace",height:"fit-content"}}>{artSr.icon}</span>
+                      <div style={{flex:1,minWidth:0}}>
+                        <div style={{fontSize:12,color:"#EDEDF0",lineHeight:1.4,marginBottom:3}}>{art.title}</div>
+                        <div style={{display:"flex",gap:6,alignItems:"center",flexWrap:"wrap"}}>
+                          <span style={{fontSize:9,color:artIc,fontWeight:600,fontFamily:"'JetBrains Mono',monospace"}}>{artImp==="bullish"?"BULL":artImp==="bearish"?"BEAR":"NEUT"}</span>
+                          <span style={{fontSize:9,color:"#3A3A4E",fontFamily:"'JetBrains Mono',monospace"}}>{art.source_name||artSr.name}</span>
+                          {art.url&&<a href={art.url} target="_blank" rel="noopener noreferrer" className="sl" onClick={function(e){e.stopPropagation()}} style={{fontSize:9}}>Link</a>}
+                          <span style={{fontSize:9,color:"#3A3A4E",marginLeft:"auto",fontFamily:"'JetBrains Mono',monospace"}}>{ago(art.published_at_utc||art.timestamp)}</span>
+                        </div>
+                      </div>
+                    </div>;
+                  })}
+                </div>}
+                {/* Sources summary */}
+                {sbDetail&&sbDetail.sources&&<div style={{marginTop:12,display:"flex",gap:4,flexWrap:"wrap"}}>
+                  <span style={{fontSize:9,color:"#3A3A4E",fontFamily:"'JetBrains Mono',monospace",marginRight:4}}>Sources:</span>
+                  {sbDetail.sources.map(function(src,si){return <span key={si} style={{fontSize:9,padding:"1px 6px",borderRadius:3,background:"#141420",color:"#7A7A8E",border:"1px solid #1C1C28",fontFamily:"'JetBrains Mono',monospace"}}>{src}</span>})}
+                </div>}
+              </div>}
+            </div>;
+          })}
+        </div>}
+      </div>
     </div>;
   };
 

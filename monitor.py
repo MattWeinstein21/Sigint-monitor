@@ -2182,6 +2182,12 @@ class AlertStore:
             emoji = emoji_map.get(word_result["article_tone"], "➡️")
             log.info(f"{emoji} [{source_id}] tone={word_result['article_tone']} conf={word_result['confidence']}{tickers_str} keyword='{keyword}' → {title[:60]} [AI queued]")
 
+        # Cluster alert into story blocks (outside store lock to avoid deadlock)
+        try:
+            story_blocks.ingest(alert)
+        except Exception as e:
+            log.debug(f"Story block ingest error: {e}")
+
         # Queue background fetch + AI enrichment (article text fetched async)
         if self.ollama_url:
             # Compute full attention score now (alert is already in self.alerts)
@@ -2295,6 +2301,260 @@ class AlertStore:
 
 
 store = AlertStore()
+
+
+# ─── Story Block Engine ──────────────────────────────────────────────────────
+
+_STOP_WORDS = frozenset(
+    "the a an and or but in on at to for of is it that this was were be been "
+    "has have had with from by are not as its their they them will would could "
+    "should may can about more than also which into over after up do how all "
+    "just been so if no when what who there than between any some very new "
+    "most says said one two three four five vs per".split()
+)
+
+
+def _significant_words(text, min_len=3):
+    """Extract significant lowercase words from text for clustering."""
+    words = re.sub(r"[^\w\s]", " ", text.lower()).split()
+    return [w for w in words if len(w) >= min_len and w not in _STOP_WORDS]
+
+
+class StoryBlockEngine:
+    """Clusters alerts into live story blocks for the Trends view.
+
+    Each block represents a developing story with multiple sources.
+    Matching uses keyword overlap, entity overlap, and title similarity.
+    No embeddings — keeps it lightweight for the single-GPU setup.
+    """
+
+    MATCH_THRESHOLD = 0.30
+    MAX_BLOCKS = 50
+    BLOCK_EXPIRY_HOURS = 48
+
+    def __init__(self):
+        self.blocks = {}       # id -> block dict
+        self.lock = threading.Lock()
+        self._next_id = 1
+
+    def ingest(self, alert):
+        """Try to match an alert to an existing block, or seed a new candidate."""
+        with self.lock:
+            self._expire_old()
+            title = alert.get("title", "")
+            sig_words = set(_significant_words(title + " " + (alert.get("snippet") or "")))
+            entities = set(alert.get("affected_tickers", []))
+            keyword = alert.get("keyword", "").lower()
+            if keyword:
+                sig_words.add(keyword)
+
+            best_id = None
+            best_score = 0.0
+
+            for bid, blk in self.blocks.items():
+                score = self._match_score(sig_words, entities, keyword, title, blk)
+                if score > best_score:
+                    best_score = score
+                    best_id = bid
+
+            if best_score >= self.MATCH_THRESHOLD and best_id:
+                self._add_to_block(best_id, alert, sig_words, entities)
+            else:
+                self._create_block(alert, sig_words, entities)
+
+    def _match_score(self, words, entities, keyword, title, block):
+        """Compute similarity between an alert and a block (0-1)."""
+        bw = block.get("_sig_words", set())
+        be = block.get("_entities", set())
+        bk = block.get("keywords", [])
+
+        # Keyword overlap (Jaccard on significant words)
+        if bw and words:
+            kw_sim = len(words & bw) / len(words | bw)
+        else:
+            kw_sim = 0
+
+        # Entity overlap (tickers, people, countries)
+        if be and entities:
+            ent_sim = len(entities & be) / len(entities | be)
+        else:
+            ent_sim = 0
+
+        # Keyword field match
+        kw_match = 1.0 if keyword and keyword in bk else 0.0
+
+        # Title similarity (Jaccard on title words)
+        title_words = set(_significant_words(title))
+        btw = block.get("_title_words", set())
+        if title_words and btw:
+            title_sim = len(title_words & btw) / len(title_words | btw)
+        else:
+            title_sim = 0
+
+        return kw_sim * 0.35 + ent_sim * 0.25 + kw_match * 0.20 + title_sim * 0.20
+
+    def _create_block(self, alert, sig_words, entities):
+        bid = f"sb_{self._next_id}"
+        self._next_id += 1
+        now = datetime.now(timezone.utc).isoformat()
+        title_words = set(_significant_words(alert.get("title", "")))
+        keyword = alert.get("keyword", "").lower()
+        kw_list = [keyword] if keyword else []
+        tickers = list(entities)
+        block = {
+            "id": bid,
+            "title": alert.get("title", ""),
+            "summary": (alert.get("snippet") or alert.get("title", ""))[:200],
+            "article_ids": [alert.get("id")],
+            "article_count": 1,
+            "keywords": kw_list,
+            "entities": list(entities),
+            "sentiment": alert.get("article_tone", "neutral"),
+            "importance_score": alert.get("attention_score", 0),
+            "market_tags": tickers[:5],
+            "sources": [alert.get("source_name", "")],
+            "market_impact": alert.get("market_impact", "neutral"),
+            "severity": alert.get("severity", "medium"),
+            "created_at": now,
+            "updated_at": now,
+            # Internal clustering state
+            "_sig_words": sig_words,
+            "_title_words": title_words,
+            "_entities": entities,
+            "_titles": [alert.get("title", "")],
+            "_sentiment_counts": {alert.get("article_tone", "neutral"): 1},
+            "_impact_counts": {alert.get("market_impact", "neutral"): 1},
+        }
+        self.blocks[bid] = block
+        if len(self.blocks) > self.MAX_BLOCKS:
+            oldest = min(self.blocks, key=lambda k: self.blocks[k]["updated_at"])
+            del self.blocks[oldest]
+
+    def _add_to_block(self, bid, alert, sig_words, entities):
+        blk = self.blocks[bid]
+        aid = alert.get("id")
+        if aid in blk["article_ids"]:
+            return
+        blk["article_ids"].append(aid)
+        blk["article_count"] = len(blk["article_ids"])
+        blk["updated_at"] = datetime.now(timezone.utc).isoformat()
+        blk["_sig_words"] |= sig_words
+        blk["_entities"] |= entities
+        blk["_title_words"] |= set(_significant_words(alert.get("title", "")))
+        blk["_titles"].append(alert.get("title", ""))
+        keyword = alert.get("keyword", "").lower()
+        if keyword and keyword not in blk["keywords"]:
+            blk["keywords"].append(keyword)
+        blk["entities"] = list(blk["_entities"])
+        src = alert.get("source_name", "")
+        if src and src not in blk["sources"]:
+            blk["sources"].append(src)
+        # Tickers
+        for t in alert.get("affected_tickers", []):
+            if t not in blk["market_tags"]:
+                blk["market_tags"].append(t)
+        blk["market_tags"] = blk["market_tags"][:8]
+        # Sentiment tracking
+        tone = alert.get("article_tone", "neutral")
+        blk["_sentiment_counts"][tone] = blk["_sentiment_counts"].get(tone, 0) + 1
+        blk["sentiment"] = max(blk["_sentiment_counts"], key=blk["_sentiment_counts"].get)
+        impact = alert.get("market_impact", "neutral")
+        blk["_impact_counts"][impact] = blk["_impact_counts"].get(impact, 0) + 1
+        blk["market_impact"] = max(blk["_impact_counts"], key=blk["_impact_counts"].get)
+        # Severity: keep highest
+        sev_rank = {"high": 3, "medium": 2, "low": 1}
+        if sev_rank.get(alert.get("severity"), 0) > sev_rank.get(blk["severity"], 0):
+            blk["severity"] = alert["severity"]
+        # Regenerate title from most common significant words
+        self._regenerate_title(blk)
+        # Update importance score
+        self._compute_importance(blk)
+
+    def _regenerate_title(self, blk):
+        """Generate a block title from the most common significant words across all titles."""
+        if blk["article_count"] < 2:
+            return
+        from collections import Counter
+        all_words = []
+        for t in blk["_titles"]:
+            all_words.extend(_significant_words(t))
+        if not all_words:
+            return
+        freq = Counter(all_words)
+        # Take top 4-6 words that appear in multiple titles
+        top = [w for w, c in freq.most_common(8) if c >= 2]
+        if len(top) < 2:
+            top = [w for w, _ in freq.most_common(4)]
+        if top:
+            blk["title"] = " ".join(w.capitalize() for w in top[:5])
+        # Summary: take the most recent title as representative
+        if blk["_titles"]:
+            latest = blk["_titles"][-1]
+            blk["summary"] = latest[:200]
+
+    def _compute_importance(self, blk):
+        """Score block importance (0-100) based on volume, severity, recency, breadth."""
+        score = 0.0
+        # Article count (0-25): more coverage = more important
+        import math
+        score += min(25, math.log2(max(1, blk["article_count"])) * 8)
+        # Source diversity (0-20)
+        score += min(20, len(blk["sources"]) * 5)
+        # Severity (0-20)
+        sev_map = {"high": 20, "medium": 10, "low": 5}
+        score += sev_map.get(blk["severity"], 5)
+        # Recency (0-20)
+        try:
+            age_h = (datetime.now(timezone.utc) -
+                     datetime.fromisoformat(blk["updated_at"].replace("Z", "+00:00"))).total_seconds() / 3600
+            score += max(0, 20 * (0.5 ** (age_h / 6)))
+        except Exception:
+            score += 5
+        # Market tag breadth (0-15)
+        score += min(15, len(blk["market_tags"]) * 3)
+        blk["importance_score"] = round(min(100, score), 1)
+
+    def _expire_old(self):
+        cutoff = (datetime.now(timezone.utc) -
+                  timedelta(hours=self.BLOCK_EXPIRY_HOURS)).isoformat()
+        expired = [bid for bid, blk in self.blocks.items()
+                   if blk["updated_at"] < cutoff]
+        for bid in expired:
+            del self.blocks[bid]
+
+    def get_blocks(self, min_articles=2, limit=30):
+        """Return visible blocks ranked by importance. Single-article seeds hidden."""
+        with self.lock:
+            self._expire_old()
+            visible = [blk for blk in self.blocks.values()
+                       if blk["article_count"] >= min_articles]
+            visible.sort(key=lambda b: b["importance_score"], reverse=True)
+            # Strip internal fields for API response
+            result = []
+            for blk in visible[:limit]:
+                entry = {k: v for k, v in blk.items() if not k.startswith("_")}
+                result.append(entry)
+            return result
+
+    def get_block(self, block_id):
+        """Return a single block with full article data."""
+        with self.lock:
+            blk = self.blocks.get(block_id)
+            if not blk:
+                return None
+            entry = {k: v for k, v in blk.items() if not k.startswith("_")}
+            # Attach full alert data for each article
+            articles = []
+            for aid in blk["article_ids"]:
+                for a in store.alerts:
+                    if a["id"] == aid:
+                        articles.append(a)
+                        break
+            entry["articles"] = articles
+            return entry
+
+
+story_blocks = StoryBlockEngine()
 
 
 def normalize_whitespace(text):
@@ -4508,6 +4768,26 @@ def get_alerts():
 def clear_alerts():
     store.clear()
     return jsonify({"status": "cleared"})
+
+
+# ─── Story Blocks API ────────────────────────────────────────────────────────
+
+@app.route("/api/story-blocks")
+def get_story_blocks():
+    """Return ranked story blocks for the Trends view."""
+    min_articles = request.args.get("min", 2, type=int)
+    limit = request.args.get("limit", 30, type=int)
+    blocks = story_blocks.get_blocks(min_articles=min_articles, limit=limit)
+    return jsonify({"blocks": blocks, "total": len(blocks)})
+
+
+@app.route("/api/story-blocks/<block_id>")
+def get_story_block(block_id):
+    """Return a single story block with full article data."""
+    block = story_blocks.get_block(block_id)
+    if not block:
+        return jsonify({"error": "Block not found"}), 404
+    return jsonify(block)
 
 
 @app.route("/api/signal/matches")
